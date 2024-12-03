@@ -5,4 +5,6 @@ We ablate many different proposed methods just to learn basic functions like add
 
 Surprisingly, standard SGD can not. 
 
-To run, you should use the sweep shell scripts. Ensure you first chmod +x *.sh. Then you can run with ./*.sh
+To run, you should use the sweep shell scripts. Ensure you first _chmod +x *.sh_. 
+
+Then you can run with _./*.sh_
