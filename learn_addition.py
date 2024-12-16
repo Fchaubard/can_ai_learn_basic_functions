@@ -1,3 +1,4 @@
+# Learning Addition
 import argparse
 import torch
 import wandb
@@ -103,12 +104,21 @@ def get_best_gpu():
     
 # Dataset for addition problems
 class AdditionDataset(Dataset):
-    def __init__(self, domain_start, domain_end, size=10000):
+    def __init__(self, domain_start, domain_end, size=10000, space_tokens=False):
         self.data = []
         for _ in range(size):
             a = random.randint(domain_start, domain_end)
             b = random.randint(domain_start, domain_end)
-            self.data.append(f"{a}+{b}={a+b}")
+            if space_tokens:
+                a_str = ' '.join(list(str(a)))    # "12" -> "1 2"
+                b_str = ' '.join(list(str(b)))    # "3" -> "3"
+                res_str = ' '.join(list(str(a+b))) # "15" -> "1 5"
+                
+                # Now ensure that '+' and '=' are also separated by spaces:
+                self.data.append(f"{a_str} + {b_str} = {res_str}")
+            else:
+                
+                self.data.append(f"{a}+{b}={a+b}")
 
     def __len__(self):
         return len(self.data)
@@ -236,10 +246,55 @@ def train(args):
     train_domain1 = 0
     train_domain2 = 10
 
+    
+    if args.raw_weights:
+        print("initing weights back to raw")
+        model.init_weights()  # Initialize with raw weights
+
+
+     
+    if args.limited_tokens:
+        print("initing the tokenizer to the minimal set for addition")
+        from transformers import PreTrainedTokenizerFast
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from tokenizers.pre_tokenizers import Whitespace
+    
+        # Define your tokens
+        special_tokens = ["<bos>", "<eos>", "<sep>", "<pad>", "<unk>"]
+        tokens = [str(d) for d in range(10)] + ["+", "="]
+    
+        # Combine special and normal tokens into a single vocabulary
+        all_tokens = special_tokens + tokens
+    
+        # Create a vocabulary dictionary
+        vocab = {tok: i for i, tok in enumerate(all_tokens)}
+    
+        # Create a WordLevel tokenizer with the limited vocab and specify unk_token
+        tokenizer_obj = Tokenizer(WordLevel(vocab=vocab, unk_token="<unk>"))
+        # Add a Whitespace pre-tokenizer to split on spaces
+        tokenizer_obj.pre_tokenizer = Whitespace()
+    
+        # Initialize PreTrainedTokenizerFast with our tokenizer object and special tokens
+        new_tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer_obj,
+            bos_token="<bos>",
+            eos_token="<eos>",
+            sep_token="<sep>",
+            pad_token="<pad>",
+            unk_token="<unk>"
+        )
+    
+        # Assign the new tokenizer globally
+        tokenizer = new_tokenizer
+    
+        # Resize the model embeddings for the new vocabulary
+        model.resize_token_embeddings(len(tokenizer))
+
     while True:
         # Create datasets
-        train_dataset = AdditionDataset(train_domain1, train_domain2)
-        val_dataset = AdditionDataset(train_domain2 + 1, train_domain2 + 10)
+        train_dataset = AdditionDataset(train_domain1, train_domain2, space_tokens=args.limited_tokens)
+        val_dataset = AdditionDataset(train_domain2 + 1, train_domain2 + 10, space_tokens=args.limited_tokens)
 
         print("train_dataset: ",train_dataset)
         print("val_dataset: ",val_dataset)
@@ -508,9 +563,10 @@ def train(args):
                     print(f"Train Sample Accuracy: {batch_accuracy*100:.2f}%")
                     print("Incorrect Samples:")
                     for sample in batch_incorrect_samples:
-                        print(f"Input: {sample['input']}")
-                        print(f"Prediction: {sample['prediction']}")
-                        print(f"Ground Truth: {sample['ground_truth']}")
+                       
+                        print(f"Input: {tokenizer.tokenize(sample['input'])}")
+                        print(f"Prediction: {tokenizer.tokenize(sample['prediction'])}")
+                        print(f"Ground Truth: {tokenizer.tokenize(sample['ground_truth'])}")
                         print("-" * 40)
 
                 if train_acc >= 0.99:
@@ -601,9 +657,9 @@ def train(args):
         print(f"Validation Accuracy: {val_acc_per_sample*100:.2f}%")
         print("Incorrect Samples:")
         for sample in val_incorrect_samples:
-            print(f"Input: {sample['input']}")
-            print(f"Prediction: {sample['prediction']}")
-            print(f"Ground Truth: {sample['ground_truth']}")
+            print(f"Input: {tokenizer.tokenize(sample['input'])}")
+            print(f"Prediction: {tokenizer.tokenize(sample['prediction'])}")
+            print(f"Ground Truth: {tokenizer.tokenize(sample['ground_truth'])}")
             print("-" * 40)
 
         # Update train domain
@@ -648,5 +704,7 @@ if __name__ == "__main__":
     parser.add_argument("--log_normal_gradient_noise", action="store_true", help="Add log-normal gradient noise")
     parser.add_argument("--log_normal_mu", type=float, default=0.0, help="Log-normal mu")
     parser.add_argument("--log_normal_sigma", type=float, default=0.01, help="Log-normal sigma")
+    parser.add_argument("--raw_weights", action="store_true", help="Initialize the model with raw weights (default: True)")
+    parser.add_argument("--limited_tokens", action="store_true", help="Initialize the model with raw weights (default: True)")
     args = parser.parse_args()
     train(args)
