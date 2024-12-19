@@ -51,7 +51,7 @@ def compute_per_sample_accuracy(input_ids, labels, logits):
             ground_truth_tokens = ground_truth_tokens[ground_truth_tokens != -100]
 
             # Get predicted tokens after '='
-            predicted_logits = logit[equal_pos + 1:]
+            predicted_logits = logit[equal_pos:]
             predicted_tokens = predicted_logits.argmax(dim=-1)
             predicted_tokens = predicted_tokens[:len(ground_truth_tokens)]
 
@@ -187,7 +187,7 @@ def compute_mse_on_parsed_answers(input_ids, labels, logits):
                 ground_truth_value = float(ground_truth_text)
             except:
                 continue  # Skip if cannot parse
-            predicted_logits = logit[equal_pos + 1:]
+            predicted_logits = logit[equal_pos:]
             predicted_tokens = predicted_logits.argmax(dim=-1)
             predicted_text = tokenizer.decode(predicted_tokens, skip_special_tokens=True).strip()
             try:
@@ -206,7 +206,7 @@ def compute_mse_on_parsed_answers(input_ids, labels, logits):
 def train(args):
     global tokenizer  # Needed for collate_fn
     # Initialize wandb
-    wandb.init(project="Solving addition", config=vars(args))
+    wandb.init(project="Solving addition (2)", config=vars(args))
 
     # Set device
     if torch.cuda.is_available():
