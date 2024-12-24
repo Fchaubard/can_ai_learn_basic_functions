@@ -14,9 +14,9 @@ Usage Example:
         --num_heads 1 \
         --optimizer adam \
         --learning_rate 1e-3 \
-        --cosine_lr True \
+        --cosine_lr  \
         --warmup_steps 1000 \
-        --mezo False \
+        --mezo \
         --wandb_proj "NTM-Experiments" \
         --wandb_run_name "test-run"
 
@@ -537,6 +537,8 @@ def main():
     
     # Training loop
     for iteration in range(1, args.max_iters + 1):
+        print("iteration:",iteration)
+        
         # Generate data
         if args.task == "copy":
             x, y = generate_copy_task(args.batch_size, args.seq_len, bits=args.output_size)
@@ -582,3 +584,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    print("finished training")
