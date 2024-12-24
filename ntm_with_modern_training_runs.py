@@ -69,145 +69,191 @@ def pick_gpu_with_most_free_mem() -> int:
 ##############################################################################
 def generate_copy_task(batch_size: int, seq_len: int, bits: int = 8) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    The copy task: 
+    The copy task:
       - Input is a random sequence of bits plus an end-of-sequence marker.
       - Model should output the same sequence after the marker.
     Returns:
-      x: [batch_size, 2*seq_len + 1, bits+1]
-      y: [batch_size, 2*seq_len + 1, bits]
+      x: [batch_size, 2*seq_len + 1, bits+1]  (the input, incl. EOS marker)
+      y: [batch_size, 2*seq_len + 1, bits]    (the target)
     """
-    # Random bit sequences
+    # 1) Generate random bit sequences [batch_size, seq_len, bits].
     seq = torch.randint(0, 2, (batch_size, seq_len, bits), dtype=torch.float32)
-    # Add an end-of-sequence marker (one-hot at the last bit index)
-    eos = torch.zeros(batch_size, 1, bits + 1)
-    eos[..., -1] = 1.0  # marker in the "bits+1"-th dimension
-    seq_with_eos = torch.cat([seq, eos], dim=1)
     
-    # The input to the network is the sequence + marker + placeholders
-    # We'll pad with zeros for the output phase
-    pad = torch.zeros(batch_size, seq_len, bits + 1)
-    x = torch.cat([seq_with_eos, pad], dim=1)
-    
-    # The target is zero during the input phase (except ignoring it in loss),
-    # then the original bits during the second phase (after the marker).
-    pad_out = torch.zeros(batch_size, seq_len + 1, bits)  # input phase + marker
-    y_copy = seq  # we want the bits to be reproduced
+    # 2) Convert to [batch_size, seq_len, bits+1] by appending a zero column for the marker slot.
+    zero_col = torch.zeros(batch_size, seq_len, 1, dtype=torch.float32)
+    seq_input = torch.cat([seq, zero_col], dim=-1)  # now shape is [batch_size, seq_len, bits+1]
+
+    # 3) Create an EOS marker of shape [batch_size, 1, bits+1], where the last entry is 1.
+    eos = torch.zeros(batch_size, 1, bits + 1, dtype=torch.float32)
+    eos[..., -1] = 1.0
+
+    # 4) Concatenate the sequence and the EOS marker along the time dimension => [batch_size, seq_len+1, bits+1]
+    seq_with_eos = torch.cat([seq_input, eos], dim=1)
+
+    # 5) For the output phase, we add an extra seq_len "time steps" of zeros to the input:
+    pad_input = torch.zeros(batch_size, seq_len, bits + 1)
+    x = torch.cat([seq_with_eos, pad_input], dim=1)
+    # x shape: [batch_size, 2*seq_len + 1, bits+1]
+
+    # 6) Build the target:
+    #    - During the first seq_len+1 timesteps (input + EOS), the target is zero (or we don't penalize).
+    #    - After the EOS, we want the model to reproduce the original seq bits.
+    # So we create zero output for seq_len+1 steps, then the seq bits for the next seq_len steps.
+    pad_out = torch.zeros(batch_size, seq_len + 1, bits)
+    y_copy = seq  # shape [batch_size, seq_len, bits]
     y = torch.cat([pad_out, y_copy], dim=1)
+    # y shape: [batch_size, 2*seq_len + 1, bits]
+
     return x, y
 
 
-def generate_repeat_copy_task(
-    batch_size: int, seq_len: int, repeat_min: int = 1, repeat_max: int = 3, bits: int = 8
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    The repeat copy task:
-      - Input is a random sequence of bits, then a separate random 'repeat count' 
-        (encoded in unary or some form), plus a marker.
-      - Model outputs the entire sequence repeated 'count' times.
-    """
-    # Random bit sequences
-    seq = torch.randint(0, 2, (batch_size, seq_len, bits), dtype=torch.float32)
-    
-    # Random repeat counts
-    repeat_counts = torch.randint(repeat_min, repeat_max + 1, (batch_size, 1))
-    
-    # Marker
-    eos = torch.zeros(batch_size, 1, bits + 2)
-    eos[..., -1] = 1.0  # marker in last dimension
-    
-    # We'll encode the repeat count in one additional dimension as one-hot
-    # or we can do something simpler, like single dimension = count
-    count_vec = torch.zeros(batch_size, 1, bits + 2)
-    for i in range(batch_size):
-        c = repeat_counts[i].item()
-        if c < bits + 2:
-            count_vec[i, 0, c] = 1.0  # one-hot in dimension c
 
-    # Combine the sequence with the count and marker
-    seq_padded = torch.cat([seq, torch.zeros(batch_size, seq_len, 2)], dim=-1)
-    x_input = torch.cat([seq_padded, count_vec, eos], dim=1)
-    
-    # Construct the target
-    max_repeat = repeat_max
-    total_out_len = seq_len * max_repeat  # over-generate, then we won't compute loss beyond actual
-    target = []
+def generate_repeat_copy_task(
+    batch_size: int,
+    seq_len: int,
+    bits: int = 8,
+    repeat_min: int = 1,
+    repeat_max: int = 3
+):
+    """
+    The repeat-copy task:
+      - We feed a sequence of bits, followed by a row encoding the repeat count,
+        then a marker row, then a period for output generation.
+      - The model must output the original sequence repeated 'count' times.
+
+    Requirements:
+      - Input dimension must be (bits + 2).
+      - Output dimension is 'bits'.
+    """
+    # 1) Generate random bit sequences: shape [B, seq_len, bits]
+    seq = torch.randint(0, 2, (batch_size, seq_len, bits), dtype=torch.float32)
+
+    # 2) Convert to shape [B, seq_len, bits+2] by adding two extra columns for
+    #    repeat-count/marker usage:
+    extra_cols = torch.zeros(batch_size, seq_len, 2, dtype=torch.float32)
+    seq_input = torch.cat([seq, extra_cols], dim=-1)  # [B, seq_len, bits+2]
+
+    # 3) Sample repeat counts
+    repeat_counts = torch.randint(repeat_min, repeat_max + 1, (batch_size,))
+
+    # 4) Create a single row for the repeat count (second-last column)
+    #    and a single row for the marker (last column).
+    #    count_row: [B, 1, bits+2]
+    count_row = torch.zeros(batch_size, 1, bits + 2, dtype=torch.float32)
+    for i in range(batch_size):
+        c = float(repeat_counts[i].item())
+        count_row[i, 0, -2] = c  # store the count in the second-last column
+
+    #    marker_row: [B, 1, bits+2], where the last column is 1
+    marker_row = torch.zeros(batch_size, 1, bits + 2, dtype=torch.float32)
+    marker_row[..., -1] = 1.0
+
+    # 5) Concatenate sequence + count row + marker row
+    seq_with_count_marker = torch.cat([seq_input, count_row, marker_row], dim=1)
+    # shape: [B, seq_len + 2, bits+2]
+
+    # 6) Pad the input for the "output phase".
+    #    We assume the maximum repeated output can be seq_len * repeat_max.
+    pad_input = torch.zeros(batch_size, seq_len * repeat_max, bits + 2, dtype=torch.float32)
+
+    # 7) Final input: [B, (seq_len+2) + seq_len*repeat_max, bits+2]
+    x = torch.cat([seq_with_count_marker, pad_input], dim=1)
+
+    # ------------------------------
+    # Construct the Target (outputs)
+    # ------------------------------
+
+    # 8) We want the first (seq_len+2) steps to produce zeros (or be ignored in loss),
+    #    then the repeated sequence. We'll pad to length = seq_len * repeat_max.
+    total_out_len = (seq_len + 2) + (seq_len * repeat_max)
+    zero_out = torch.zeros(batch_size, seq_len + 2, bits, dtype=torch.float32)
+
+    # 9) Build the repeated sequence for each sample, then pad it to seq_len*repeat_max
+    repeated_outs = []
     for i in range(batch_size):
         c = repeat_counts[i].item()
-        repeated = seq[i].repeat((c, 1))
-        # Pad to max_repeat * seq_len
-        pad_len = total_out_len - repeated.shape[0]
-        pad_zone = torch.zeros(pad_len, bits)
-        out_seq = torch.cat([repeated, pad_zone], dim=0)
-        target.append(out_seq)
-    y_out = torch.stack(target, dim=0)  # [batch_size, total_out_len, bits]
-    
-    # For alignment, we make sure x_input and y_out have the same time dimension
-    # We'll just match to the bigger dimension (seq_len + 2 vs total_out_len).
-    T_in = x_input.size(1)
-    T_out = y_out.size(1)
-    T = max(T_in, T_out)
-    if T_in < T:
-        pad_in = torch.zeros(batch_size, T - T_in, bits + 2)
-        x_input = torch.cat([x_input, pad_in], dim=1)
-    if T_out < T:
-        pad_out = torch.zeros(batch_size, T - T_out, bits)
-        y_out = torch.cat([y_out, pad_out], dim=1)
-    return x_input, y_out
+        repeated_seq = seq[i].repeat((int(c), 1))  # shape: [seq_len * c, bits]
+        # pad to seq_len * repeat_max
+        pad_len = seq_len * repeat_max - repeated_seq.size(0)
+        out_pad = torch.zeros(pad_len, bits, dtype=torch.float32)
+        repeated_padded = torch.cat([repeated_seq, out_pad], dim=0)  # [seq_len*repeat_max, bits]
+        repeated_outs.append(repeated_padded)
+
+    out_rep = torch.stack(repeated_outs, dim=0)  # [B, seq_len*repeat_max, bits]
+
+    # 10) Concatenate zeros (for the input & marker phase) + repeated portion
+    y = torch.cat([zero_out, out_rep], dim=1)  # [B, total_out_len, bits]
+
+    return x, y
 
 
 def generate_associative_recall_task(
-    batch_size: int, item_len: int = 3, num_items: int = 3, bits: int = 8
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    batch_size: int,
+    item_len: int = 3,
+    num_items: int = 3,
+    bits: int = 8
+):
     """
-    Simplified version of the Associative Recall task:
-      - We have num_items items, each of length item_len (bits).
-      - We ask the model to recall the item that follows a given 'query' item in the list.
-      - The input includes all items plus the query item + marker, the output is the single item that follows the query.
+    The associative-recall task (simplified):
+      - We have `num_items` items, each of length `item_len` bits.
+      - We present all items (flattened), then a marker row, then a 'query' item.
+      - The model must output the item that follows the query in the original list.
+
+    Requirements:
+      - Input dimension must be (bits + 1).
+      - Output dimension is 'bits'.
     """
-    # Generate random items
+    # 1) Generate random items: [B, num_items, item_len, bits]
     items = torch.randint(0, 2, (batch_size, num_items, item_len, bits), dtype=torch.float32)
-    
-    # Randomly pick which item is the query, ensuring it isn't the last
+
+    # 2) Randomly choose an index in [0, num_items-2], so there's always a "next" item
     query_indices = torch.randint(0, num_items - 1, (batch_size,))
+
+    # 3) Gather the queries and their "next" (answers)
     queries = []
     answers = []
     for i in range(batch_size):
         q_idx = query_indices[i].item()
-        queries.append(items[i, q_idx])
-        answers.append(items[i, q_idx + 1])  # The "associated" item is the next one
-    
-    queries = torch.stack(queries, dim=0)   # [batch_size, item_len, bits]
-    answers = torch.stack(answers, dim=0)   # [batch_size, item_len, bits]
-    
-    # Flatten the items into a single sequence to feed
-    # Then place a marker at the end and then the query
-    flattened = []
-    for i in range(batch_size):
-        batch_seq = items[i].reshape(num_items * item_len, bits)
-        flattened.append(batch_seq)
-    flattened = torch.stack(flattened, dim=0)  # [batch_size, num_items*item_len, bits]
-    
-    # Append a marker dimension
-    eos = torch.zeros(batch_size, 1, bits + 1)
-    eos[..., -1] = 1.0
-    # Expand flattened to bits+1
-    flattened_pad = torch.cat([flattened, torch.zeros(batch_size, flattened.size(1), 1)], dim=-1)
-    
-    # Expand queries to bits+1
-    query_pad = torch.cat([queries, torch.zeros(batch_size, item_len, 1)], dim=-1)
-    
-    x_input = torch.cat([flattened_pad, eos, query_pad], dim=1)
-    
-    # Our target is the item that follows the query
-    y_out = answers  # [batch_size, item_len, bits]
-    # We might want to pad up to match length
-    T_in = x_input.size(1)
-    T_out = y_out.size(1)
-    if T_out < T_in:
-        pad_out = torch.zeros(batch_size, T_in - T_out, bits)
-        y_out = torch.cat([y_out, pad_out], dim=1)
-    return x_input, y_out
+        queries.append(items[i, q_idx])       # shape [item_len, bits]
+        answers.append(items[i, q_idx + 1])   # shape [item_len, bits]
 
+    queries = torch.stack(queries, dim=0)   # [B, item_len, bits]
+    answers = torch.stack(answers, dim=0)   # [B, item_len, bits]
+
+    # 4) Flatten the full set of items: [B, num_items * item_len, bits]
+    flattened = items.view(batch_size, num_items * item_len, bits)
+
+    # 5) Convert flattened items to shape [B, num_items*item_len, bits+1] by adding
+    #    one extra column for the marker dimension (initialized to zero).
+    extra_col = torch.zeros(batch_size, num_items * item_len, 1, dtype=torch.float32)
+    flattened_in = torch.cat([flattened, extra_col], dim=-1)  # [B, num_items*item_len, bits+1]
+
+    # 6) Create a marker row: [B, 1, bits+1]
+    marker_row = torch.zeros(batch_size, 1, bits + 1, dtype=torch.float32)
+    marker_row[..., -1] = 1.0
+
+    # 7) Convert the query to shape [B, item_len, bits+1] (add zero col)
+    zero_col_query = torch.zeros(batch_size, item_len, 1, dtype=torch.float32)
+    query_in = torch.cat([queries, zero_col_query], dim=-1)  # [B, item_len, bits+1]
+
+    # 8) Final input x = [flattened items, marker row, query]
+    #    shape => [B, (num_items*item_len + 1 + item_len), bits+1]
+    x = torch.cat([flattened_in, marker_row, query_in], dim=1)
+
+    # ------------------------------
+    # Construct the Target (outputs)
+    # ------------------------------
+
+    # 9) The target is the item after the query => [B, item_len, bits].
+    #    We'll pad it to match the same time dimension as x.
+    T_in = x.size(1)  # total input length
+    item_out_len = answers.size(1)  # usually item_len
+    pad_len = T_in - item_out_len
+
+    pad_zeros = torch.zeros(batch_size, pad_len, bits, dtype=torch.float32)
+    y = torch.cat([answers, pad_zeros], dim=1)  # [B, T_in, bits]
+
+    return x, y
 
 ##############################################################################
 # NTM Model Definition
