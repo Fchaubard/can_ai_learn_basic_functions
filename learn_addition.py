@@ -55,14 +55,37 @@ def compute_per_sample_accuracy(input_ids, labels, logits):
             predicted_tokens = predicted_logits.argmax(dim=-1)
             predicted_tokens = predicted_tokens[:len(ground_truth_tokens)]
 
+            ground_truth_text = tokenizer.decode(ground_truth_tokens, skip_special_tokens=True).strip()
+            predicted_text = tokenizer.decode(predicted_tokens, skip_special_tokens=True).strip()
+            
+            # Remove spaces if your tokenization creates them
+            ground_truth_text = ground_truth_text.replace(' ', '')
+            predicted_text = predicted_text.replace(' ', '')
+            input_text = tokenizer.decode(input_id, skip_special_tokens=True)
+                
+            # Now parse
+            # ground_truth_value = float(ground_truth_text)
+            # predicted_value = float(predicted_text)
+            try:
+                # Now parse
+                ground_truth_value = float(ground_truth_text)
+                predicted_value = float(predicted_text)
+            
+            except:
+                print(f"could not parse. ground_truth_text:{ground_truth_text} predicted_text:{predicted_text}")
+                continue  # Skip if cannot parse
             # Compare the sequences
             if torch.equal(predicted_tokens, ground_truth_tokens):
                 correct += 1
+                if np.random.rand()>.99:
+                    print({
+                    'input': input_text,
+                    'prediction': predicted_text,
+                    'ground_truth': ground_truth_text,
+                    })
             else:
                 # Collect incorrect sample
-                input_text = tokenizer.decode(input_id, skip_special_tokens=True)
-                predicted_text = tokenizer.decode(predicted_tokens, skip_special_tokens=True)
-                ground_truth_text = tokenizer.decode(ground_truth_tokens, skip_special_tokens=True)
+                
                 incorrect_samples.append({
                     'input': input_text,
                     'prediction': predicted_text,
@@ -182,18 +205,31 @@ def compute_mse_on_parsed_answers(input_ids, labels, logits):
         if len(equal_pos[0]) > 0:
             equal_pos = equal_pos[0].item()
             ground_truth_tokens = input_id[equal_pos + 1:]
-            ground_truth_text = tokenizer.decode(ground_truth_tokens, skip_special_tokens=True).strip()
-            try:
-                ground_truth_value = float(ground_truth_text)
-            except:
-                continue  # Skip if cannot parse
+            # ground_truth_tokens = label[equal_pos + 1:]
+            ground_truth_tokens = ground_truth_tokens[ground_truth_tokens != -100]
+
+            # Get predicted tokens after '='
             predicted_logits = logit[equal_pos:]
             predicted_tokens = predicted_logits.argmax(dim=-1)
+            predicted_tokens = predicted_tokens[:len(ground_truth_tokens)]
+
+            ground_truth_text = tokenizer.decode(ground_truth_tokens, skip_special_tokens=True).strip()
             predicted_text = tokenizer.decode(predicted_tokens, skip_special_tokens=True).strip()
+            
+            # Remove spaces if your tokenization creates them
+            ground_truth_text = ground_truth_text.replace(' ', '')
+            predicted_text = predicted_text.replace(' ', '')
+            
+            
             try:
+                # Now parse
+                ground_truth_value = float(ground_truth_text)
                 predicted_value = float(predicted_text)
+            
             except:
-                continue  # Skip if cannot parse
+                # print(f"could not parse. ground_truth_text:{ground_truth_text} predicted_text:{predicted_text}")
+                continue 
+                
             mse = (predicted_value - ground_truth_value) ** 2
             total_mse += mse
             count += 1
@@ -202,6 +238,168 @@ def compute_mse_on_parsed_answers(input_ids, labels, logits):
     else:
         return None
 
+# def validate(model, tokenizer, val_dataloader, device, optimizer, args):
+#     model.eval()
+#     val_loss_total = 0.0
+#     val_base_loss_total = 0.0
+#     val_kl_loss_total = 0.0
+#     val_weight_decay_loss = 0.0
+#     val_correct = 0
+#     val_total = 0
+#     val_mse_total = 0.0
+#     val_count = 0
+#     val_incorrect_samples = []
+
+#     # For generation, decide on parameters like max_new_tokens
+#     # Assuming we know sums won't exceed 3 digits (safe margin)
+#     max_new_tokens = 8
+
+#     with torch.no_grad():
+#         for val_batch in val_dataloader:
+#             input_ids = val_batch['input_ids'].to(device)
+#             attention_mask = val_batch['attention_mask'].to(device)
+#             labels = val_batch['labels'].to(device)
+
+#             # Compute losses for logging (same as before)
+#             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+#             base_loss = outputs.loss
+#             if args.klsparsity:
+#                 kl_loss = compute_klsparsity_loss(model, args.klsparsity_pi)
+#             else:
+#                 kl_loss = 0.0
+#             total_loss = base_loss + args.klsparsity_lambda * kl_loss
+
+#             # Compute weight decay loss
+#             weight_decay_loss = 0.0
+#             for group in optimizer.param_groups:
+#                 for param in group['params']:
+#                     if param.requires_grad:
+#                         weight_decay_loss += torch.sum(param.data ** 2)
+#             weight_decay_loss *= optimizer.param_groups[0]['weight_decay']
+
+#             val_loss_total += total_loss.item()
+#             val_base_loss_total += base_loss.item()
+#             val_kl_loss_total += kl_loss.item() if args.klsparsity else 0.0
+#             val_weight_decay_loss += weight_decay_loss.item()
+
+#             # Now perform generation for accuracy calculation
+#             batch_size = input_ids.size(0)
+#             batch_predictions = []
+#             batch_ground_truths = []
+#             batch_inputs = []
+
+#             # Identify positions of '=' and slice input to generate from there
+#             equal_token_id = tokenizer.convert_tokens_to_ids('=')
+
+#             for i in range(batch_size):
+#                 seq = input_ids[i]
+#                 # Find '=' position
+#                 equal_pos = (seq == equal_token_id).nonzero(as_tuple=True)
+#                 if len(equal_pos[0]) == 0:
+#                     # No '=' found, skip
+#                     continue
+#                 equal_pos = equal_pos[0].item()
+
+#                 # The prefix is everything up to and including '='
+#                 prefix = seq[:equal_pos+1].unsqueeze(0)  # shape: (1, seq_len)
+#                 # Generate tokens after '='
+#                 generated = model.generate(
+#                     prefix,
+#                     max_new_tokens=max_new_tokens,
+#                     pad_token_id=tokenizer.pad_token_id,
+#                     eos_token_id=tokenizer.eos_token_id,
+#                     do_sample=False  # Greedy for this simple task
+#                 )
+
+#                 # Extract the newly generated tokens (after prefix)
+#                 new_tokens = generated[0, equal_pos+1:]
+#                 predicted_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+#                 predicted_text = predicted_text.replace(' ', '')
+
+#                 # Ground truth tokens
+#                 ground_truth_tokens = labels[i, equal_pos+1:]
+#                 ground_truth_tokens = ground_truth_tokens[ground_truth_tokens != -100]
+#                 ground_truth_text = tokenizer.decode(ground_truth_tokens, skip_special_tokens=True).strip()
+#                 ground_truth_text = ground_truth_text.replace(' ', '')
+
+#                 input_text = tokenizer.decode(seq, skip_special_tokens=True)
+
+#                 # Store for accuracy computation
+#                 batch_predictions.append(predicted_text)
+#                 batch_ground_truths.append(ground_truth_text)
+#                 batch_inputs.append(input_text)
+
+#             # Compute per-sample accuracy and track incorrect samples
+#             # We'll consider a sample "correct" if the predicted_text matches exactly with ground_truth_text
+#             sample_correct = 0
+#             sample_count = 0
+#             local_incorrect = []
+#             for inp, pred, gt in zip(batch_inputs, batch_predictions, batch_ground_truths):
+#                 if gt and pred:
+#                     try:
+#                         predicted_value = float(pred)
+#                         ground_truth_value = float(gt)
+#                     except:
+#                         # If can't parse as float, skip
+#                         continue
+
+#                     # Check exact token equality by re-tokenizing
+#                     # Or just compare strings since we stripped spaces and both are digits
+#                     if pred == gt:
+#                         sample_correct += 1
+#                     else:
+#                         local_incorrect.append({
+#                             'input': inp,
+#                             'prediction': pred,
+#                             'ground_truth': gt
+#                         })
+#                     sample_count += 1
+
+#             if sample_count > 0:
+#                 batch_accuracy = sample_correct / sample_count
+#             else:
+#                 batch_accuracy = 0.0
+
+#             val_correct += sample_correct
+#             val_total += sample_count
+#             val_incorrect_samples.extend(local_incorrect)
+
+#             # Compute MSE for those that parsed correctly
+#             for pred, gt in zip(batch_predictions, batch_ground_truths):
+#                 if pred and gt:
+#                     try:
+#                         p_val = float(pred)
+#                         g_val = float(gt)
+#                         mse = (p_val - g_val)**2
+#                         val_mse_total += mse
+#                         val_count += 1
+#                     except:
+#                         pass
+
+#     val_acc_per_sample = val_correct / val_total if val_total > 0 else 0.0
+#     val_loss_avg = val_loss_total / len(val_dataloader)
+#     val_base_loss_avg = val_base_loss_total / len(val_dataloader)
+#     val_kl_loss_avg = val_kl_loss_total / len(val_dataloader)
+#     val_weight_decay_loss_avg = val_weight_decay_loss / len(val_dataloader)
+#     val_mse_avg = val_mse_total / val_count if val_count > 0 else None
+
+#     print(f"Validation Accuracy: {val_acc_per_sample*100:.2f}%")
+#     print("Incorrect Samples:")
+#     for sample in val_incorrect_samples:
+#         print(f"Input: {tokenizer.tokenize(sample['input'])}")
+#         print(f"Prediction: {tokenizer.tokenize(sample['prediction'])}")
+#         print(f"Ground Truth: {tokenizer.tokenize(sample['ground_truth'])}")
+#         print("-" * 40)
+
+#     return {
+#         'val_loss': val_loss_avg,
+#         'val_base_loss': val_base_loss_avg,
+#         'val_kl_loss': val_kl_loss_avg,
+#         'val_weight_decay_loss': val_weight_decay_loss_avg,
+#         'val_acc_per_sample': val_acc_per_sample,
+#         'val_mse': val_mse_avg,
+#     }
+    
 # Training function
 def train(args):
     global tokenizer  # Needed for collate_fn
@@ -548,7 +746,7 @@ def train(args):
                     'base_loss': base_loss,
                     'kl_loss': kl_loss,
                     'weight_decay_loss': weight_decay_loss.item(),
-                    'train_acc': train_acc,
+                    'train_acc': train_correct / num_total,
                     'lr': scheduler.get_last_lr()[0],
                     'weight_decay': optimizer.param_groups[0]['weight_decay'],
                     'train_iters': train_iters,
@@ -565,11 +763,10 @@ def train(args):
                     for sample in batch_incorrect_samples:
                        
                         print(f"Input: {tokenizer.tokenize(sample['input'])}")
-                        print(f"Prediction: {tokenizer.tokenize(sample['prediction'])}")
-                        print(f"Ground Truth: {tokenizer.tokenize(sample['ground_truth'])}")
+                        print(sample)
                         print("-" * 40)
 
-                if train_acc >= 0.99:
+                if batch_accuracy >= 0.98:
                     patience_counter += 1
                 else:
                     patience_counter = 0
@@ -591,8 +788,11 @@ def train(args):
         val_mse_total = 0.0
         val_count = 0
         val_incorrect_samples = []
+        print("STARTING VALIDATION")
         with torch.no_grad():
             for val_batch in val_dataloader:
+                if val_total>100 and val_count<30:
+                    break
                 input_ids = val_batch['input_ids'].to(device)
                 attention_mask = val_batch['attention_mask'].to(device)
                 labels = val_batch['labels'].to(device)
@@ -656,10 +856,10 @@ def train(args):
         # Output the incorrect samples
         print(f"Validation Accuracy: {val_acc_per_sample*100:.2f}%")
         print("Incorrect Samples:")
+        # import pdb
+        # pdb.set_trace()
         for sample in val_incorrect_samples:
-            print(f"Input: {tokenizer.tokenize(sample['input'])}")
-            print(f"Prediction: {tokenizer.tokenize(sample['prediction'])}")
-            print(f"Ground Truth: {tokenizer.tokenize(sample['ground_truth'])}")
+            print(sample)
             print("-" * 40)
 
         # Update train domain
