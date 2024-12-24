@@ -4,7 +4,7 @@ Training script to train a Neural Turing Machine (NTM) on classic tasks w/ multi
 May need to: pip install nvidia-ml-py3
 
 Usage Example:
-    python train_ntm.py \
+    python ntm_with_modern_training_runs.py \
         --task copy \
         --batch_size 16 \
         --max_iters 50000 \
