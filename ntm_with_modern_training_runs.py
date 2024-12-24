@@ -24,6 +24,7 @@ Author: Francois Chaubard
 """
 
 import os
+os.environ["WANDB_API_KEY"] = ""
 import sys
 import math
 import wandb
@@ -38,8 +39,62 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
+import random
 
-os.environ["WANDB_API_KEY"] = ""
+def debug_print_samples(
+    x: torch.Tensor, 
+    y: torch.Tensor, 
+    preds: torch.Tensor, 
+    iteration: int, 
+    tag: str = "Train", 
+    n: int = 3
+):
+    """
+    Print a random subset of examples from the batch:
+      - x: [batch_size, seq_len, input_dim]
+      - y: [batch_size, seq_len, output_dim]
+      - preds: [batch_size, seq_len, output_dim]
+      - iteration: current iteration number
+      - tag: 'Train' or 'Val' to label
+      - n: how many samples to print
+
+    We'll show a short portion of each sequence for readability, or entire if short.
+    """
+    # Make sure inputs are on CPU for printing
+    x_cpu = x.detach().cpu()
+    y_cpu = y.detach().cpu()
+    p_cpu = preds.detach().cpu()
+    
+    batch_size = x_cpu.size(0)
+    seq_len_in = x_cpu.size(1)
+    seq_len_out = y_cpu.size(1)
+
+    print(f"\n[DEBUG] {tag} Samples at iteration {iteration}:")
+    
+    # Choose 'n' random indices from the batch
+    indices = random.sample(range(batch_size), min(n, batch_size))
+    for idx in indices:
+        # Convert to Python lists (just for printing clarity)
+        input_seq = x_cpu[idx].tolist()
+        target_seq = y_cpu[idx].tolist()
+        pred_seq = p_cpu[idx].tolist()
+
+        # For tasks like Copy/Repeat/Associative Recall, seq_len_in and seq_len_out might differ
+        # We'll unify them if we want to print them side by side
+        max_seq_len = max(seq_len_in, seq_len_out)
+        
+        # Print just the first few timesteps if it’s too long
+        T_print = min(max_seq_len, 10)  # limit to 10 for brevity
+        print(f"  Sample idx={idx} (showing up to first {T_print} timesteps):")
+        for t in range(T_print):
+            # Safely index
+            input_t = input_seq[t] if t < seq_len_in else "[no-input]"
+            target_t = target_seq[t] if t < seq_len_out else "[no-target]"
+            pred_t   = pred_seq[t] if t < seq_len_out else "[no-pred]"
+
+            print(f"    t={t} | x={input_t} | y={target_t} | pred={pred_t}")
+    print("[END DEBUG]\n")
+
 
 def compute_batch_accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
     """
@@ -633,6 +688,7 @@ def main():
             optimizer.step()
         else:
             # MeZO or other custom
+            outputs, _, _ = model(x)
             loss = mezo_step(model, x, y, criterion, layerwise=args.mezo_layerwise)
 
         # Step scheduler if using one
@@ -657,9 +713,19 @@ def main():
             # Compute training accuracy on this batch
             seq_len = min(outputs.size(1), y.size(1))
             train_acc = compute_batch_accuracy(outputs[:, :seq_len, :], y[:, :seq_len, :])
-
+            # Debug print for TRAIN
+            print("TRAIN:")
+            debug_print_samples(
+                x,                 # the train input
+                y,                 # the train target
+                outputs,           # the train model outputs
+                iteration,
+                tag="Train",
+                n=3
+            )
             # Create a small validation batch
             # (If you want a *real* separate dataset, adjust as needed)
+            print("VAL:")
             with torch.no_grad():
                 if args.task == "copy":
                     val_x, val_y = generate_copy_task(args.batch_size, args.seq_len, bits=args.output_size)
@@ -674,6 +740,14 @@ def main():
                 val_seq_len = min(val_outputs.size(1), val_y.size(1))
                 val_loss = criterion(val_outputs[:, :val_seq_len, :], val_y[:, :val_seq_len, :])
                 val_acc = compute_batch_accuracy(val_outputs[:, :val_seq_len, :], val_y[:, :val_seq_len, :])
+                debug_print_samples(
+                    val_x,
+                    val_y,
+                    val_outputs,
+                    iteration,
+                    tag="Val",
+                    n=3
+                )
 
             # Weight decay term (if used)
             if optimizer is not None and "weight_decay" in optimizer.param_groups[0]:
