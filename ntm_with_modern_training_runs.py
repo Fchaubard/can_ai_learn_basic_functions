@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Training script to train a Neural Turing Machine (NTM) on classic tasks w/ multiple "modern" optimization techniques (Adam, Cosine LR, Warmup, MeZO, etc.) to see if anything has changed.
+May need to: pip install nvidia-ml-py3
 
 Usage Example:
     python train_ntm.py \
@@ -37,6 +38,8 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
+
+os.environ["WANDB_API_KEY"] = ""
 
 
 
