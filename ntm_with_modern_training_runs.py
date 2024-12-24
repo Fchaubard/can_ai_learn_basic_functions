@@ -485,84 +485,214 @@ def train_step(model, x, y, criterion, optimizer):
     return loss.item()
 
 
-def mezo_step(model, x, y, criterion, epsilon=1e-3, layerwise=False):
+# def mezo_step(model, x, y, criterion, epsilon=1e-3, layerwise=False, lr = 1e-3):
+#     """
+#     Memory-Efficient Zero-Order (MeZO) demonstration:
+#     ...
+#     Returns a PyTorch tensor (so main loop can do .item()).
+#     """
+#     model.train()
+#     all_params = list(model.parameters())
+
+#     if layerwise:
+#         total_loss = 0.0
+#         for param in all_params:
+#             if param.requires_grad:
+#                 original_data = param.data.clone()
+
+#                 # +epsilon
+#                 param.data = original_data + epsilon
+#                 outputs, _, _ = model(x)
+#                 seq_len = min(outputs.size(1), y.size(1))
+#                 loss_plus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
+
+#                 # -2 * epsilon
+#                 param.data = original_data - 2 * epsilon
+#                 outputs, _, _ = model(x)
+#                 loss_minus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
+
+#                 grad_est = (loss_plus - loss_minus) / (2 * epsilon)
+
+#                 # restore
+#                 param.data = original_data
+
+#                 # manual update
+                
+#                 param.data = param.data - lr * grad_est * epsilon * torch.sign(torch.randn_like(param.data))
+
+#                 total_loss += ((loss_plus + loss_minus) / 2.0).item()
+#         avg_loss = total_loss / len(all_params)
+#         return torch.tensor(avg_loss, device=x.device)
+
+#     else:
+#         original_data = [p.data.clone() for p in all_params]
+#         directions = [torch.randn_like(p.data) for p in all_params]
+
+#         # +epsilon
+#         for p, d in zip(all_params, directions):
+#             p.data = p.data + epsilon * d.sign()
+
+#         outputs, _, _ = model(x)
+#         seq_len = min(outputs.size(1), y.size(1))
+#         loss_plus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
+
+#         # -2 epsilon
+#         for p, d in zip(all_params, directions):
+#             p.data = p.data - 2 * epsilon * d.sign()
+
+#         outputs, _, _ = model(x)
+#         loss_minus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
+
+#         # restore
+#         for p, orig_data in zip(all_params, original_data):
+#             p.data = orig_data
+
+#         grad_est = (loss_plus - loss_minus) / (2 * epsilon)
+        
+#         for p, d in zip(all_params, directions):
+#             p.data = p.data - lr * grad_est.item() * epsilon * d.sign()
+
+#         avg_loss = 0.5 * (loss_plus.item() + loss_minus.item())
+#         return torch.tensor(avg_loss, device=x.device)
+
+
+def mezo_step(
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    criterion: torch.nn.Module,
+    epsilon: float = 1e-3,
+    layerwise: bool = False,
+    weight_decay: float = 1e-5
+) -> torch.Tensor:
     """
-    Memory-Efficient Zero-Order (MeZO) demonstration:
-    - For each layer (or for the entire model if layerwise=False), we do:
-      1) Save original weights
-      2) Perturb weights by +epsilon, compute forward pass & loss
-      3) Perturb by -2*epsilon, compute forward pass & loss
-      4) Finite diff => grad ~ (loss_plus - loss_minus) / 2*epsilon
-      5) Restore original, apply update
-    This is a toy demonstration (not a fully optimized or stable approach).
+    Memory-Efficient Zero-Order (MeZO) demonstration with optional weight decay.
+    
+    Args:
+      model: The NTM (or any) model to update.
+      x: Input batch tensor.
+      y: Target batch tensor.
+      criterion: Loss function (e.g., BCEWithLogitsLoss).
+      epsilon: Perturbation magnitude for finite difference.
+      layerwise: If True, do layer-by-layer (param-by-param) perturbation.
+                 If False, do a single big perturbation for the entire model.
+      weight_decay: L2 regularization coefficient. 
+                    If > 0, adds 0.5 * weight_decay * sum(param^2) to the loss.
+    
+    Returns:
+      A PyTorch scalar tensor representing the average loss from the plus/minus passes.
     """
     model.train()
     all_params = list(model.parameters())
-    
+
+    def compute_weight_decay_loss(model, wd):
+        """
+        Compute 0.5 * wd * sum of squares of all parameters that require grad.
+        Returns a float or a torch scalar. We'll do float + manual add to the final
+        so we keep the data consistent with the final computations.
+        """
+        if wd == 0.0:
+            return 0.0
+        sum_of_squares = 0.0
+        for p in model.parameters():
+            if p.requires_grad:
+                sum_of_squares += p.data.pow(2).sum().item()
+        return 0.5 * wd * sum_of_squares
+
     if layerwise:
-        # For each layer, do the perturbation
+        # Layerwise approach: For each parameter, do +epsilon pass, -2*epsilon pass, etc.
         total_loss = 0.0
+        count_params = 0
         for param in all_params:
-            if param.requires_grad:
-                original_data = param.data.clone()
-                
-                # +epsilon
-                param.data = original_data + epsilon
-                outputs, _, _ = model(x)
-                seq_len = min(outputs.size(1), y.size(1))
-                loss_plus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
-                
-                # -2 epsilon
-                param.data = original_data - 2 * epsilon
-                outputs, _, _ = model(x)
-                loss_minus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
-                
-                # gradient estimate
-                grad_est = (loss_plus - loss_minus) / (2 * epsilon)
-                
-                # restore
-                param.data = original_data
-                
-                # manual update
-                # Let's pick some "learning rate" for demonstration
-                lr = 1e-3
-                param.data = param.data - lr * grad_est * epsilon * torch.sign(torch.randn_like(param.data))
-                
-                total_loss += (loss_plus.item() + loss_minus.item()) / 2.0
-        return total_loss / len(all_params)
+            if not param.requires_grad:
+                continue
+            count_params += 1
+
+            original_data = param.data.clone()
+
+            # + epsilon
+            param.data = original_data + epsilon
+            outputs, _, _ = model(x)
+            seq_len = min(outputs.size(1), y.size(1))
+            loss_plus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
+            # Add weight decay penalty
+            loss_plus = loss_plus + compute_weight_decay_loss(model, weight_decay)
+
+            # -2 * epsilon
+            param.data = original_data - 2 * epsilon
+            outputs, _, _ = model(x)
+            loss_minus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
+            # Add weight decay penalty
+            loss_minus = loss_minus + compute_weight_decay_loss(model, weight_decay)
+
+            # Finite difference
+            grad_est = (loss_plus - loss_minus) / (2 * epsilon)
+
+            # Restore original
+            param.data = original_data
+
+            # Manual update: For demonstration, we pick a small LR
+            lr = 1e-3
+            # We multiply by 'grad_est' (a scalar), then epsilon, etc.
+            # This is a toy approach to do "coordinate-free" direction updates.
+            with torch.no_grad():
+                # param update
+                param.data -= lr * grad_est * epsilon * torch.sign(torch.randn_like(param.data))
+
+            # Accumulate average loss for logging
+            # We'll take the mean of (loss_plus + loss_minus) / 2 to approximate the loss
+            avg_pass_loss = 0.5 * (loss_plus.item() + loss_minus.item())
+            total_loss += avg_pass_loss
+
+        # Average over number of parameters
+        if count_params > 0:
+            total_loss /= float(count_params)
+        # Return as a Torch tensor so we can call .item() outside
+        return torch.tensor(total_loss, device=x.device)
+
     else:
-        # Single big perturbation approach
+        # Single-perturbation approach
         original_data = [p.data.clone() for p in all_params]
-        
-        # Random direction for each param
-        directions = [torch.randn_like(p.data) for p in all_params]
-        
-        # +epsilon
+        directions = [torch.randn_like(p.data) if p.requires_grad else None for p in all_params]
+
+        # + epsilon
         for p, d in zip(all_params, directions):
-            p.data = p.data + epsilon * d.sign()
+            if p.requires_grad and d is not None:
+                p.data = p.data + epsilon * d.sign()
+
         outputs, _, _ = model(x)
         seq_len = min(outputs.size(1), y.size(1))
         loss_plus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
-        
+        loss_plus = loss_plus + compute_weight_decay_loss(model, weight_decay)
+
         # -2 epsilon
         for p, d in zip(all_params, directions):
-            p.data = p.data - 2 * epsilon * d.sign()
+            if p.requires_grad and d is not None:
+                p.data = p.data - 2 * epsilon * d.sign()
+
         outputs, _, _ = model(x)
         loss_minus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
-        
-        # gradient estimate
-        grad_est = (loss_plus - loss_minus) / (2 * epsilon)
-        
-        # restore
+        loss_minus = loss_minus + compute_weight_decay_loss(model, weight_decay)
+
+        # Restore original data
         for p, orig_data in zip(all_params, original_data):
             p.data = orig_data
-        
-        # manual update
+
+        # Finite difference gradient estimate
+        grad_est = (loss_plus - loss_minus) / (2 * epsilon)
+
+        # Manual update
         lr = 1e-3
-        for p, d in zip(all_params, directions):
-            p.data = p.data - lr * grad_est.item() * epsilon * d.sign()
-        
-        return (loss_plus.item() + loss_minus.item()) / 2.0
+        with torch.no_grad():
+            for p, d in zip(all_params, directions):
+                if p.requires_grad and d is not None:
+                    # grad_est is a scalar
+                    p.data = p.data - lr * grad_est.item() * epsilon * d.sign()
+
+        # Return average of plus/minus losses as a scalar
+        avg_loss = 0.5 * (loss_plus.item() + loss_minus.item())
+        return torch.tensor(avg_loss, device=x.device)
+
 
 
 ##############################################################################
@@ -605,6 +735,7 @@ def main():
     parser.add_argument("--wandb_proj", type=str, default=None, help="Weights & Biases project name.")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases run name.")
     args = parser.parse_args()
+    init_weight_decay = 1e-5
     
     # Device
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -634,7 +765,7 @@ def main():
     # Create optimizer
     if args.optimizer == "adam":
         # Example: if you want to see weight_decay in logs, set it here
-        optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
+        optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=init_weight_decay)
     else:
         optimizer = None  # We'll do mezo manually
 
@@ -689,7 +820,13 @@ def main():
         else:
             # MeZO or other custom
             outputs, _, _ = model(x)
-            loss = mezo_step(model, x, y, criterion, layerwise=args.mezo_layerwise)
+            loss = mezo_step(model, 
+                             x, 
+                             y, 
+                             criterion, 
+                             layerwise=args.mezo_layerwise, 
+                             lr=args.learning_rate,
+                             weight_decay=init_weight_decay)
 
         # Step scheduler if using one
         if scheduler is not None and iteration > args.warmup_steps:
@@ -759,9 +896,9 @@ def main():
 
             # Print to stdout
             msg = (f"Iter: {iteration}, "
-                   f"Train Loss: {loss.item():.4f}, "
+                   f"Train Loss: {loss}, "
                    f"Train Acc: {train_acc:.3f}, "
-                   f"Val Loss: {val_loss.item():.4f}, "
+                   f"Val Loss: {val_loss}, "
                    f"Val Acc: {val_acc:.3f}, "
                    f"WD term: {wd_term:.6f}, "
                    f"LR: {lr_current:.8f}")
@@ -771,9 +908,9 @@ def main():
             # Log to W&B
             if args.wandb_proj is not None:
                 wandb.log({
-                    "train_loss": loss.item(),
+                    "train_loss": loss,
                     "train_acc": train_acc,
-                    "val_loss": val_loss.item(),
+                    "val_loss": val_loss,
                     "val_acc": val_acc,
                     "weight_decay_term": wd_term,
                     "lr": lr_current
