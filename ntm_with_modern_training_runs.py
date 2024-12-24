@@ -582,7 +582,7 @@ def main():
     global_step = 0
     
     # Training loop
-    for iteration in range(1, 1e10 + 1):
+    for iteration in range(1, 100000000 + 1):
         print("iteration:",iteration)
         
         # Generate data
