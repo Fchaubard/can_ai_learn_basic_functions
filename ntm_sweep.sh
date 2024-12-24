@@ -14,17 +14,17 @@
 
 # 1) Kill existing screens with prefix "NTM_"
 echo "[INFO] Killing existing screen sessions named 'NTM_*'..."
-screen -ls | grep '\.NTM_' | awk '{print $1}' | xargs -I{} screen -S {} -X quit 2>/dev/null
+screen -ls | grep '\.NTM_' | awk '{print $1}' | xargs -I{} screen -S {} -X quit #2>/dev/null
 
 # 2) Hyperparameter values to sweep
 TASKS=("copy" "repeat_copy" "associative_recall")
-HIDDEN_SIZES=(64 128)
-MEMORY_SIZES=(64 128)
-HEAD_SIZES=(32 64)
+HIDDEN_SIZES=(64 128 1280)
+MEMORY_SIZES=(64 128 1280)
+HEAD_SIZES=(32 64 6400)
 LEARNING_RATES=(0.001 0.0001)
 OPTIMIZERS=("adam" "mezo")
 
-MAX_ITERS=5000
+MAX_ITERS=1000000
 BATCH_SIZE=16
 SEQ_LEN=10
 LOG_INTERVAL=500
@@ -69,9 +69,6 @@ for TASK in "${TASKS[@]}"; do
                   echo '[INFO] Finished run: $RUN_NAME';
                   exec bash
                 "
-
-                # Optional short sleep to let resources settle
-                sleep 5
               done
             else
               # For Adam (standard backprop)
@@ -81,7 +78,7 @@ for TASK in "${TASKS[@]}"; do
               screen -dmS "$RUN_NAME" bash -c "
                 echo '[INFO] Starting run: $RUN_NAME';
                 export WANDB_RUN_NAME=$RUN_NAME;
-                python train_ntm.py \
+                python ntm_with_modern_training_runs.py \
                   --task $TASK \
                   --seq_len $SEQ_LEN \
                   --hidden_size $HS \
@@ -99,8 +96,9 @@ for TASK in "${TASKS[@]}"; do
                 exec bash
               "
 
-              sleep 5
+              
             fi
+            sleep 5
 
           done
         done
