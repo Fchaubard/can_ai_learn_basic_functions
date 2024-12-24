@@ -41,6 +41,30 @@ import torch.nn.functional as F
 
 os.environ["WANDB_API_KEY"] = ""
 
+def compute_batch_accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
+    """
+    Computes bitwise accuracy for a batch, assuming binary classification (0 or 1) on each bit.
+      - logits: [batch_size, seq_len, bits], raw outputs
+      - targets: [batch_size, seq_len, bits], 0/1 ground truth
+    """
+    with torch.no_grad():
+        preds = torch.sigmoid(logits) > 0.5   # boolean tensor
+        correct = (preds == (targets > 0.5))  # elementwise comparison
+        return correct.float().mean().item()  # average over entire batch & all bits
+
+def compute_weight_decay_term(model, weight_decay: float) -> float:
+    """
+    If you're applying weight decay in optimizer, you might want to log
+    the L2 penalty term = 0.5 * wd * sum of squares of all parameters.
+    (This is purely for logging; the actual WD is applied in the optimizer step.)
+    """
+    if weight_decay <= 0.0:
+        return 0.0
+    sum_of_squares = 0.0
+    with torch.no_grad():
+        for p in model.parameters():
+            sum_of_squares += p.pow(2).sum().item()
+    return 0.5 * weight_decay * sum_of_squares
 
 
 def pick_gpu_with_most_free_mem() -> int:
@@ -548,44 +572,37 @@ def main():
         head_size=args.head_size,
         num_heads=args.num_heads
     ).to(device)
-    
-    # Create model
-    model = NTM(
-        input_size=args.input_size, 
-        output_size=args.output_size,
-        hidden_size=args.hidden_size,
-        memory_size=args.memory_size,
-        head_size=args.head_size,
-        num_heads=args.num_heads
-    ).to(device)
-    
-    # Criterion
+
     criterion = nn.BCEWithLogitsLoss()
-    
-    # Optimizer
+
+    max_iters = 1000000000
+    # Create optimizer
     if args.optimizer == "adam":
-        optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+        # Example: if you want to see weight_decay in logs, set it here
+        optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
     else:
         optimizer = None  # We'll do mezo manually
-    
+
     # Learning rate scheduler (cosine)
     if args.cosine_lr and args.optimizer == "adam":
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_iters, eta_min=1e-6)
+        # Important: T_max should match how many times you step the scheduler
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max_iters,
+            eta_min=1e-6
+        )
     else:
         scheduler = None
-    
-    # W&B init
+
+    # Initialize W&B if desired
     if args.wandb_proj is not None:
         wandb.init(project=args.wandb_proj, name=args.wandb_run_name)
         wandb.config.update(args)
-    
+
     global_step = 0
-    
-    # Training loop
-    for iteration in range(1, 100000000 + 1):
-        print("iteration:",iteration)
-        
-        # Generate data
+
+    for iteration in range(1, max_iters + 1):
+        # Generate a training batch
         if args.task == "copy":
             x, y = generate_copy_task(args.batch_size, args.seq_len, bits=args.output_size)
         elif args.task == "repeat_copy":
@@ -593,39 +610,100 @@ def main():
         else:
             # default: associative recall
             x, y = generate_associative_recall_task(args.batch_size, item_len=3, num_items=args.seq_len, bits=args.output_size)
-        
+
         x, y = x.to(device), y.to(device)
-        
-        # Possibly do warmup
+
+        # Optional warmup
         if args.warmup_steps > 0 and iteration <= args.warmup_steps and args.optimizer == "adam":
             warmup_frac = iteration / float(args.warmup_steps)
             for g in optimizer.param_groups:
-                g['lr'] = args.learning_rate * warmup_frac
-        
-        # One step
-        if args.mezo:
-            loss_val = mezo_step(model, x, y, criterion, layerwise=args.mezo_layerwise)
+                g["lr"] = args.learning_rate * warmup_frac
+
+        # ===================
+        #     TRAIN STEP
+        # ===================
+        if args.optimizer == "adam":
+            # Typical backprop
+            model.train()
+            optimizer.zero_grad()
+            outputs, _, _ = model(x)
+            seq_len = min(outputs.size(1), y.size(1))
+            loss = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
+            loss.backward()
+            optimizer.step()
         else:
-            loss_val = train_step(model, x, y, criterion, optimizer)
-        
-        # Step LR scheduler
-        if scheduler is not None:
+            # MeZO or other custom
+            loss = mezo_step(model, x, y, criterion, layerwise=args.mezo_layerwise)
+
+        # Step scheduler if using one
+        if scheduler is not None and iteration > args.warmup_steps:
             scheduler.step()
-        
+
+        # =====================
+        #    LOGGING BLOCK
+        # =====================
         global_step += 1
-        
-        # Logging
+
+        # Log every N iterations
         if iteration % args.log_interval == 0:
-            lr_current = (
-                optimizer.param_groups[0]["lr"] if args.optimizer == "adam" else 0.0
-            )
-            msg = f"Iter: {iteration}, Loss: {loss_val:.4f}, LR: {lr_current:.6f}"
+            # Compute current LR
+            if scheduler is not None:
+                lr_current = scheduler.get_last_lr()[0]  # for multi-param groups, pick group[0]
+            elif optimizer is not None and len(optimizer.param_groups) > 0:
+                lr_current = optimizer.param_groups[0]["lr"]
+            else:
+                lr_current = 0.0
+
+            # Compute training accuracy on this batch
+            seq_len = min(outputs.size(1), y.size(1))
+            train_acc = compute_batch_accuracy(outputs[:, :seq_len, :], y[:, :seq_len, :])
+
+            # Create a small validation batch
+            # (If you want a *real* separate dataset, adjust as needed)
+            with torch.no_grad():
+                if args.task == "copy":
+                    val_x, val_y = generate_copy_task(args.batch_size, args.seq_len, bits=args.output_size)
+                elif args.task == "repeat_copy":
+                    val_x, val_y = generate_repeat_copy_task(args.batch_size, args.seq_len, bits=args.output_size)
+                else:
+                    val_x, val_y = generate_associative_recall_task(
+                        args.batch_size, item_len=3, num_items=args.seq_len, bits=args.output_size
+                    )
+                val_x, val_y = val_x.to(device), val_y.to(device)
+                val_outputs, _, _ = model(val_x)
+                val_seq_len = min(val_outputs.size(1), val_y.size(1))
+                val_loss = criterion(val_outputs[:, :val_seq_len, :], val_y[:, :val_seq_len, :])
+                val_acc = compute_batch_accuracy(val_outputs[:, :val_seq_len, :], val_y[:, :val_seq_len, :])
+
+            # Weight decay term (if used)
+            if optimizer is not None and "weight_decay" in optimizer.param_groups[0]:
+                wd = optimizer.param_groups[0]["weight_decay"]
+            else:
+                wd = 0.0
+
+            wd_term = compute_weight_decay_term(model, wd)
+
+            # Print to stdout
+            msg = (f"Iter: {iteration}, "
+                   f"Train Loss: {loss.item():.4f}, "
+                   f"Train Acc: {train_acc:.3f}, "
+                   f"Val Loss: {val_loss.item():.4f}, "
+                   f"Val Acc: {val_acc:.3f}, "
+                   f"WD term: {wd_term:.6f}, "
+                   f"LR: {lr_current:.8f}")
             print(msg)
             sys.stdout.flush()
-            
+
+            # Log to W&B
             if args.wandb_proj is not None:
-                wandb.log({"loss": loss_val, "lr": lr_current}, step=global_step)
-                
+                wandb.log({
+                    "train_loss": loss.item(),
+                    "train_acc": train_acc,
+                    "val_loss": val_loss.item(),
+                    "val_acc": val_acc,
+                    "weight_decay_term": wd_term,
+                    "lr": lr_current
+                }, step=global_step)
 
 
 if __name__ == "__main__":
