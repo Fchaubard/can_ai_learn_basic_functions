@@ -24,7 +24,7 @@ Author: Francois Chaubard
 """
 
 import os
-os.environ["WANDB_API_KEY"] = ""
+os.environ["WANDB_API_KEY"] = "cce47709d839921f0b13533529f31c8af7f3f4dc"
 import sys
 import math
 import wandb
@@ -144,47 +144,50 @@ def pick_gpu_with_most_free_mem() -> int:
 
 
 ##############################################################################
-# Data Generation for Classical NTM Tasks
+# Data Generation for Tasks
 ##############################################################################
-def generate_copy_task(batch_size: int, seq_len: int, bits: int = 8) -> Tuple[torch.Tensor, torch.Tensor]:
+
+def generate_copy_task(
+    batch_size: int, 
+    seq_len: int, 
+    bits: int = 8, 
+    train: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     The copy task:
-      - Input is a random sequence of bits plus an end-of-sequence marker.
-      - Model should output the same sequence after the marker.
-    Returns:
-      x: [batch_size, 2*seq_len + 1, bits+1]  (the input, incl. EOS marker)
-      y: [batch_size, 2*seq_len + 1, bits]    (the target)
+      - If train=True, we use seq_len as is.
+      - If train=False, we use seq_len * 5 to validate on a longer sequence.
+
+    x: [batch_size, 2*seq_len + 1, bits+1]
+    y: [batch_size, 2*seq_len + 1, bits]
     """
+    if not train:
+        seq_len = seq_len * 5  # 5x longer sequences for validation
+
     # 1) Generate random bit sequences [batch_size, seq_len, bits].
     seq = torch.randint(0, 2, (batch_size, seq_len, bits), dtype=torch.float32)
     
     # 2) Convert to [batch_size, seq_len, bits+1] by appending a zero column for the marker slot.
     zero_col = torch.zeros(batch_size, seq_len, 1, dtype=torch.float32)
-    seq_input = torch.cat([seq, zero_col], dim=-1)  # now shape is [batch_size, seq_len, bits+1]
+    seq_input = torch.cat([seq, zero_col], dim=-1)  # shape: [B, seq_len, bits+1]
 
-    # 3) Create an EOS marker of shape [batch_size, 1, bits+1], where the last entry is 1.
+    # 3) Create an EOS marker of shape [B, 1, bits+1], last entry is 1.
     eos = torch.zeros(batch_size, 1, bits + 1, dtype=torch.float32)
     eos[..., -1] = 1.0
 
-    # 4) Concatenate the sequence and the EOS marker along the time dimension => [batch_size, seq_len+1, bits+1]
+    # 4) Concatenate sequence and the EOS marker => [B, seq_len+1, bits+1]
     seq_with_eos = torch.cat([seq_input, eos], dim=1)
 
-    # 5) For the output phase, we add an extra seq_len "time steps" of zeros to the input:
+    # 5) For the output phase, add extra seq_len "time steps" of zeros
     pad_input = torch.zeros(batch_size, seq_len, bits + 1)
-    x = torch.cat([seq_with_eos, pad_input], dim=1)
-    # x shape: [batch_size, 2*seq_len + 1, bits+1]
+    x = torch.cat([seq_with_eos, pad_input], dim=1)  # [B, 2*seq_len + 1, bits+1]
 
-    # 6) Build the target:
-    #    - During the first seq_len+1 timesteps (input + EOS), the target is zero (or we don't penalize).
-    #    - After the EOS, we want the model to reproduce the original seq bits.
-    # So we create zero output for seq_len+1 steps, then the seq bits for the next seq_len steps.
+    # 6) Build the target: zero for first seq_len+1 steps, then replicate original seq bits
     pad_out = torch.zeros(batch_size, seq_len + 1, bits)
-    y_copy = seq  # shape [batch_size, seq_len, bits]
-    y = torch.cat([pad_out, y_copy], dim=1)
-    # y shape: [batch_size, 2*seq_len + 1, bits]
+    y_copy = seq
+    y = torch.cat([pad_out, y_copy], dim=1)  # [B, 2*seq_len + 1, bits]
 
     return x, y
-
 
 
 def generate_repeat_copy_task(
@@ -192,147 +195,308 @@ def generate_repeat_copy_task(
     seq_len: int,
     bits: int = 8,
     repeat_min: int = 1,
-    repeat_max: int = 3
-):
+    repeat_max: int = 3,
+    train: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    The repeat-copy task:
-      - We feed a sequence of bits, followed by a row encoding the repeat count,
-        then a marker row, then a period for output generation.
-      - The model must output the original sequence repeated 'count' times.
+    The repeat-copy task, input dimension = bits+1.
 
-    Requirements:
-      - Input dimension must be (bits + 2).
-      - Output dimension is 'bits'.
+    - If train=False, we do seq_len*5 for validation.
+    - We present a sequence [seq_len, bits], plus a row storing the repeat count,
+      plus a marker row, then pad zeros for the output phase.
+
+    Returns:
+      x: [B, (seq_len+2) + (seq_len*repeat_max), bits+1]
+      y: [B, (seq_len+2) + (seq_len*repeat_max), bits]
     """
-    # 1) Generate random bit sequences: shape [B, seq_len, bits]
+    if not train:
+        seq_len = seq_len * 5
+
     seq = torch.randint(0, 2, (batch_size, seq_len, bits), dtype=torch.float32)
+    zero_col = torch.zeros(batch_size, seq_len, 1, dtype=torch.float32)
+    seq_input = torch.cat([seq, zero_col], dim=-1)  # [B, seq_len, bits+1]
 
-    # 2) Convert to shape [B, seq_len, bits+2] by adding two extra columns for
-    #    repeat-count/marker usage:
-    extra_cols = torch.zeros(batch_size, seq_len, 2, dtype=torch.float32)
-    seq_input = torch.cat([seq, extra_cols], dim=-1)  # [B, seq_len, bits+2]
-
-    # 3) Sample repeat counts
     repeat_counts = torch.randint(repeat_min, repeat_max + 1, (batch_size,))
 
-    # 4) Create a single row for the repeat count (second-last column)
-    #    and a single row for the marker (last column).
-    #    count_row: [B, 1, bits+2]
-    count_row = torch.zeros(batch_size, 1, bits + 2, dtype=torch.float32)
+    count_row = torch.zeros(batch_size, 1, bits + 1, dtype=torch.float32)
     for i in range(batch_size):
         c = float(repeat_counts[i].item())
-        count_row[i, 0, -2] = c  # store the count in the second-last column
+        count_row[i, 0, -2] = c
 
-    #    marker_row: [B, 1, bits+2], where the last column is 1
-    marker_row = torch.zeros(batch_size, 1, bits + 2, dtype=torch.float32)
+    marker_row = torch.zeros(batch_size, 1, bits + 1, dtype=torch.float32)
     marker_row[..., -1] = 1.0
 
-    # 5) Concatenate sequence + count row + marker row
     seq_with_count_marker = torch.cat([seq_input, count_row, marker_row], dim=1)
-    # shape: [B, seq_len + 2, bits+2]
 
-    # 6) Pad the input for the "output phase".
-    #    We assume the maximum repeated output can be seq_len * repeat_max.
-    pad_input = torch.zeros(batch_size, seq_len * repeat_max, bits + 2, dtype=torch.float32)
-
-    # 7) Final input: [B, (seq_len+2) + seq_len*repeat_max, bits+2]
+    pad_input = torch.zeros(batch_size, seq_len * repeat_max, bits + 1, dtype=torch.float32)
     x = torch.cat([seq_with_count_marker, pad_input], dim=1)
 
-    # ------------------------------
-    # Construct the Target (outputs)
-    # ------------------------------
+    total_time = (seq_len + 2) + (seq_len * repeat_max)
+    zero_target = torch.zeros(batch_size, seq_len + 2, bits, dtype=torch.float32)
 
-    # 8) We want the first (seq_len+2) steps to produce zeros (or be ignored in loss),
-    #    then the repeated sequence. We'll pad to length = seq_len * repeat_max.
-    total_out_len = (seq_len + 2) + (seq_len * repeat_max)
-    zero_out = torch.zeros(batch_size, seq_len + 2, bits, dtype=torch.float32)
-
-    # 9) Build the repeated sequence for each sample, then pad it to seq_len*repeat_max
-    repeated_outs = []
+    repeated_stacks = []
     for i in range(batch_size):
-        c = repeat_counts[i].item()
-        repeated_seq = seq[i].repeat((int(c), 1))  # shape: [seq_len * c, bits]
-        # pad to seq_len * repeat_max
+        c = int(repeat_counts[i].item())
+        repeated_seq = seq[i].repeat((c, 1))
         pad_len = seq_len * repeat_max - repeated_seq.size(0)
         out_pad = torch.zeros(pad_len, bits, dtype=torch.float32)
-        repeated_padded = torch.cat([repeated_seq, out_pad], dim=0)  # [seq_len*repeat_max, bits]
-        repeated_outs.append(repeated_padded)
+        repeated_out = torch.cat([repeated_seq, out_pad], dim=0)
+        repeated_stacks.append(repeated_out)
 
-    out_rep = torch.stack(repeated_outs, dim=0)  # [B, seq_len*repeat_max, bits]
-
-    # 10) Concatenate zeros (for the input & marker phase) + repeated portion
-    y = torch.cat([zero_out, out_rep], dim=1)  # [B, total_out_len, bits]
+    repeated_outs = torch.stack(repeated_stacks, dim=0)
+    y = torch.cat([zero_target, repeated_outs], dim=1)
 
     return x, y
+
+
 
 
 def generate_associative_recall_task(
     batch_size: int,
     item_len: int = 3,
     num_items: int = 3,
-    bits: int = 8
-):
+    bits: int = 8,
+    train: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    The associative-recall task (simplified):
-      - We have `num_items` items, each of length `item_len` bits.
-      - We present all items (flattened), then a marker row, then a 'query' item.
-      - The model must output the item that follows the query in the original list.
+    If train=False, we do num_items *= 5 for validation.
 
-    Requirements:
-      - Input dimension must be (bits + 1).
-      - Output dimension is 'bits'.
+    x: [B, (num_items*item_len + 1 + item_len), bits+1]
+    y: [B, same_time, bits]
     """
-    # 1) Generate random items: [B, num_items, item_len, bits]
+    if not train:
+        num_items = num_items * 5
+
     items = torch.randint(0, 2, (batch_size, num_items, item_len, bits), dtype=torch.float32)
-
-    # 2) Randomly choose an index in [0, num_items-2], so there's always a "next" item
     query_indices = torch.randint(0, num_items - 1, (batch_size,))
 
-    # 3) Gather the queries and their "next" (answers)
-    queries = []
-    answers = []
+    queries, answers = [], []
     for i in range(batch_size):
         q_idx = query_indices[i].item()
-        queries.append(items[i, q_idx])       # shape [item_len, bits]
-        answers.append(items[i, q_idx + 1])   # shape [item_len, bits]
+        queries.append(items[i, q_idx])
+        answers.append(items[i, q_idx + 1])
 
-    queries = torch.stack(queries, dim=0)   # [B, item_len, bits]
-    answers = torch.stack(answers, dim=0)   # [B, item_len, bits]
+    queries = torch.stack(queries, dim=0)
+    answers = torch.stack(answers, dim=0)
 
-    # 4) Flatten the full set of items: [B, num_items * item_len, bits]
     flattened = items.view(batch_size, num_items * item_len, bits)
-
-    # 5) Convert flattened items to shape [B, num_items*item_len, bits+1] by adding
-    #    one extra column for the marker dimension (initialized to zero).
     extra_col = torch.zeros(batch_size, num_items * item_len, 1, dtype=torch.float32)
-    flattened_in = torch.cat([flattened, extra_col], dim=-1)  # [B, num_items*item_len, bits+1]
+    flattened_in = torch.cat([flattened, extra_col], dim=-1)
 
-    # 6) Create a marker row: [B, 1, bits+1]
     marker_row = torch.zeros(batch_size, 1, bits + 1, dtype=torch.float32)
     marker_row[..., -1] = 1.0
 
-    # 7) Convert the query to shape [B, item_len, bits+1] (add zero col)
     zero_col_query = torch.zeros(batch_size, item_len, 1, dtype=torch.float32)
-    query_in = torch.cat([queries, zero_col_query], dim=-1)  # [B, item_len, bits+1]
+    query_in = torch.cat([queries, zero_col_query], dim=-1)
 
-    # 8) Final input x = [flattened items, marker row, query]
-    #    shape => [B, (num_items*item_len + 1 + item_len), bits+1]
     x = torch.cat([flattened_in, marker_row, query_in], dim=1)
 
-    # ------------------------------
-    # Construct the Target (outputs)
-    # ------------------------------
-
-    # 9) The target is the item after the query => [B, item_len, bits].
-    #    We'll pad it to match the same time dimension as x.
-    T_in = x.size(1)  # total input length
-    item_out_len = answers.size(1)  # usually item_len
-    pad_len = T_in - item_out_len
-
+    T_in = x.size(1)
+    out_len = answers.size(1)
+    pad_len = T_in - out_len
     pad_zeros = torch.zeros(batch_size, pad_len, bits, dtype=torch.float32)
-    y = torch.cat([answers, pad_zeros], dim=1)  # [B, T_in, bits]
+    y = torch.cat([answers, pad_zeros], dim=1)
 
     return x, y
+
+
+def generate_arithmetic_task(
+    batch_size: int,
+    task_type: str = "add",
+    max_num: int = 100,
+    train: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Generates a simple arithmetic dataset for tasks = {add, sub, mul, div}.
+    Returns x => [B, 1, input_dim], y => [B, 1, output_dim].
+    """
+    # Example domain shift if !train, etc.
+    if train:
+        lo, hi = 1, max_num
+    else:
+        lo, hi = max_num + 1, max_num + 10
+
+    # sample a,b ensuring no negative results for sub,div if desired
+    a = torch.randint(lo, hi + 1, (batch_size,))
+    b = torch.randint(lo, hi + 1, (batch_size,))
+
+    if task_type in ["sub", "div"]:
+        # force a >= b
+        for i in range(batch_size):
+            a_val = a[i].item()
+            if a_val < lo:
+                a_val = lo
+                a[i] = lo
+            b[i] = torch.randint(lo, a_val+1, (1,))
+
+    # compute result
+    if task_type == "add":
+        res = a + b
+        max_res = 2 * hi
+    elif task_type == "sub":
+        res = a - b
+        max_res = hi
+    elif task_type == "mul":
+        res = a * b
+        max_res = hi * hi
+    elif task_type == "div":
+        res = a // b
+        max_res = hi
+    else:
+        # fallback => add
+        res = a + b
+        max_res = 2 * hi
+
+    # figure bits_in, bits_out
+    bits_in = math.ceil(math.log2(hi + 1)) 
+    bits_out = math.ceil(math.log2(max_res + 1))
+
+    x_batch = []
+    y_batch = []
+
+    for i in range(batch_size):
+        a_val = int(a[i].item())
+        b_val = int(b[i].item())
+        r_val = int(res[i].item())
+
+        a_bin = f"{a_val:0{bits_in}b}"
+        b_bin = f"{b_val:0{bits_in}b}"
+        r_bin = f"{r_val:0{bits_out}b}"
+
+        # input => [a_bin + b_bin + marker], length=2*bits_in+1
+        x_i_list = [int(c) for c in a_bin] + [int(c) for c in b_bin] + [0]
+        x_i = torch.tensor(x_i_list, dtype=torch.float32)  # shape [input_length]
+
+        # output => shape [bits_out]
+        y_i = torch.tensor([int(c) for c in r_bin], dtype=torch.float32)
+
+        # Now ensure 3D => [1, 1, input_length] & [1, 1, bits_out]
+        # then we can stack to [B, 1, input_length]
+        x_i = x_i.unsqueeze(0).unsqueeze(0)  # => [1,1,length]
+        y_i = y_i.unsqueeze(0).unsqueeze(0)  # => [1,1,bits_out]
+
+        x_batch.append(x_i)
+        y_batch.append(y_i)
+
+    # cat along dim=0 => [B, 1, length], [B, 1, bits_out]
+    x = torch.cat(x_batch, dim=0)
+    y = torch.cat(y_batch, dim=0)
+
+    return x, y
+
+
+
+def generate_fibonacci_task(
+    batch_size: int,
+    max_n: int = 10,
+    train: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    If train=True, n in [1..max_n].
+    If train=False, n in [max_n+1..max_n+10].
+    x: [B, 1, bits_in+1], y: [B, 1, bits_out]
+    """
+    if train:
+        lo, hi = 1, max_n
+    else:
+        lo, hi = max_n + 1, max_n + 10
+
+    n_vals = torch.randint(lo, hi + 1, (batch_size,))
+
+    # Precompute fib up to hi+10 in worst case
+    max_fib = hi + 10
+    fib_cache = [0, 1]
+    for i in range(2, max_fib + 1):
+        fib_cache.append(fib_cache[-1] + fib_cache[-2])
+
+    # The largest fib we might see is fib_cache[hi+10].
+    max_fib_val = fib_cache[hi]
+
+    # bits for input n, bits for fib(n)
+    bits_in = math.ceil(math.log2(hi + 1))
+    bits_out = math.ceil(math.log2(max_fib_val + 1))
+
+    x_batch, y_batch = [], []
+
+    for i in range(batch_size):
+        n_i = n_vals[i].item()
+        fib_n = fib_cache[int(n_i)]
+
+        n_bin = f"{int(n_i):0{bits_in}b}"
+        fib_bin = f"{int(fib_n):0{bits_out}b}"
+
+        # input => [n_bin + marker], shape => 1 x (bits_in + 1)
+        x_i = [int(c) for c in n_bin] + [0]
+        x_i = torch.tensor(x_i, dtype=torch.float32).unsqueeze(0)
+
+        # output => shape => 1 x bits_out
+        y_i = [int(c) for c in fib_bin]
+        y_i = torch.tensor(y_i, dtype=torch.float32).unsqueeze(0)
+
+        x_batch.append(x_i)
+        y_batch.append(y_i)
+
+    x = torch.cat(x_batch, dim=0)
+    y = torch.cat(y_batch, dim=0)
+    return x, y
+
+
+
+def generate_factorial_task(
+    batch_size: int,
+    max_n: int = 6,
+    train: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    If train=True, n in [1..max_n].
+    If train=False, n in [max_n+1..max_n+10].
+    x: [B, 1, bits_in+1], y: [B, 1, bits_out]
+    """
+    if train:
+        lo, hi = 1, max_n
+    else:
+        lo, hi = max_n + 1, max_n + 10
+
+    n_vals = torch.randint(lo, hi + 1, (batch_size,))
+
+    # Precompute factorial up to hi+10 in worst case
+    max_fact = hi + 10
+    fact_cache = [1]
+    for i in range(1, max_fact + 1):
+        fact_cache.append(fact_cache[-1] * i)
+
+    # bits
+    bits_in = math.ceil(math.log2(hi + 1))
+    # max factorial we might see is fact_cache[hi+10], but let's do fact_cache[hi]
+    max_fact_val = fact_cache[hi]
+    bits_out = math.ceil(math.log2(max_fact_val + 1))
+
+    x_batch, y_batch = [], []
+    for i in range(batch_size):
+        n_i = n_vals[i].item()
+        fact_n = fact_cache[int(n_i)]
+
+        n_bin = f"{int(n_i):0{bits_in}b}"
+        fact_bin = f"{int(fact_n):0{bits_out}b}"
+
+        # input => [n_bin + marker]
+        x_i = [int(c) for c in n_bin] + [0]
+        x_i = torch.tensor(x_i, dtype=torch.float32).unsqueeze(0)
+
+        y_i = [int(c) for c in fact_bin]
+        y_i = torch.tensor(y_i, dtype=torch.float32).unsqueeze(0)
+
+        x_batch.append(x_i)
+        y_batch.append(y_i)
+
+    x = torch.cat(x_batch, dim=0)
+    y = torch.cat(y_batch, dim=0)
+    return x, y
+
+
+
+
+
 
 ##############################################################################
 # NTM Model Definition
@@ -467,6 +631,354 @@ class NTM(nn.Module):
 
 
 ##############################################################################
+# DNC definition
+##############################################################################
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+def softplus(x):
+    return torch.log1p(torch.exp(x))
+
+class DNC(nn.Module):
+    """
+    A minimal Differentiable Neural Computer implementation with:
+      - Single LSTM Controller
+      - Single read head, single write head
+      - Usage vector, temporal link, precedence weighting
+      - Erase & add operations for writing
+      - Weighted read for reading
+
+    Usage Example:
+      dnc = DNC(
+          input_size=10,
+          output_size=8,
+          hidden_size=64,
+          memory_size=32,   # number of memory slots
+          head_size=16,     # dimension of each memory slot
+          num_heads=1       # single read head
+      )
+      outputs, memory_state, hidden = dnc(inputs)
+    """
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        hidden_size: int,
+        memory_size: int,
+        head_size: int,
+        num_heads: int = 1,
+    ):
+        super(DNC, self).__init__()
+        assert num_heads == 1, "This minimal DNC only supports 1 read head for simplicity."
+
+        self.input_size = input_size
+        self.output_size = output_size
+        self.hidden_size = hidden_size
+        self.memory_size = memory_size  # N
+        self.head_size = head_size      # W
+        self.num_reads = num_heads      # =1 for read head
+
+        # 1) LSTM controller: feed (input + read_vector) each timestep
+        self.controller = nn.LSTM(
+            input_size + (self.num_reads * self.head_size),
+            hidden_size,
+            batch_first=True
+        )
+
+        # 2) Interface vector: erase(W) + write(W) + write_gate(1) + alloc_gate(1)
+        #                     + read_key(W) + read_strength(1) + read_mode(3)
+        self.interface_size = (
+            self.head_size +  # erase
+            self.head_size +  # write
+            1 +               # write_gate
+            1 +               # allocation_gate
+            self.head_size +  # read_key
+            1 +               # read_strength
+            3                 # read mode
+        )
+        self.fc_interface = nn.Linear(hidden_size, self.interface_size)
+
+        # 3) Output projection
+        # final = [controller_output + read_vector]
+        self.fc_output = nn.Linear(self.hidden_size + self.num_reads * self.head_size, output_size)
+
+        # 4) Initialize memory buffers
+        self.reset_memory()
+
+    def reset_memory(self, batch_size=1, device="cpu"):
+        """
+        Initialize memory states. Call at the start of a new sequence/batch if needed.
+        """
+        self.memory = None            # [B, N, W]
+        self.usage = None             # [B, N]
+        self.precedence = None        # [B, N]
+        self.link = None             # [B, N, N]
+        self.read_weights = None      # [B, N]
+        self.write_weights = None     # [B, N]
+
+    def _init_memory_if_needed(self, batch_size, device):
+        """
+        If memory is None or batch size changed, create fresh zero memory.
+        """
+        if self.memory is None or self.memory.size(0) != batch_size:
+            self.memory = torch.zeros(batch_size, self.memory_size, self.head_size, device=device)
+            self.usage = torch.zeros(batch_size, self.memory_size, device=device)
+            self.precedence = torch.zeros(batch_size, self.memory_size, device=device)
+            self.link = torch.zeros(batch_size, self.memory_size, self.memory_size, device=device)
+            self.read_weights = torch.zeros(batch_size, self.memory_size, device=device)
+            self.write_weights = torch.zeros(batch_size, self.memory_size, device=device)
+
+    def _read_from_memory(self, read_weights):
+        """
+        read_weights: [B, N]
+        memory: [B, N, W]
+        => read_vector: [B, W]
+        """
+        return torch.bmm(read_weights.unsqueeze(1), self.memory).squeeze(1)
+
+    def _update_usage(self):
+        """
+        Simple usage update:
+          usage = usage + (1 - usage)*write_w
+        ignoring read frees for simplicity.
+        """
+        w = self.write_weights  # [B, N]
+        self.usage = self.usage + (1 - self.usage) * w
+
+    def _get_allocation_weights(self):
+        """
+        Allocate to least-used slots first. Sort usage ascending, do 'cumulative product'.
+        Returns: [B, N] alloc weights
+        """
+        usage_sorted, idx_sorted = torch.sort(self.usage, dim=-1)  # ascending
+        alloc_w = torch.zeros_like(self.usage)
+        cprod = torch.cumprod(usage_sorted, dim=-1)
+        cprod = F.pad(cprod[:, :-1], (1, 0), value=1.0)  # shift right
+
+        alloc_in_order = (1 - usage_sorted) * cprod
+        alloc_w.scatter_(1, idx_sorted, alloc_in_order)
+        return alloc_w
+
+    def _update_temporal_link(self, write_w):
+        """
+        Update link => [B, N, N], precedence => [B, N].
+        """
+        ww_ij = write_w.unsqueeze(-1) + write_w.unsqueeze(1)
+        self.link = (1 - ww_ij) * self.link
+
+        # add precedence->write
+        self.link += torch.bmm(self.precedence.unsqueeze(-1), write_w.unsqueeze(1))
+
+        # zero diag
+        diag = torch.eye(self.memory_size, device=write_w.device).unsqueeze(0)
+        self.link = self.link * (1 - diag)
+
+        # precedence
+        self.precedence = (1 - write_w.sum(dim=-1, keepdim=True)) * self.precedence
+        self.precedence = self.precedence + write_w
+
+    def _content_addressing(self, key, strength=1.0):
+        """
+        Content-based addressing: dot(key, memory), scaled by strength, softmax.
+        key: [B, W], memory: [B, N, W]
+        => weights: [B, N]
+        """
+        dot = torch.einsum("bkw,bnw->bn", key.unsqueeze(1), self.memory)
+        key_norm = torch.norm(key, 2, dim=-1, keepdim=True) + 1e-8
+        mem_norm = torch.norm(self.memory, 2, dim=-1) + 1e-8
+        dot = dot / (key_norm * mem_norm)
+        dot = dot * strength.unsqueeze(-1)
+        return F.softmax(dot, dim=-1)
+
+    def _write_to_memory(self, interface):
+        """
+        parse interface => erase_vec, write_vec, write_gate, alloc_gate,
+        and do memory update: erase + add
+        """
+        offset = 0
+        erase_vec = torch.sigmoid(interface[..., offset:offset+self.head_size])  # [B,W]
+        offset += self.head_size
+
+        write_vec = interface[..., offset:offset+self.head_size]                # [B,W]
+        offset += self.head_size
+
+        write_gate = torch.sigmoid(interface[..., offset:offset+1]).squeeze(-1) # [B]
+        offset += 1
+
+        alloc_gate = torch.sigmoid(interface[..., offset:offset+1]).squeeze(-1) # [B]
+        offset += 1
+
+        # get allocation
+        alloc_w = self._get_allocation_weights()  # [B, N]
+        w_gate = write_gate.unsqueeze(-1)         # [B, 1]
+        a_gate = alloc_gate.unsqueeze(-1)         # [B, 1]
+        write_w = w_gate * a_gate * alloc_w       # [B, N]
+        self.write_weights = write_w
+
+        # erase
+        erase_mat = erase_vec.unsqueeze(1)  # [B,1,W]
+        self.memory = self.memory * (1 - torch.bmm(write_w.unsqueeze(-1), erase_mat))
+
+        # add
+        add_mat = write_vec.unsqueeze(1)    # [B,1,W]
+        self.memory = self.memory + torch.bmm(write_w.unsqueeze(-1), add_mat)
+
+        # usage + link
+        self._update_usage()
+        self._update_temporal_link(write_w)
+
+    def _get_read_weights(self, interface, read_strength):
+        """
+        read_mode = 3 => [back, forward, content]
+        read_key => content-based addressing
+        """
+        read_mode = interface[..., -3:]          # [B,3]
+        read_mode = F.softmax(read_mode, dim=-1) # [B,3]
+
+        read_key = interface[..., :self.head_size]
+        cw = self._content_addressing(read_key, strength=read_strength)  # [B, N]
+
+        # forward/backward from link
+        bw = torch.bmm(self.link.transpose(1, 2), self.read_weights.unsqueeze(-1)).squeeze(-1) # [B,N]
+        fw = torch.bmm(self.link, self.read_weights.unsqueeze(-1)).squeeze(-1)                 # [B,N]
+
+        weights = (read_mode[..., 0:1] * bw) + \
+                  (read_mode[..., 1:2] * fw) + \
+                  (read_mode[..., 2:3] * cw)
+        weights += 1e-8
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        return weights
+
+    def forward(self, x, hidden=None):
+        """
+        x: [B, seq_len, input_size]
+        hidden: (h, c), optional
+        Return:
+          outs: [B, seq_len, output_size]
+          (memory, usage, link, precedence)
+          hidden
+        """
+        batch_size, seq_len, _ = x.size()
+        device = x.device
+
+        # init memory if needed
+        self._init_memory_if_needed(batch_size, device)
+
+        if hidden is None:
+            h0 = x.new_zeros(1, batch_size, self.hidden_size)
+            c0 = x.new_zeros(1, batch_size, self.hidden_size)
+            hidden = (h0, c0)
+
+        # single read vector => [B,W]
+        read_vec = torch.zeros(batch_size, self.head_size, device=device)
+
+        outputs = []
+        for t in range(seq_len):
+            inp_t = torch.cat([x[:, t, :], read_vec], dim=-1).unsqueeze(1)  # [B,1, input_size+W]
+            out_ctrl, hidden = self.controller(inp_t, hidden)   # LSTM
+            h = out_ctrl.squeeze(1)  # [B, hidden_size]
+
+            # parse interface
+            interface = self.fc_interface(h)  # [B, interface_size]
+            # parse read_key, read_strength
+            offset = (self.head_size * 2) + 2
+            read_key = interface[..., offset:offset+self.head_size]
+            offset += self.head_size
+            read_strength = softplus(interface[..., offset:offset+1]).squeeze(-1)
+            offset += 1
+            # last 3 => read_mode
+
+            # write
+            self._write_to_memory(interface)
+            # read
+            rw = self._get_read_weights(interface, read_strength)
+            self.read_weights = rw
+
+            read_vec = self._read_from_memory(rw)
+            # final output
+            out = torch.cat([h, read_vec], dim=-1)
+            out = self.fc_output(out)
+            outputs.append(out.unsqueeze(1))
+
+        outs = torch.cat(outputs, dim=1)  # [B, seq_len, output_size]
+
+        # -------------------------------------------
+        # Detach memory + hidden so we don't accidentally
+        # backprop through old states across iterations.
+        # This prevents "Trying to backward ... second time" errors
+        # if you reuse the same DNC object next iteration.
+        # If you want full BPTT across iterations, remove these lines.
+        # -------------------------------------------
+        self.memory = self.memory.detach()  
+        self.usage = self.usage.detach()
+        self.precedence = self.precedence.detach()
+        self.link = self.link.detach()
+        self.read_weights = self.read_weights.detach()
+        self.write_weights = self.write_weights.detach()
+
+        hidden = (hidden[0].detach(), hidden[1].detach())
+
+        return outs, (self.memory, self.usage, self.link, self.precedence), hidden
+
+
+
+class TransformerController(nn.Module):
+    """
+    A simple Transformer-based module that processes each time step.
+    For NTM-like usage, you'd still have an external 'read/write' operation,
+    but let's keep it simple here.
+    """
+    def __init__(self, d_model=128, nhead=4, num_layers=2, dim_feedforward=256, dropout=0.1):
+        super(TransformerController, self).__init__()
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead,
+                                                   dim_feedforward=dim_feedforward,
+                                                   dropout=dropout, batch_first=True)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+    def forward(self, x):
+        # x shape: [batch_size, seq_len, d_model]
+        out = self.encoder(x)  # same shape
+        return out
+
+
+##############################################################################
+# Transformer based NTM
+##############################################################################
+class TransformerNTM(nn.Module):
+    """
+    A 'transformer-based' variant for demonstration.
+    We skip the external memory for brevity, but you could combine
+    this with NTM-like read/write heads if desired.
+    """
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        hidden_size: int,
+        # memory stuff if you want,
+        # or skip for a pure transformer
+    ):
+        super(TransformerNTM, self).__init__()
+        self.embedding = nn.Linear(input_size, hidden_size)
+        self.transformer = TransformerController(d_model=hidden_size, nhead=4,
+                                                 num_layers=2, dim_feedforward=4*hidden_size)
+        self.fc_out = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x, hidden=None, memory=None):
+        # x: [batch_size, seq_len, input_size]
+        emb = self.embedding(x)  # [B, seq_len, hidden_size]
+        # pass through stacked Transformer
+        trans_out = self.transformer(emb)  # [B, seq_len, hidden_size]
+        out = self.fc_out(trans_out)       # [B, seq_len, output_size]
+        return out, None, None
+
+##############################################################################
 # Training Loop
 ##############################################################################
 def train_step(model, x, y, criterion, optimizer):
@@ -556,143 +1068,307 @@ def train_step(model, x, y, criterion, optimizer):
 #         return torch.tensor(avg_loss, device=x.device)
 
 
-def mezo_step(
-    model: torch.nn.Module,
+
+# def mezo_step(
+#     model: torch.nn.Module,
+#     x: torch.Tensor,
+#     y: torch.Tensor,
+#     criterion: torch.nn.Module,
+#     epsilon: float = 1e-3,
+#     lr: float = 1e-3,
+#     weight_decay: float = 1e-5
+#     layerwise: bool = False,
+# ) -> torch.Tensor:
+#     """
+#     Memory-Efficient Zero-Order (MeZO) demonstration with optional weight decay.
+    
+#     Args:
+#       model: The NTM (or any) model to update.
+#       x: Input batch tensor.
+#       y: Target batch tensor.
+#       criterion: Loss function (e.g., BCEWithLogitsLoss).
+#       epsilon: Perturbation magnitude for finite difference.
+#       layerwise: If True, do layer-by-layer (param-by-param) perturbation.
+#                  If False, do a single big perturbation for the entire model.
+#       weight_decay: L2 regularization coefficient. 
+#                     If > 0, adds 0.5 * weight_decay * sum(param^2) to the loss.
+    
+#     Returns:
+#       A PyTorch scalar tensor representing the average loss from the plus/minus passes.
+#     """
+#     model.train()
+#     all_params = list(model.parameters())
+
+#     def compute_weight_decay_loss(model, wd):
+#         """
+#         Compute 0.5 * wd * sum of squares of all parameters that require grad.
+#         Returns a float or a torch scalar. We'll do float + manual add to the final
+#         so we keep the data consistent with the final computations.
+#         """
+#         if wd == 0.0:
+#             return 0.0
+#         sum_of_squares = 0.0
+#         for p in model.parameters():
+#             if p.requires_grad:
+#                 sum_of_squares += p.data.pow(2).sum().item()
+#         return 0.5 * wd * sum_of_squares
+
+#     if layerwise:
+#         # Layerwise approach: For each parameter, do +epsilon pass, -2*epsilon pass, etc.
+#         total_loss = 0.0
+#         count_params = 0
+#         for param in all_params:
+#             if not param.requires_grad:
+#                 continue
+#             count_params += 1
+
+#             original_data = param.data.clone()
+
+#             # + epsilon
+#             param.data = original_data + epsilon
+#             outputs, _, _ = model(x)
+#             seq_len = min(outputs.size(1), y.size(1))
+#             loss_plus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
+#             # Add weight decay penalty
+#             loss_plus = loss_plus + compute_weight_decay_loss(model, weight_decay)
+
+#             # -2 * epsilon
+#             param.data = original_data - 2 * epsilon
+#             outputs, _, _ = model(x)
+#             loss_minus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
+#             # Add weight decay penalty
+#             loss_minus = loss_minus + compute_weight_decay_loss(model, weight_decay)
+
+#             # Finite difference
+#             grad_est = (loss_plus - loss_minus) / (2 * epsilon)
+
+#             # Restore original
+#             param.data = original_data
+
+            
+#             # We multiply by 'grad_est' (a scalar), then epsilon, etc.
+#             # This is a toy approach to do "coordinate-free" direction updates.
+#             with torch.no_grad():
+#                 # param update
+#                 param.data -= lr * grad_est * epsilon * torch.sign(torch.randn_like(param.data))
+
+#             # Accumulate average loss for logging
+#             # We'll take the mean of (loss_plus + loss_minus) / 2 to approximate the loss
+#             avg_pass_loss = 0.5 * (loss_plus.item() + loss_minus.item())
+#             total_loss += avg_pass_loss
+
+#         # Average over number of parameters
+#         if count_params > 0:
+#             total_loss /= float(count_params)
+#         # Return as a Torch tensor so we can call .item() outside
+#         return torch.tensor(total_loss, device=x.device)
+
+#     else:
+#         # Single-perturbation approach
+#         original_data = [p.data.clone() for p in all_params]
+#         directions = [torch.randn_like(p.data) if p.requires_grad else None for p in all_params]
+
+#         # + epsilon
+#         for p, d in zip(all_params, directions):
+#             if p.requires_grad and d is not None:
+#                 p.data = p.data + epsilon * d.sign()
+
+#         outputs, _, _ = model(x)
+#         seq_len = min(outputs.size(1), y.size(1))
+#         loss_plus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
+#         loss_plus = loss_plus + compute_weight_decay_loss(model, weight_decay)
+
+#         # -2 epsilon
+#         for p, d in zip(all_params, directions):
+#             if p.requires_grad and d is not None:
+#                 p.data = p.data - 2 * epsilon * d.sign()
+
+#         outputs, _, _ = model(x)
+#         loss_minus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
+#         loss_minus = loss_minus + compute_weight_decay_loss(model, weight_decay)
+
+#         # Restore original data
+#         for p, orig_data in zip(all_params, original_data):
+#             p.data = orig_data
+
+#         # Finite difference gradient estimate
+#         grad_est = (loss_plus - loss_minus) / (2 * epsilon)
+
+#         # Manual update
+#         with torch.no_grad():
+#             for p, d in zip(all_params, directions):
+#                 if p.requires_grad and d is not None:
+#                     # grad_est is a scalar
+#                     p.data = p.data - lr * grad_est.item() * epsilon * d.sign()
+
+#         # Return average of plus/minus losses as a scalar
+#         avg_loss = 0.5 * (loss_plus.item() + loss_minus.item())
+#         return torch.tensor(avg_loss, device=x.device)
+
+def mezo_zero_order_grad_single(
+    model: nn.Module,
     x: torch.Tensor,
     y: torch.Tensor,
-    criterion: torch.nn.Module,
-    epsilon: float = 1e-3,
-    layerwise: bool = False,
-    weight_decay: float = 1e-5
-) -> torch.Tensor:
+    criterion: nn.Module,
+    epsilon: float,
+    weight_decay: float
+) -> float:
     """
-    Memory-Efficient Zero-Order (MeZO) demonstration with optional weight decay.
-    
-    Args:
-      model: The NTM (or any) model to update.
-      x: Input batch tensor.
-      y: Target batch tensor.
-      criterion: Loss function (e.g., BCEWithLogitsLoss).
-      epsilon: Perturbation magnitude for finite difference.
-      layerwise: If True, do layer-by-layer (param-by-param) perturbation.
-                 If False, do a single big perturbation for the entire model.
-      weight_decay: L2 regularization coefficient. 
-                    If > 0, adds 0.5 * weight_decay * sum(param^2) to the loss.
-    
-    Returns:
-      A PyTorch scalar tensor representing the average loss from the plus/minus passes.
+    Single-direction MeZO:
+    1) Create a single random direction for all params.
+    2) Do +epsilon pass -> loss_plus
+    3) Do -epsilon pass -> loss_minus
+    4) grad_est = (loss_plus - loss_minus)/(2*epsilon) (a scalar)
+    5) param.grad = grad_est * sign(direction) for each param
+    6) Return average loss for logging
     """
     model.train()
     all_params = list(model.parameters())
 
-    def compute_weight_decay_loss(model, wd):
-        """
-        Compute 0.5 * wd * sum of squares of all parameters that require grad.
-        Returns a float or a torch scalar. We'll do float + manual add to the final
-        so we keep the data consistent with the final computations.
-        """
-        if wd == 0.0:
+    # Zero existing grads
+    for p in all_params:
+        if p.grad is not None:
+            p.grad.zero_()
+
+    orig_data = [p.data.clone() for p in all_params]
+    directions = [torch.randn_like(p) if p.requires_grad else None for p in all_params]
+
+    # +epsilon
+    for p, d in zip(all_params, directions):
+        if p.requires_grad and d is not None:
+            p.data.add_(epsilon * d.sign())
+
+    outputs, _, _ = model(x)
+    seq_len = min(outputs.size(1), y.size(1))
+    loss_plus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
+
+    # WD for +epsilon pass
+    if weight_decay > 0.0:
+        wd_plus = 0.5 * weight_decay * sum((p.data**2).sum().item() for p in all_params if p.requires_grad)
+        loss_plus = loss_plus + wd_plus
+
+    # -2epsilon
+    for p, d in zip(all_params, directions):
+        if p.requires_grad and d is not None:
+            p.data.sub_(2.0 * epsilon * d.sign())
+
+    outputs, _, _ = model(x)
+    loss_minus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
+
+    # WD for -epsilon pass
+    if weight_decay > 0.0:
+        wd_minus = 0.5 * weight_decay * sum((p.data**2).sum().item() for p in all_params if p.requires_grad)
+        loss_minus = loss_minus + wd_minus
+
+    # grad_est (scalar)
+    grad_est = (loss_plus - loss_minus) / (2.0 * epsilon)
+
+    # Restore
+    for p, od in zip(all_params, orig_data):
+        p.data = od
+
+    # param.grad = grad_est * sign(direction)
+    for p, d in zip(all_params, directions):
+        if p.requires_grad and d is not None:
+            p.grad = grad_est * d.sign()
+
+    # For logging
+    avg_loss = 0.5 * (loss_plus.item() + loss_minus.item())
+    return avg_loss
+
+
+def mezo_zero_order_grad_layerwise(
+    model: nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    criterion: nn.Module,
+    epsilon: float,
+    weight_decay: float
+) -> float:
+    """
+    Layerwise (param-by-param) MeZO with no_grad() to avoid building huge graphs.
+    For each param p:
+      1) +epsilon pass -> loss_plus
+      2) -epsilon pass -> loss_minus
+      3) grad_est = (loss_plus - loss_minus)/(2*epsilon)  (scalar)
+      4) p.grad += grad_est * sign(direction)
+      5) restore p.data
+    Return average (loss_plus + loss_minus)/2 over all params for logging.
+    """
+    model.train()
+    all_params = list(model.parameters())
+
+    # We do not do normal autograd, so zero any existing grads:
+    for p in all_params:
+        if p.grad is not None:
+            p.grad.zero_()
+
+    total_loss = 0.0
+    param_count = 0
+
+    # We'll compute weight decay penalty if needed
+    def compute_wd(params, wd):
+        if wd <= 0.0:
             return 0.0
-        sum_of_squares = 0.0
-        for p in model.parameters():
-            if p.requires_grad:
-                sum_of_squares += p.data.pow(2).sum().item()
-        return 0.5 * wd * sum_of_squares
+        # Summation of (p^2)
+        s = 0.0
+        for pp in params:
+            if pp.requires_grad:
+                s += pp.data.pow(2).sum().item()
+        return 0.5 * wd * s
 
-    if layerwise:
-        # Layerwise approach: For each parameter, do +epsilon pass, -2*epsilon pass, etc.
-        total_loss = 0.0
-        count_params = 0
-        for param in all_params:
-            if not param.requires_grad:
-                continue
-            count_params += 1
+    for param in all_params:
+        if not param.requires_grad:
+            continue
 
-            original_data = param.data.clone()
+        param_count += 1
+        original_data = param.data.clone()
+        direction = torch.randn_like(param)
 
-            # + epsilon
-            param.data = original_data + epsilon
+        # +epsilon pass
+        param.data = original_data + epsilon * direction.sign()
+        with torch.no_grad():  # <--- no_grad to avoid building a graph
             outputs, _, _ = model(x)
             seq_len = min(outputs.size(1), y.size(1))
             loss_plus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
-            # Add weight decay penalty
-            loss_plus = loss_plus + compute_weight_decay_loss(model, weight_decay)
+            wd_plus = compute_wd(all_params, weight_decay)
+            loss_plus = loss_plus + wd_plus
 
-            # -2 * epsilon
-            param.data = original_data - 2 * epsilon
+        # -2 epsilon pass
+        param.data = original_data - 2.0 * epsilon * direction.sign()
+        with torch.no_grad():  # <--- no_grad again
             outputs, _, _ = model(x)
+            seq_len = min(outputs.size(1), y.size(1))
             loss_minus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
-            # Add weight decay penalty
-            loss_minus = loss_minus + compute_weight_decay_loss(model, weight_decay)
+            wd_minus = compute_wd(all_params, weight_decay)
+            loss_minus = loss_minus + wd_minus
 
-            # Finite difference
-            grad_est = (loss_plus - loss_minus) / (2 * epsilon)
+        # finite difference
+        grad_est = (loss_plus - loss_minus) / (2.0 * epsilon)
 
-            # Restore original
-            param.data = original_data
+        # restore original parameter
+        param.data = original_data
 
-            # Manual update: For demonstration, we pick a small LR
-            lr = 1e-3
-            # We multiply by 'grad_est' (a scalar), then epsilon, etc.
-            # This is a toy approach to do "coordinate-free" direction updates.
-            with torch.no_grad():
-                # param update
-                param.data -= lr * grad_est * epsilon * torch.sign(torch.randn_like(param.data))
+        # Accumulate gradient in param.grad
+        # param.grad shape = param.shape
+        # grad_est is a scalar, direction.sign() is param-shaped
+        if param.grad is None:
+            param.grad = grad_est * direction.sign()
+        else:
+            param.grad.add_(grad_est * direction.sign())
 
-            # Accumulate average loss for logging
-            # We'll take the mean of (loss_plus + loss_minus) / 2 to approximate the loss
-            avg_pass_loss = 0.5 * (loss_plus.item() + loss_minus.item())
-            total_loss += avg_pass_loss
+        # logging
+        avg_p_loss = 0.5 * (loss_plus.item() + loss_minus.item())
+        total_loss += avg_p_loss
 
-        # Average over number of parameters
-        if count_params > 0:
-            total_loss /= float(count_params)
-        # Return as a Torch tensor so we can call .item() outside
-        return torch.tensor(total_loss, device=x.device)
+    if param_count > 0:
+        total_loss /= param_count
 
-    else:
-        # Single-perturbation approach
-        original_data = [p.data.clone() for p in all_params]
-        directions = [torch.randn_like(p.data) if p.requires_grad else None for p in all_params]
+    return total_loss
 
-        # + epsilon
-        for p, d in zip(all_params, directions):
-            if p.requires_grad and d is not None:
-                p.data = p.data + epsilon * d.sign()
 
-        outputs, _, _ = model(x)
-        seq_len = min(outputs.size(1), y.size(1))
-        loss_plus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
-        loss_plus = loss_plus + compute_weight_decay_loss(model, weight_decay)
-
-        # -2 epsilon
-        for p, d in zip(all_params, directions):
-            if p.requires_grad and d is not None:
-                p.data = p.data - 2 * epsilon * d.sign()
-
-        outputs, _, _ = model(x)
-        loss_minus = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
-        loss_minus = loss_minus + compute_weight_decay_loss(model, weight_decay)
-
-        # Restore original data
-        for p, orig_data in zip(all_params, original_data):
-            p.data = orig_data
-
-        # Finite difference gradient estimate
-        grad_est = (loss_plus - loss_minus) / (2 * epsilon)
-
-        # Manual update
-        lr = 1e-3
-        with torch.no_grad():
-            for p, d in zip(all_params, directions):
-                if p.requires_grad and d is not None:
-                    # grad_est is a scalar
-                    p.data = p.data - lr * grad_est.item() * epsilon * d.sign()
-
-        # Return average of plus/minus losses as a scalar
-        avg_loss = 0.5 * (loss_plus.item() + loss_minus.item())
-        return torch.tensor(avg_loss, device=x.device)
-
+def softplus(x):
+    return torch.log1p(torch.exp(x))
 
 
 ##############################################################################
@@ -700,43 +1376,58 @@ def mezo_step(
 ##############################################################################
 def main():
     parser = argparse.ArgumentParser(description="Train an NTM on classical tasks.")
+    # Model
+    parser.add_argument("--arch", type=str, default="ntm",
+                    choices=["ntm", "dnc", "tra"],
+                    help="Which architecture to use: NTM, DNC, or a Transformer-based model.")
     
     # Task
-    parser.add_argument("--task", type=str, default="copy", 
-                        choices=["copy", "repeat_copy", "associative_recall"],
-                        help="Which task to train on.")
-    parser.add_argument("--seq_len", type=int, default=10, help="Sequence length (task-dependent).")
+    parser.add_argument("--task", type=str, default="copy",
+                    choices=["copy", "repeat_copy", "associative_recall",
+                             "add", "sub", "mul", "div", "fib", "factorial"],
+                    help="Which task to train on.")
+    
+    parser.add_argument("--seq_len", type=int, default=10)
     
     # Model
-    parser.add_argument("--input_size", type=int, default=9, help="Input size (bits+1 for tasks).")
-    parser.add_argument("--output_size", type=int, default=8, help="Output size (bits).")
-    parser.add_argument("--hidden_size", type=int, default=128, help="Controller hidden size.")
-    parser.add_argument("--memory_size", type=int, default=128, help="Number of memory slots.")
-    parser.add_argument("--head_size", type=int, default=64, help="Dimension of each head vector.")
-    parser.add_argument("--num_heads", type=int, default=1, help="Number of heads.")
+    parser.add_argument("--input_size", type=int, default=9)
+    parser.add_argument("--output_size", type=int, default=8)
+    parser.add_argument("--hidden_size", type=int, default=128)
+    parser.add_argument("--memory_size", type=int, default=128)
+    parser.add_argument("--head_size", type=int, default=64)
+    parser.add_argument("--num_heads", type=int, default=1)
     
     # Training
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--max_iters", type=int, default=10000)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
-    parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "mezo"],
-                        help="Which optimizer to use.")
+    parser.add_argument("--optimizer", type=str, default="adam",
+                        choices=["adam", "mezo"])
+    parser.add_argument("--weight_decay", type=float, default=1e-5)
+    
+    parser.add_argument("--max_num", type=int, default=100)
+
     
     # Cosine LR & Warmup
-    parser.add_argument("--cosine_lr", action="store_true", help="Use cosine learning rate scheduling.")
-    parser.add_argument("--warmup_steps", type=int, default=0, help="Number of warmup steps if using warmup.")
+    parser.add_argument("--cosine_lr", action="store_true")
+    parser.add_argument("--warmup_steps", type=int, default=0)
+
     
     # MeZO
-    parser.add_argument("--mezo", action="store_true", help="Use MeZO updates (instead of standard grad).")
-    parser.add_argument("--mezo_layerwise", action="store_true", help="Apply MeZO updates layer by layer.")
+    parser.add_argument("--mezo", action="store_true",
+                        help="If true, uses mezo-based gradient instead of backprop.")
+    parser.add_argument("--epsilon", type=float, default=1e-3,
+                        help="Perturbation size for mezo.")
+    parser.add_argument("--mezo_layerwise", action="store_true",
+                        help="Apply MeZO updates layer by layer.")
     
     # Misc
-    parser.add_argument("--log_interval", type=int, default=100, help="Logging interval.")
-    parser.add_argument("--wandb_proj", type=str, default=None, help="Weights & Biases project name.")
-    parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases run name.")
+    parser.add_argument("--log_interval", type=int, default=100)
+    parser.add_argument("--wandb_proj", type=str, default=None)
+    parser.add_argument("--wandb_run_name", type=str, default=None)
     args = parser.parse_args()
-    init_weight_decay = 1e-5
-    
+
+
     # Device
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # print(f"[INFO] Using device: {device}")
@@ -750,33 +1441,52 @@ def main():
         device = torch.device("cpu")
         print("[INFO] Using CPU")
 
-    model = NTM(
-        input_size=args.input_size,
-        output_size=args.output_size,
-        hidden_size=args.hidden_size,
-        memory_size=args.memory_size,
-        head_size=args.head_size,
-        num_heads=args.num_heads
-    ).to(device)
+    if args.arch == "ntm":
+        model = NTM(
+            input_size=args.input_size,
+            output_size=args.output_size,
+            hidden_size=args.hidden_size,
+            memory_size=args.memory_size,
+            head_size=args.head_size,
+            num_heads=args.num_heads
+        )
+    elif args.arch == "dnc":
+        model = DNC(
+            input_size=args.input_size,
+            output_size=args.output_size,
+            hidden_size=args.hidden_size,
+            memory_size=args.memory_size,
+            head_size=args.head_size,
+            num_heads=args.num_heads
+        )
+    else:  # "transformer"
+        model = TransformerNTM(
+            input_size=args.input_size,
+            output_size=args.output_size,
+            hidden_size=args.hidden_size
+            # skip memory if purely Transformer
+        )
+    
+    model = model.to(device)
 
     criterion = nn.BCEWithLogitsLoss()
 
     max_iters = 1000000000
-    # Create optimizer
+    
+    # Create an optimizer that handles momentum, WD, LR, etc.
     if args.optimizer == "adam":
-        # Example: if you want to see weight_decay in logs, set it here
-        optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=init_weight_decay)
+        optimizer = optim.Adam(model.parameters(), lr=args.learning_rate,
+                               weight_decay=args.weight_decay)
     else:
-        optimizer = None  # We'll do mezo manually
-
-    # Learning rate scheduler (cosine)
-    if args.cosine_lr and args.optimizer == "adam":
-        # Important: T_max should match how many times you step the scheduler
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=max_iters,
-            eta_min=1e-6
-        )
+        # mezo uses e.g. SGD w/ momentum, so LR & WD apply
+        optimizer = optim.SGD(model.parameters(), lr=args.learning_rate,
+                              momentum=0.9, weight_decay=args.weight_decay)
+    
+    # LR scheduler
+    if args.cosine_lr:
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer,
+                                                         T_max=args.max_iters,
+                                                         eta_min=1e-6)
     else:
         scheduler = None
 
@@ -787,136 +1497,166 @@ def main():
 
     global_step = 0
 
-    for iteration in range(1, max_iters + 1):
-        # Generate a training batch
+    # ---------- MAIN TRAINING LOOP ------------
+    for iteration in range(1, args.max_iters + 1):
+
+        # ~~~~~~~~~~~~ Generate TRAIN data ~~~~~~~~~~~~
         if args.task == "copy":
-            x, y = generate_copy_task(args.batch_size, args.seq_len, bits=args.output_size)
+            x, y = generate_copy_task(
+                batch_size=args.batch_size,
+                seq_len=args.seq_len,
+                bits=args.output_size,
+                train=True
+            )
         elif args.task == "repeat_copy":
-            x, y = generate_repeat_copy_task(args.batch_size, args.seq_len, bits=args.output_size)
+            x, y = generate_repeat_copy_task(
+                batch_size=args.batch_size,
+                seq_len=args.seq_len,
+                bits=args.output_size,
+                train=True
+            )
+        elif args.task == "associative_recall":
+            x, y = generate_associative_recall_task(
+                batch_size=args.batch_size,
+                item_len=3,
+                num_items=args.seq_len,
+                bits=args.output_size,
+                train=True
+            )
+        elif args.task in ["add", "sub", "mul", "div"]:
+            x, y = generate_arithmetic_task(
+                batch_size=args.batch_size,
+                task_type=args.task,
+                max_num=args.max_num,
+                train=True
+            )
+        elif args.task == "fib":
+            x, y = generate_fibonacci_task(
+                batch_size=args.batch_size,
+                max_n=args.max_num,
+                train=True
+            )
+        elif args.task == "factorial":
+            x, y = generate_factorial_task(
+                batch_size=args.batch_size,
+                max_n=args.max_num,
+                train=True
+            )
         else:
-            # default: associative recall
-            x, y = generate_associative_recall_task(args.batch_size, item_len=3, num_items=args.seq_len, bits=args.output_size)
+            raise ValueError(f"Unknown task {args.task}")
 
         x, y = x.to(device), y.to(device)
 
-        # Optional warmup
-        if args.warmup_steps > 0 and iteration <= args.warmup_steps and args.optimizer == "adam":
-            warmup_frac = iteration / float(args.warmup_steps)
-            for g in optimizer.param_groups:
-                g["lr"] = args.learning_rate * warmup_frac
+        # =========== WARMUP LR if needed ============
+        if args.optimizer == "adam" and args.warmup_steps > 0 and iteration <= args.warmup_steps:
+            frac = iteration / float(args.warmup_steps)
+            new_lr = args.learning_rate * frac
+            for pg in optimizer.param_groups:
+                pg["lr"] = new_lr
 
-        # ===================
-        #     TRAIN STEP
-        # ===================
-        if args.optimizer == "adam":
-            # Typical backprop
-            model.train()
-            optimizer.zero_grad()
-            outputs, _, _ = model(x)
-            seq_len = min(outputs.size(1), y.size(1))
-            loss = criterion(outputs[:, :seq_len, :], y[:, :seq_len, :])
-            loss.backward()
+        # ================== TRAIN STEP ==================
+        if args.mezo:
+            # Zero-order approach
+            if args.mezo_layerwise:
+                avg_loss = mezo_zero_order_grad_layerwise(
+                    model, x, y, criterion, epsilon=args.epsilon, weight_decay=args.weight_decay
+                )
+            else:
+                avg_loss = mezo_zero_order_grad_single(
+                    model, x, y, criterion, epsilon=args.epsilon, weight_decay=args.weight_decay
+                )
+
             optimizer.step()
-        else:
-            # MeZO or other custom
-            outputs, _, _ = model(x)
-            loss = mezo_step(model, 
-                             x, 
-                             y, 
-                             criterion, 
-                             layerwise=args.mezo_layerwise, 
-                             lr=args.learning_rate,
-                             weight_decay=init_weight_decay)
+            loss_val = avg_loss
 
-        # Step scheduler if using one
+        else:
+            loss_val = train_step(model, x, y, criterion, optimizer)  # standard backprop
+
+        # Step scheduler
         if scheduler is not None and iteration > args.warmup_steps:
             scheduler.step()
 
-        # =====================
-        #    LOGGING BLOCK
-        # =====================
         global_step += 1
 
-        # Log every N iterations
+        # ~~~~~~~~~ LOG & VALIDATE ~~~~~~~~~
         if iteration % args.log_interval == 0:
-            # Compute current LR
-            if scheduler is not None:
-                lr_current = scheduler.get_last_lr()[0]  # for multi-param groups, pick group[0]
-            elif optimizer is not None and len(optimizer.param_groups) > 0:
-                lr_current = optimizer.param_groups[0]["lr"]
-            else:
-                lr_current = 0.0
+            lr_current = optimizer.param_groups[0]["lr"]
 
-            # Compute training accuracy on this batch
-            seq_len = min(outputs.size(1), y.size(1))
-            train_acc = compute_batch_accuracy(outputs[:, :seq_len, :], y[:, :seq_len, :])
-            # Debug print for TRAIN
-            print("TRAIN:")
-            debug_print_samples(
-                x,                 # the train input
-                y,                 # the train target
-                outputs,           # the train model outputs
-                iteration,
-                tag="Train",
-                n=3
-            )
-            # Create a small validation batch
-            # (If you want a *real* separate dataset, adjust as needed)
-            print("VAL:")
+            # Evaluate on a small VAL batch
             with torch.no_grad():
                 if args.task == "copy":
-                    val_x, val_y = generate_copy_task(args.batch_size, args.seq_len, bits=args.output_size)
-                elif args.task == "repeat_copy":
-                    val_x, val_y = generate_repeat_copy_task(args.batch_size, args.seq_len, bits=args.output_size)
-                else:
-                    val_x, val_y = generate_associative_recall_task(
-                        args.batch_size, item_len=3, num_items=args.seq_len, bits=args.output_size
+                    val_x, val_y = generate_copy_task(
+                        batch_size=args.batch_size,
+                        seq_len=args.seq_len,
+                        bits=args.output_size,
+                        train=False  # domain shift / 5x seq len
                     )
+                elif args.task == "repeat_copy":
+                    val_x, val_y = generate_repeat_copy_task(
+                        batch_size=args.batch_size,
+                        seq_len=args.seq_len,
+                        bits=args.output_size,
+                        train=False
+                    )
+                elif args.task == "associative_recall":
+                    val_x, val_y = generate_associative_recall_task(
+                        batch_size=args.batch_size,
+                        item_len=3,
+                        num_items=args.seq_len,
+                        bits=args.output_size,
+                        train=False
+                    )
+                elif args.task in ["add", "sub", "mul", "div"]:
+                    val_x, val_y = generate_arithmetic_task(
+                        batch_size=args.batch_size,
+                        task_type=args.task,
+                        max_num=args.max_num,
+                        train=False
+                    )
+                elif args.task == "fib":
+                    val_x, val_y = generate_fibonacci_task(
+                        batch_size=args.batch_size,
+                        max_n=args.max_num,
+                        train=False
+                    )
+                elif args.task == "factorial":
+                    val_x, val_y = generate_factorial_task(
+                        batch_size=args.batch_size,
+                        max_n=args.max_num,
+                        train=False
+                    )
+                else:
+                    raise ValueError(f"Unknown task {args.task}")
+
                 val_x, val_y = val_x.to(device), val_y.to(device)
                 val_outputs, _, _ = model(val_x)
-                val_seq_len = min(val_outputs.size(1), val_y.size(1))
-                val_loss = criterion(val_outputs[:, :val_seq_len, :], val_y[:, :val_seq_len, :])
-                val_acc = compute_batch_accuracy(val_outputs[:, :val_seq_len, :], val_y[:, :val_seq_len, :])
-                debug_print_samples(
-                    val_x,
-                    val_y,
-                    val_outputs,
-                    iteration,
-                    tag="Val",
-                    n=3
-                )
-
-            # Weight decay term (if used)
-            if optimizer is not None and "weight_decay" in optimizer.param_groups[0]:
-                wd = optimizer.param_groups[0]["weight_decay"]
-            else:
-                wd = 0.0
-
-            wd_term = compute_weight_decay_term(model, wd)
+                
+                # Align seq_len if needed
+                seq_len_val = min(val_outputs.size(1), val_y.size(1))
+                val_loss_t = criterion(val_outputs[:, :seq_len_val, :], val_y[:, :seq_len_val, :])
+                # Suppose we compute bitwise accuracy
+                val_acc = compute_batch_accuracy(val_outputs[:, :seq_len_val, :], val_y[:, :seq_len_val, :])
 
             # Print to stdout
-            msg = (f"Iter: {iteration}, "
-                   f"Train Loss: {loss}, "
-                   f"Train Acc: {train_acc:.3f}, "
-                   f"Val Loss: {val_loss}, "
-                   f"Val Acc: {val_acc:.3f}, "
-                   f"WD term: {wd_term:.6f}, "
-                   f"LR: {lr_current:.8f}")
+            msg = (f"Iter {iteration}, "
+                   f"TrainLoss={loss_val:.4f}, "
+                   f"ValLoss={val_loss_t.item():.4f}, "
+                   f"ValAcc={val_acc:.3f}, "
+                   f"LR={lr_current:.6f}")
             print(msg)
             sys.stdout.flush()
 
-            # Log to W&B
+            # W&B logging if desired
             if args.wandb_proj is not None:
                 wandb.log({
-                    "train_loss": loss,
-                    "train_acc": train_acc,
-                    "val_loss": val_loss,
+                    "train_loss": loss_val,
+                    "val_loss": val_loss_t.item(),
                     "val_acc": val_acc,
-                    "weight_decay_term": wd_term,
-                    "lr": lr_current
+                    "lr": lr_current,
                 }, step=global_step)
+
+    print("Finished training!")
 
 
 if __name__ == "__main__":
     main()
-    print("finished training")
