@@ -17,41 +17,24 @@ echo "[INFO] Killing existing screen sessions named 'NTM_*'..."
 screen -ls | grep '\.NTM_' | awk '{print $1}' | xargs -I{} screen -S {} -X quit # 2>/dev/null
 
 echo "[INFO] Starting to launch screens.."
+
 # 2) Define hyperparameter values
 TASKS=("copy" "repeat_copy" "associative_recall" "add" "sub" "mul" "div" "fib" "factorial")
+ARCHITECTURES=("ntm" "dnc" "tra")
 
-# ARCHITECTURES=("ntm" "dnc" "tra")
-MEZO_LAYERWISE=("false" "true")
-
-###
-# HIDDEN_SIZES=(64 128)
-# MEMORY_SIZES=(64 128)
-# HEAD_SIZES=(32 64)
-# LEARNING_RATES=(0.001 0.0001)
-# EPSILONS=(0.01 0.001 0.0001)
-# BATCH_SIZES=(16 32)
-
-ARCHITECTURES=("ntm")
-
+# You can adjust these as you wish:
 HIDDEN_SIZES=(64)
 MEMORY_SIZES=(64)
 HEAD_SIZES=(32)
 LEARNING_RATES=(0.001)
-EPSILONS=(0.01)
+EPSILONS=(0.001)
 BATCH_SIZES=(16)
+MEZO_LAYERWISE=("false" "true")
 
-
-MEZO_LAYERWISE=("false")
-
-# We can toggle "adam" vs "mezo" with a single array:
 OPTIMIZERS=("adam" "mezo")
-OPTIMIZERS=("mezo")
-
-
 MAX_ITERS=1000000
 SEQ_LEN=10
 LOG_INTERVAL=500
-
 WANDB_PROJ="NTM-Experiments"
 RUN_PREFIX="NTM_"
 
@@ -69,7 +52,6 @@ for TASK in "${TASKS[@]}"; do
                   # MeZO => we also sweep EPSILON & mezo_layerwise
                   for EPS in "${EPSILONS[@]}"; do
                     for MLW in "${MEZO_LAYERWISE[@]}"; do
-
                       RUN_NAME="${RUN_PREFIX}${TASK}_${ARCH}_lr${LR}_eps${EPS}_mezo_LW${MLW}"
                       echo "[INFO] Launching screen session: $RUN_NAME"
 
@@ -92,12 +74,12 @@ for TASK in "${TASKS[@]}"; do
                           --optimizer mezo \
                           --mezo \
                           --epsilon $EPS \
+                          --input_size 32 \
                           $( [ $MLW = 'true' ] && echo '--mezo_layerwise' ) \
                           --wandb_proj $WANDB_PROJ;
                         echo '[INFO] Finished run: $RUN_NAME';
                         exec bash
                       "
-
                       sleep 1
                     done
                   done
@@ -124,11 +106,11 @@ for TASK in "${TASKS[@]}"; do
                       --cosine_lr \
                       --learning_rate $LR \
                       --optimizer adam \
+                      --input_size 32 \
                       --wandb_proj $WANDB_PROJ;
                     echo '[INFO] Finished run: $RUN_NAME';
                     exec bash
                   "
-
                   sleep 1
                 fi
 
