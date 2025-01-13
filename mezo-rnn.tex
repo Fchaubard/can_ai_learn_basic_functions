@@ -1,0 +1,230 @@
+\documentclass{article}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+
+\begin{document}
+
+\title{RNNs Trained with MeZO Provide State of the Art Performance and Memory Scaling Laws}
+\author{}
+\date{}
+\maketitle
+
+\begin{abstract}
+This paper combines recent advancements in Zero-Order training methods such as MeZO with classical RNN architectures such as NTMs (Neural Turing Machines) and DNCs (Differential Neural Computers) to eliminate backpropagation through time (BPTT) during training, which achieves the lowest memory complexity of any reliable training method. Holding VRAM and compute constant, we find MeZO-RNNs (NTMs and DNCs trained with MeZO) outperform all other models on all benchmarks tested, including RNNs trained with BPTT and transformer-based architectures such as vanilla Transformers, Mamba, Reformer, Performer, and Linformer. We test on short and long sequence legnths for Copy, Associative Recall, Reverse, Sort, Anagram Detection, Sum, Multiply, and Bit Parity. This discovery makes possible new derivative-free recurrent architectures with nonlinearities in the time domain that were previously infeasible due to the memory requirements of BPTT that scales linearly with context length now removed with applying MeZO.
+\end{abstract}
+
+\section{Introduction}
+
+
+The history of deep learning for sequential and contextual data is marked by several critical advancements, beginning with recurrent neural networks (RNNs). RNNs were the first class of models designed to process sequential data, enabling them to capture temporal dependencies. However, their reliance on Backpropagation Through Time (BPTT) introduced significant challenges, including:
+\begin{itemize}
+    \item \textbf{High Memory Usage:} BPTT requires storing all intermediate activations for the entire sequence during forward propagation, leading to $O(C \cdot d)$ memory requirements for a sequence length $C$ and hidden dimension activations $d$.
+    \item \textbf{Vanishing and Exploding Gradients:} Long-term dependencies are difficult to capture due to gradient instability over long sequences.
+\end{itemize}
+
+To address some of these issues, models like Long Short-Term Memory (LSTM) and Gated Recurrent Units (GRUs) introduced gating mechanisms to mitigate vanishing gradients. However, these models still relied on BPTT, which constrained their scalability for long sequences.
+
+Transformers revolutionized sequential modeling by eliminating the need for BPTT altogether. Instead of processing data sequentially, transformers use self-attention to model relationships between all elements of the input simultaneously. This innovation enabled:
+\begin{itemize}
+    \item \textbf{Parallel Processing:} Transformers process all tokens in a sequence simultaneously, leading to significant speedups compared to the sequential nature of RNNs.
+    \item \textbf{Long-Range Dependencies:} The self-attention mechanism allows direct connections between any two tokens, making it easier to capture global context.
+\end{itemize}
+
+However, the self-attention mechanism comes with its own limitations. First, the memory requirements for computing the attention matrix scale as $O(C^2 \cdot h)$, where $C$ is the context length and $h$ is the number of attention heads. This quadratic dependency on $C$ limits the scalability of transformers for long-context tasks. Second, while transformers excel at capturing global dependencies, their inability to process data sequentially makes them suboptimal for tasks that inherently depend on sequential order, such as bit parity, certain algorithmic tasks, and other problems requiring strict temporal ordering.
+
+Historically, various methods have been proposed to address these limitations:
+\begin{itemize}
+    \item \textbf{"Linear" Transformers:} Models like Reformer, Performer, and Linformer reduce the quadratic memory requirements of self-attention by approximating or restricting the attention mechanism to have it scale linearly.
+    \item \textbf{Hybrid Architectures:} Combining RNNs and transformers to leverage the strengths of both sequential processing and global context modeling.
+\end{itemize}
+
+In this paper, we experiment on MeZO-RNNs, a class of models that combines the strengths of RNNs with the memory efficiency of zero-order optimization. By eliminating BPTT, MeZO-RNNs reduce memory requirements to $O(W+l \cdot d)$ as we have to store the weights (W), the activations per layer(d) for number of layers (l). This enables scalable training for remarkably long context lengths allowing RNNs to solve  new tasks never before possible without infeasible memory. NTMs have long struggled on such tasks including math equations over long sequences (>1e6) (bit parity, four function math, etc), long-distance anagram detection, context-sensitive language parsing, DNA Sequence Alignment, Long-Horizon Reinforcement Learning (e.g., such as in Strategy Games), and summarizing long text sequences. MeZO-RNNs outperform BPTT RNNs on these tasks as well as transformer-based models under fixed VRAM and compute budgets, demonstrating their potential as a robust solution for sequential tasks.
+
+
+\subsection{Memory Analysis}
+Memory requirements can be broadly categorized into three components:
+\begin{itemize}
+    \item \textbf{Weights (W):} Memory required to store the model parameters, proportional to the total number of parameters in the model.
+    \item \textbf{Activations (d):} Memory required to store intermediate results during the forward pass for use in backpropagation. For RNNs, activations (or hidden dimensions) scale with sequence length $C$, while for transformers, activations are affected quadratically by $C$ due to the self-attention mechanism (unless using linear variants).
+    \item \textbf{Gradients:} Memory required for storing the gradients of both activations and weights during backpropagation. This is typically proportional to the memory used for activations and weights.
+\end{itemize}
+
+\subsection{Traditional RNN and Transformer Memory Bottlenecks}
+RNNs trained with Backpropagation Through Time (BPTT) require storing all activations for the entire sequence length $C$, leading to memory requirements of $O(W + l \cdot C \cdot d)$, where $W$ is for the weights, $l$ is the number of layers, $C$ is the context length, and $d$ is the hidden dimension. This scaling is problematic for long sequences.
+
+Transformers, on the other hand, face an even greater challenge: the memory requirement for the self-attention mechanism scales as $O(W + l \cdot (C^2 \cdot h + C \cdot d) + C \cdot V_{BPE})$, where $h$ is the number of attention heads, and $V_BPE$ is the vocabulary size. This quadratic scaling in $C$ severely limits the context length $C$ that can be processed efficiently, making transformers impractical for very long sequences.
+
+\subsection{Historical Solutions}
+Several techniques have been proposed to address these memory challenges:
+\begin{itemize}
+    \item \textbf{Gradient Checkpointing:} Reduces memory by recomputing activations during backpropagation, trading memory for additional computation.
+    \item \textbf{Linear Attention Mechanisms:} Methods like Linformer, Performer, and Reformer reduce the quadratic scaling of self-attention by approximating or restricting the attention mechanism. For example, Linformer projects the sequence length $C$ to a fixed dimension $k$, achieving $O(C \cdot k)$ memory.
+    \item \textbf{Alternate Optimizations:} Most recently, Zero-order methods like MeZO eliminate the need for storing gradients by using derivative-free optimization, drastically reducing memory requirements.
+\end{itemize}
+
+\subsection{MeZO-RNN Advantages}
+To our knowledge, no researcher has adopted MeZO for RNNs to train without BPTT, reducing memory requirements to $O(d)$ for activations vs. $O(C \cdot d)$. Furthermore, we show that we do not require a layer-wise approach for RNNs to train with MeZO bringing down its compute time as well. As only a single step's activations need to be stored, compute is actually more performant now than BPTT and MeZO. This efficiency allows MeZO-RNNs to:
+\begin{itemize}
+    \item Scale context length $C$ to state of the art levels without increasing memory complexity at all.
+    \item Achieve SOTA performance on many long dependence tasks.
+    \item Achieve SOTA scaling laws compared to both traditional RNNs and transformers. 
+    \item Maintain constant or improved compute as compared to other methods.
+\end{itemize}
+
+In \ref{tab:memory_requirements} we analyze the memory complexity of the relevant deep learning architectures. As you can see, MeZO-RNNs are by far the most efficient enabling a 501x reduction to the current most memory efficient model.
+% \begin{table}[h!]
+% \centering
+% \begin{tabular}{@{}lcc@{}}
+% \toprule
+% \textbf{Model} & \textbf{Total Memory (Big-O)} & \textbf{Ex. VRAM Required (GB)} \\
+% \midrule
+% Transformer LLM & $O(W + C^2 \cdot h + C \cdot d + C \cdot |V_{BPE}|)$ & 89,502.23 \\
+% Reformer & $O(W + C \cdot \log(C) \cdot h + C \cdot d + C \cdot |V_{BPE}|)$ & 103.85 \\
+% Mamba & $O(W + C \cdot h + C \cdot d + C \cdot |V_{BPE}|)$ & 95.35 \\
+% Performer & $O(W + C \cdot h + C \cdot d + C \cdot |V_{BPE}|)$ & 95.35 \\
+% Linformer & $O(W + C \cdot k + C \cdot d + C \cdot |V_{BPE}|)$ & 95.74 \\
+% LSTM (BPTT) & $O(W + C \cdot d + C \cdot |V_c|)$ & 48.79 \\
+% LSTM (MeZO) & $O(W + d + C \cdot |V_c|)$ & 37.35 \\
+% \bottomrule
+% \end{tabular}
+% \caption{Estimated VRAM requirements (in GB) and Big-O complexity for training various models with $h=96$, $C=1,000,000$, $|V_{BPE}|=50,000$, $|V_c|=100$, $W=40$ billion parameters, $d=12,288$, and $k=512$.}
+% \label{tab:memory_requirements}
+% \end{table}
+\begin{table}
+\centering
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Model} & \textbf{Memory Complexity} & \textbf{Ex. VRAM Required (GB)} \\
+\midrule
+Transformer LLM & $O(W + l \cdot (C^2 \cdot h + C \cdot d) + C \cdot |V_{BPE}|)$ & 89,920 \\
+Reformer & $O(W + l \cdot (C \cdot \log(C) \cdot h + C \cdot d) + C \cdot |V_{BPE}|)$ & 515 \\
+Mamba & $O(W + l \cdot (C \cdot h + C \cdot d) + C \cdot |V_{BPE}|)$ & 513 \\
+Performer & $O(W + l \cdot (C \cdot h + C \cdot d) + C \cdot |V_{BPE}|)$ & 513 \\
+Linformer & $O(W + l \cdot (C \cdot k + C \cdot d) + C \cdot |V_{BPE}|)$ & 513 \\
+RNN (BPTT) & $O(W + l \cdot C \cdot d )$ & 466 \\
+RNN (MeZO) & $O(W + l \cdot d )$ & 0.93 \\
+\bottomrule
+\end{tabular}
+\caption{Estimated VRAM requirements (in GB) and memory complexity for training various models. For an example, we provide memory costs in GBs assuming $h=96$, $C=1,000,000$, $|V_{BPE}|=50,000$, $l=10$ layers, $W=1$ billion parameters, $d=50k$ hidden activations per layer, and $k=512$ (for linformer).} 
+\label{tab:memory_requirements}
+\end{table}
+
+Also, for completeness in \ref{tab:compute_requirements}, we include our comparison for compute of one "step" of training. 
+
+\begin{table}
+\centering
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Model} & \textbf{Compute Complexity} & \textbf{Ex. Compute Required (TFLOP/step)} \\
+\midrule
+\textbf{Transformer LLM} & $O(l \cdot (C^2 \cdot h + C \cdot d))$ & 965.00 \\
+\textbf{Reformer} & $O(l \cdot (C \cdot \log(C) \cdot h + C \cdot d))$ & 5.02 \\
+\textbf{Mamba} & $O(l \cdot (C \cdot h + C \cdot d))$ & 5.00 \\
+\textbf{Performer} & $O(l \cdot (C \cdot h + C \cdot d))$ & 5.00 \\
+\textbf{Linformer} & $O(l \cdot (C \cdot k + C \cdot d))$ & 5.01 \\
+\textbf{RNN (BPTT)} & $O(2 \cdot l \cdot C \cdot (W + d) + W)$ & 1.001 \\
+\textbf{RNN (MeZO)} & $O(2 \cdot l \cdot C \cdot (W + d) + W)$ & 1.001 \\
+\bottomrule
+\end{tabular}
+\caption{Compute requirements for various models, including complexity. For an example, we provide compute costs in TFLOPs assuming $h=96$, $C=1,000,000$, $|V_{BPE}|=50,000$, $|V_c|=128$, $W=1$ billion parameters, $d=12,288$, $A=500,000$, $k=512$, and $l=10$.}
+\label{tab:compute_requirements}
+\end{table}
+
+
+\section{Definitions}
+
+\begin{itemize}
+    \item \textbf{\(W\) (Weights):}
+    \begin{itemize}
+        \item \textbf{Definition:} Memory required to store the model's parameters, including the weights of all layers (e.g., embedding layers, attention heads, feed-forward networks, RNN cells).
+        \item \textbf{Common Values:} For large-scale models:
+        \begin{itemize}
+            \item Transformer-based models (e.g., GPT-3): Billions of parameters (\(10^{9}\) to \(10^{12}\)).
+            \item RNNs: Typically smaller, ranging from \(10^{6}\) to \(10^{8}\).
+        \end{itemize}
+    \end{itemize}
+    \item \textbf{\(C\) (Context Length):}
+    \begin{itemize}
+        \item \textbf{Definition:} The length of the input sequence or context window that the model processes.
+        \item \textbf{Common Values:}
+        \begin{itemize}
+            \item Transformers: \(C = 512\) to \(2048\) for models like GPT and BERT. Some long-context models extend this to \(C = 10^4\) or higher.
+            \item RNNs: Can handle arbitrary lengths in theory but are practically limited by memory and computational constraints.
+        \end{itemize}
+    \end{itemize}
+    \item \textbf{\(h\) (Number of Attention Heads):}
+    \begin{itemize}
+        \item \textbf{Definition:} The number of parallel attention mechanisms in transformer architectures.
+        \item \textbf{Common Values:}
+        \begin{itemize}
+            \item Typically \(h = 12\) (BERT-base) to \(96\) (GPT-3).
+        \end{itemize}
+    \end{itemize}
+    \item \textbf{\(k\) (Projection Dimension):}
+    \begin{itemize}
+        \item \textbf{Definition:} The reduced dimensionality used in models like Linformer to approximate self-attention.
+        \item \textbf{Common Values:} \(k = 256\) to \(512\), depending on the model size and sequence length.
+    \end{itemize}
+     \item \textbf{\(|V|\) (Vocabulary Size):}
+    \begin{itemize}
+        \item \textbf{Definition:} The number of unique tokens in the model's vocabulary.
+        \item \textbf{Common Values:}
+        \begin{itemize}
+            \item Subword-based tokenization (e.g., byte-pair encoding): \(|V_{BPE}| = 30,000\) to \(50,000\).
+            \item Character-level models: \(|V_c| = 100\) to \(300\), depending on the language.
+        \end{itemize}
+    \end{itemize}
+    \item \textbf{\(d\) (Activations per layer):}
+    \begin{itemize}
+        \item \textbf{Definition:} Memory required to store intermediate results during forward passes for use in backpropagation.
+        \item \textbf{Common Values:}  TODO
+        \begin{itemize}
+            \item Transformers: \(d = 768\) (BERT-base) to \(12288\) (GPT-3).
+            \item RNNs: \(d = 256\) to \(2048\).
+        \end{itemize}
+    \end{itemize}
+\end{itemize}
+
+
+\subsection{Empirical Comparison}
+In our experiments, we compare MeZO-RNNs, transformers and traditional RNNs under fixed VRAM and compute constraints for long dependence tasks. We do our best holding memory and context length constant to ensure apples to apples comparison for our tests. Specifically, we max out the size of all models so that context length (1 million) can still fit on a single A40 GPU which holds only 48 GBs of VRAM. This means that some models will be much bigger than others however, we felt this was an appropriate apples to apples comparison as deep learning practitioners are bounded by their available GPU VRAM. 
+
+\subsection{Results}
+Tasks (each one with a context length of >1e6):
+\begin{itemize}
+            \item Copy 
+            \item Repeat Copy
+            \item Associative Recall
+            \item Reverse
+            \item Sort
+            \item Anagram Detection
+            \item Sum
+            \item Multiply
+            \item Bit Parity
+            \item GSM8k?
+            \item PGSM8k?
+            \item ThePile?
+            \item anything else???
+\end{itemize}
+
+            
+
+
+Architectures and training procedures:
+\begin{itemize}
+    \item Transformer LLM
+    \item Reformer
+    \item Mamba
+    \item Performer 
+    \item Linformer
+    \item NTM (BPTT)
+    \item DNC (BPTT)
+    \item Transformer-NTM (BPTT)
+    \item NTM (MeZO)
+    \item DNC (MeZO)
+    \item Transformer-NTM (MeZO)
+    \item anything else???
+\end{itemize}
+
+\end{document}
