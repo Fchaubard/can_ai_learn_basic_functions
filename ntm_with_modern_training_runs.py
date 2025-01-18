@@ -51,45 +51,38 @@ def pick_gpu_with_most_free_mem() -> int:
 ##############################################################################
 # ASCII Vocab + Tokenizer (with <bos> and <eos>)
 ##############################################################################
+
 def get_char_vocab():
     """
-    We'll define a small ASCII set:
-      index 0 => <PAD>
-      index 1 => <bos>
-      index 2 => <eos>
-      then digits 0..9, uppercase A..Z, operators + - * / =, space, '|'
+    Defines a character vocabulary with:
+      - Special tokens: <PAD>, <bos>, <eos>, <UNK>
+      - Digits: 0..9
+      - Uppercase and lowercase letters: A..Z, a..z
+      - Operators: + - * / =
+      - Other symbols: space and '|'
     """
-    special = ['<PAD>', '<bos>', '<eos>', '+', '-', '*', '/', '=', ' ', '|']
+    special = ['<PAD>', '<bos>', '<eos>', '<UNK>']  # Add <UNK>
     digits = list(string.digits)
-    letters = list(string.ascii_uppercase)
+    letters_upper = list(string.ascii_uppercase)
+    letters_lower = list(string.ascii_lowercase)
+    operators = ['+', '-', '*', '/', '=', ' ', '|']
 
-    vocab_list = special + digits + letters  # Ensures special tokens come first
+    # Combine all into the vocabulary list
+    vocab_list = special + digits + letters_upper + letters_lower + operators
+
+    # Create mapping dictionaries
     char_to_id = {ch: i for i, ch in enumerate(vocab_list)}
     id_to_char = {i: ch for i, ch in enumerate(vocab_list)}
 
     return vocab_list, char_to_id, id_to_char
 
+
+
+
+
 ##############################################################################
 # Convert strings -> fixed [B, max_seq_len], pad or truncate
 ##############################################################################
-
-def str_to_tensor(batch_strs, char_to_id, max_seq_len):
-    """
-    Convert a batch of tokenized strings to a tensor of fixed size [B, max_seq_len],
-    padded or truncated as needed.
-    """
-    B = len(batch_strs)
-    out = torch.zeros(B, max_seq_len, dtype=torch.long)
-    for i, s in enumerate(batch_strs):
-        # Tokenize the string while preserving special tokens like <bos> and <eos>
-        tokens = tokenize_special(s, char_to_id)
-        for j, token in enumerate(tokens):
-            if j >= max_seq_len:
-                break
-            out[i, j] = char_to_id.get(token, 0)
-    return out
-
-
 def tensor_to_string(tensor, id_to_char):
     """
     Convert a tensor of token IDs (1D or 2D) back into a string or list of strings.
@@ -112,25 +105,62 @@ def tensor_to_string(tensor, id_to_char):
         raise ValueError("Input tensor must be 1D or 2D.")
 
 
-def tokenize_special(string, char_to_id):
+
+def str_to_tensor(batch_strs, char_to_id):
     """
-    Tokenize a string while preserving special tokens.
-    For example:
-      "<bos>0123<eos>" -> ["<bos>", "0", "1", "2", "3", "<eos>"]
+    Convert a batch of strings (which may contain special tokens like <bos>, <eos>, etc.)
+    into a padded LongTensor of shape [B, max_len].
+
+    1) For each string, call `tokenize_special(...)` to produce a list of tokens.
+    2) Find the maximum sequence length across the batch.
+    3) Create a tensor [B, max_len] of zeros (padding index=0).
+    4) Fill in the token IDs for each sequence up to its length.
     """
-    special_tokens = {'<bos>', '<eos>', '<PAD>'}  # Define your special tokens
+    # 1) Tokenize each string
+    token_lists = []
+    for s in batch_strs:
+        tokens = tokenize_special(s)
+        token_lists.append(tokens)
+
+    # 2) Find the maximum length across all tokenized strings
+    max_len = max(len(toks) for toks in token_lists) if token_lists else 1
+
+    # 3) Create the output tensor [B, max_len], initialized to 0 (PAD)
+    B = len(batch_strs)
+    out = torch.zeros(B, max_len, dtype=torch.long)
+
+    # 4) Fill in the token IDs
+    for i, tokens in enumerate(token_lists):
+        for j, tok in enumerate(tokens):
+            out[i, j] = char_to_id.get(tok, 0)
+
+    return out
+
+def tokenize_special(s):
+    """
+    Example tokenizer that treats any substring like <bos>, <eos>, <PAD>, etc.
+    as *single* tokens if present. Otherwise, each character is its own token.
+
+    This is just a toy example. Adjust it to fit your needs (e.g. handling
+    <bos>... in the input more robustly).
+    """
     tokens = []
     i = 0
-    while i < len(string):
-        # Check for special tokens
-        if string[i:i+5] == '<bos>':
-            tokens.append('<bos>')
-            i += 5
-        elif string[i:i+5] == '<eos>':
-            tokens.append('<eos>')
-            i += 5
+    while i < len(s):
+        if s[i] == '<':
+            # Try to find the matching '>'
+            j = s.find('>', i + 1)
+            if j == -1:
+                # No '>' found => treat '<' as a normal character (unlikely in well-formed data).
+                tokens.append(s[i])
+                i += 1
+            else:
+                # Collect the full '<...>'
+                tokens.append(s[i : j+1])
+                i = j + 1
         else:
-            tokens.append(string[i])
+            # Normal character
+            tokens.append(s[i])
             i += 1
     return tokens
 
@@ -331,6 +361,51 @@ def generate_factorial_task_str(num_samples, input_sample_length, max_n=6, train
 ##############################################################################
 # Model Classes
 ##############################################################################
+class SimpleLSTM(nn.Module):
+    def __init__(self, input_size, output_size, hidden_size, embed):
+        super(SimpleLSTM, self).__init__()
+        self.input_size = input_size
+        self.output_size = output_size
+        self.hidden_size = hidden_size
+        self.embed = embed
+
+        # Input normalization
+        controller_input_size = input_size 
+        self.input_norm = nn.LayerNorm(controller_input_size)
+        self.controller_norm = nn.LayerNorm(output_size)
+
+        # Controller with input normalization
+        self.controller = nn.LSTM(controller_input_size, hidden_size, proj_size=output_size, batch_first=True)
+
+    def forward(self, x_emb, hidden=None, memory=None, skip_layer_norm=True):
+        B, L, E = x_emb.size()
+
+        # Correct hidden and cell state initialization
+        if hidden is None:
+            h0 = x_emb.new_zeros(1, B, self.output_size)  # Hidden state matches proj_size
+            c0 = x_emb.new_zeros(1, B, self.hidden_size)  # Cell state matches hidden_size
+            hidden = (h0, c0)
+
+        outputs = []
+        for t in range(L):
+            controller_input = x_emb[:, t, :]
+            if not skip_layer_norm:
+                controller_input = self.input_norm(controller_input)
+
+            # Controller
+            out_ctrl, hidden = self.controller(controller_input.unsqueeze(1), hidden)
+            # out_ctrl = out_ctrl.squeeze(1)
+            # Normalize output
+            if not skip_layer_norm:
+                out_ctrl = self.controller_norm(out_ctrl)
+            outputs.append(out_ctrl)
+
+        outputs = torch.cat(outputs, dim=1)
+        return outputs, memory, hidden
+
+
+
+
 class NTM(nn.Module):
     def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed):
         super(NTM, self).__init__()
@@ -364,6 +439,7 @@ class NTM(nn.Module):
         self.fc_proj = nn.Linear(total_output_size, output_size)  # Direct to vocab size
 
         self.reset_parameters()
+        self.temperature = 4.0
 
     def reset_parameters(self):
         """Initialize parameters with appropriate distributions"""
@@ -401,12 +477,12 @@ class NTM(nn.Module):
     
         # Read operation with normalized attention
         read_weights = torch.einsum('bnk,bmk->bnm', read_keys, memory_normalized)  # No scaling, let LayerNorm handle it
-        read_weights = F.softmax(read_weights, dim=-1)
+        read_weights = F.softmax(read_weights/self.temperature, dim=-1)
         read_content = torch.einsum('bnm,bmh->bnh', read_weights, memory)
     
         # Write operation with normalized attention
         write_weights = torch.einsum('bnk,bmk->bnm', write_keys, memory_normalized)
-        write_weights = F.softmax(write_weights, dim=-1)
+        write_weights = F.softmax(write_weights/self.temperature, dim=-1)
     
         # Erase and write operations
         erase_vectors_expanded = torch.einsum('bnm,bnh->bmh', write_weights, erase_vectors)
@@ -650,6 +726,7 @@ class TransformerMemoryDNC(nn.Module):
         self.fc_proj = nn.Linear(total_output_size, output_size)
 
         self.reset_parameters()
+        self.temperature = 4.0
 
     def reset_parameters(self):
         """Initialize parameters"""
@@ -681,7 +758,7 @@ class TransformerMemoryDNC(nn.Module):
 
         # Compute attention weights
         read_weights = torch.softmax(
-            torch.einsum('bnh,bmh->bnm', read_keys, memory_normalized),
+            torch.einsum('bnh,bmh->bnm', read_keys, memory_normalized)/self.temperature,
             dim=2
         )
         read_vectors = torch.einsum('bnm,bmh->bnh', read_weights, memory)
@@ -698,7 +775,7 @@ class TransformerMemoryDNC(nn.Module):
 
         # Compute write weights
         write_weights = torch.softmax(
-            torch.einsum('bh,bmh->bm', write_keys, memory_normalized),
+            torch.einsum('bh,bmh->bm', write_keys, memory_normalized)/self.temperature,
             dim=1
         ).unsqueeze(1)
 
@@ -919,7 +996,7 @@ class TransformerNTM(nn.Module):
     def forward(self, x_emb, hidden=None, memory=None):
         trans_out = self.transformer(x_emb)
         out = self.fc_out(trans_out)
-        return out, None, None
+        return out, None, (None, None)
 
 
 ##############################################################################
@@ -942,7 +1019,7 @@ def group_params_by_layer(named_params):
 
 from torch.nn.utils.rnn import pad_sequence
 import pdb
-def teacher_forcing_loss_emb(model, x_emb, y_ids, criterion, teacher_force=True):
+def teacher_forcing_loss_emb(model, x_emb, y_ids_unpadded, criterion, teacher_force=True):
     """
     Teacher-forcing loss for step-by-step sequence generation.
     
@@ -956,8 +1033,8 @@ def teacher_forcing_loss_emb(model, x_emb, y_ids, criterion, teacher_force=True)
         torch.Tensor: Average loss per token.
     """
     B, Lx, E = x_emb.size()
-    y_ids_trimmed = [y[y != 0] for y in y_ids]
-    y_ids_unpadded = pad_sequence(y_ids_trimmed, batch_first=True, padding_value=0)
+    # y_ids_trimmed = [y[y != 0] for y in y_ids]
+    # y_ids_unpadded = pad_sequence(y_ids_trimmed, batch_first=True, padding_value=0)
 
     Ly = y_ids_unpadded.size(1)
     device = x_emb.device
@@ -967,45 +1044,63 @@ def teacher_forcing_loss_emb(model, x_emb, y_ids, criterion, teacher_force=True)
     hidden = None
     memory = None
 
-    # Forward input sequence step-by-step
-    for t in range(Lx):
-        inp_t = x_emb[:, t, :].unsqueeze(1)  # [B, 1, E]
-        logits, memory, hidden = model(inp_t, hidden=hidden, memory=memory)
+    y_emb_input = model.embed(y_ids_unpadded)[:, :-1, :]  # shape [B, L_y-1, E]
 
-    # Now process target sequence step-by-step
-    total_loss = 0.0
-    num_tokens = 0
+    # Concatenate input and partial target
+    # e.g. shape [B, L_x + (L_y-1), E]
+    full_input = torch.cat([x_emb, y_emb_input], dim=1)
+    
+    # Now feed this entire sequence to the LSTM "in one shot"
+    outputs, _, (h, c) = model(full_input)  # shape of outputs is [B, L_x + (L_y - 1), something]
+    logits = outputs[:, Lx-1:, :].contiguous()  # Get predictions starting from after input sequence
+    logits = logits.view(-1, logits.size(-1))  # [batch_size * seq_len, num_classes]
+    
+    # Reshape targets
+    targets = y_ids_unpadded.contiguous().view(-1)  # [batch_size * seq_len]
+    
+    total_loss = criterion(logits, targets)
+    return total_loss/Ly 
 
-    for t in range(Ly):  
-        logits = logits.squeeze(1)  # [B, vocab_size]
-        # Determine whether to continue teacher forcing
-        pred_t = logits.argmax(dim=-1)  # Predicted token IDs
-        counter=0
-        while pred_t.eq(0).all() and counter>10: # its allowed to think for 10 iters per token.. after that incur loss
-            counter+=1
-            inp_t = model.embed(pred_t).unsqueeze(1)
-            logits, memory, hidden = model(inp_t, hidden=hidden, memory=memory)
-            logits = logits.squeeze(1)  # [B, vocab_size]
-            # Determine whether to continue teacher forcing
-            pred_t = logits.argmax(dim=-1)  # Predicted token IDs
+
+    # # # Forward input sequence step-by-step
+    # # for t in range(Lx):
+    # #     inp_t = x_emb[:, t, :].unsqueeze(1)  # [B, 1, E]
+    # #     logits, memory, hidden = model(inp_t, hidden=hidden, memory=memory)
+
+    # # Now process target sequence step-by-step
+    # total_loss = 0.0
+    # num_tokens = 0
+
+    # for t in range(Ly):  
+    #     logits = logits.squeeze(1)  # [B, vocab_size]
+    #     # Determine whether to continue teacher forcing
+    #     pred_t = logits.argmax(dim=-1)  # Predicted token IDs
+    #     counter=0
+    #     while pred_t.eq(0).all() and counter>10: # its allowed to think for 10 iters per token.. after that incur loss
+    #         counter+=1
+    #         inp_t = model.embed(pred_t).unsqueeze(1)
+    #         logits, memory, hidden = model(inp_t, hidden=hidden, memory=memory)
+    #         logits = logits.squeeze(1)  # [B, vocab_size]
+    #         # Determine whether to continue teacher forcing
+    #         pred_t = logits.argmax(dim=-1)  # Predicted token IDs
         
-        # pdb.set_trace()
-        # we made our prediction for this t so lets get some loss
-        target_t = y_ids_unpadded[:, t ]  # Ground truth at step t+1 (excluding <bos>)
-        step_loss = criterion(logits, target_t)
-        total_loss += step_loss #.item()
-        # correct += (target_t == pred_t).sum().item()
-        num_tokens += (target_t != 0).sum().item()
+    #     # pdb.set_trace()
+    #     # we made our prediction for this t so lets get some loss
+    #     target_t = y_ids_unpadded[:, t ]  # Ground truth at step t+1 (excluding <bos>)
+    #     step_loss = criterion(logits/4.0, target_t)
+    #     total_loss += step_loss #.item()
+    #     # correct += (target_t == pred_t).sum().item()
+    #     num_tokens += (target_t != 0).sum().item()
 
-        if not teacher_force: # if we are not teacher forcing, we should feed its own output back in
-            target_t = pred_t
+    #     if not teacher_force: # if we are not teacher forcing, we should feed its own output back in
+    #         target_t = pred_t
         
   
-        # now we take the next truth and give it to the model and iter again
-        target_t_emb = model.embed(target_t).unsqueeze(1)  # [B, 1, E]
+    #     # now we take the next truth and give it to the model and iter again
+    #     target_t_emb = model.embed(target_t).unsqueeze(1)  # [B, 1, E]
   
-        # Generate prediction for the current step
-        logits, memory, hidden = model(target_t_emb, hidden=hidden, memory=memory) # TODO, hidden may need a transpose?
+    #     # Generate prediction for the current step
+    #     logits, memory, hidden = model(target_t_emb, hidden=hidden, memory=memory) # TODO, hidden may need a transpose?
 
     # Average loss across all valid tokens
     return total_loss/Ly #  / num_tokens if num_tokens > 0 else 0.0
@@ -1442,124 +1537,135 @@ def mezo_char_single(model, x_emb, y, criterion, epsilon=1e-3, verbose=False):
     return avg_loss
 
 
-
-def generate_sequence_batched(model, x_ids, embed, char_to_id, id_to_char, max_seq_len, device, 
+def generate_sequence_batched(model, x_ids, embed, char_to_id, id_to_char, max_seq_len=20, device='cuda', 
                                criterion=None, y_ids=None, bos_token='<bos>', eos_token='<eos>', 
                                pad_token='<PAD>', teacher_force=False, verbose=False):
     """
-    Generate sequences step-by-step using a sequence-to-sequence model.
-
+    Generate sequences step-by-step using a sequence model with autoregressive or teacher-forced generation.
+    The input x_ids already contains the <bos> token followed by the prompt.
+    
     Args:
-        model (nn.Module): Sequence-to-sequence model.
-        x_ids (torch.Tensor): [B, Lx], token IDs for input sequences.
-        embed (nn.Embedding): Embedding layer.
-        char_to_id (dict): Token-to-ID mapping.
-        id_to_char (dict): ID-to-token mapping.
-        max_seq_len (int): Maximum sequence length for generation.
-        device (torch.device): Device for computation.
-        criterion (nn.Module, optional): Loss function for token-level loss computation.
-        y_ids (torch.Tensor, optional): [B, Ly], token IDs for target sequences.
-        bos_token (str): Beginning-of-sequence token.
-        eos_token (str): End-of-sequence token.
-        pad_token (str): Padding token.
-        teacher_force (bool): Whether to apply teacher forcing during generation.
-        verbose (bool): If True, prints debug information.
-
+        model: The sequence model
+        x_ids: Input token IDs including <bos> [batch_size, input_seq_len]
+        embed: Embedding layer
+        char_to_id: Dictionary mapping characters to token IDs
+        id_to_char: Dictionary mapping token IDs to characters
+        max_seq_len: Maximum length of generated sequence
+        device: Device to run the model on
+        criterion: Loss function (optional)
+        y_ids: Target token IDs for teacher forcing and loss calculation [batch_size, target_seq_len]
+        bos_token: Beginning of sequence token
+        eos_token: End of sequence token
+        pad_token: Padding token
+        teacher_force: Whether to use teacher forcing
+        verbose: Whether to print generation progress
     Returns:
-        Tuple containing:
-        - generated_strs: List[str], generated strings without special tokens.
-        - generated_strs_with_all_special_tokens: List[str], generated strings with special tokens.
-        - generated_ids: List[List[int]], token IDs of generated sequences.
-        - probs_batch: List[List[float]], probabilities for each generated token.
-        - avg_loss: float, average token-level loss.
-        - avg_token_level_accuracy: float, average token-level accuracy.
-        - avg_sample_level_accuracy: float, average sample-level accuracy.
+        Tuple containing generated strings, full sequences, token IDs, probabilities and metrics
     """
     B, Lx = x_ids.size()
     device = x_ids.device
-
+    
     # Special token IDs
     bos_id = char_to_id[bos_token]
     eos_id = char_to_id[eos_token]
     pad_id = char_to_id[pad_token]
-
-    # Embed the input sequence
+    
+    # Embed the input sequence which already includes <bos>
     x_emb = embed(x_ids)  # [B, Lx, E]
-
-    # Initialize memory, hidden states, and outputs
+    
+    # Initialize states and outputs
     memory = None
     hidden = None
     generated_ids = [[] for _ in range(B)]
     probs_batch = [[] for _ in range(B)]
-    total_loss = 0.0
-    total_correct = 0
-    total_tokens = 0
-    total_samples = 0
-
-    # Process input sequence step-by-step
-    for t in range(Lx):
-        inp_t = x_emb[:, t, :].unsqueeze(1)  # [B, 1, E]
-        logits, memory, hidden = model(inp_t, hidden=hidden, memory=memory)
-        
+    all_logits = []
+    all_targets = []
     
+    # Get initial prediction from the input sequence
+    logits, memory, hidden = model(x_emb, hidden=hidden, memory=memory)
+    last_logits = logits[:, -1, :]  # Get predictions for next token after input
+    
+    # Track which sequences have finished generating
+    finished = torch.zeros(B, dtype=torch.bool, device=device)
+    
+    # Generation loop
     for step in range(max_seq_len):
-        logits = logits.squeeze(1)
-        probs = torch.softmax(logits, dim=-1)
-        next_tokens = probs.argmax(dim=-1)  # Greedy decoding
-
-        # Handle "thinking steps" for PAD predictions
-        counter = 0
-        while next_tokens.eq(pad_id).all() and counter < 10:
-            counter += 1
-            inp_t_emb = model.embed(next_tokens).unsqueeze(1) 
-            logits, memory, hidden = model(inp_t_emb, hidden=hidden, memory=memory)
-            logits = logits.squeeze(1)  # [B, vocab_size]
-            probs = torch.softmax(logits, dim=-1)
-            next_tokens = probs.argmax(dim=-1)
-
-        # Record generated tokens and probabilities
-        for b in range(B):
-            if len(generated_ids[b]) < max_seq_len and next_tokens[b] != eos_id:
-                generated_ids[b].append(next_tokens[b].item())
-                probs_batch[b].append(float(probs[b, next_tokens[b].item()]))
-                
-        # Compute loss if criterion and targets are provided
-        if criterion is not None and y_ids is not None and step < y_ids.size(1):
-            target_t = y_ids[:, step]  # Ground truth for this step
-            assert not torch.isnan(logits).any(), "Logits contain NaN!"
-            assert not torch.isinf(logits).any(), "Logits contain Inf!"
-            assert y_ids.max() < logits.size(-1), "Target token ID out of bounds!"
-
-            
-            step_loss = criterion(logits, target_t)
-            total_loss += step_loss.item()
-            total_correct += (next_tokens == target_t).sum().item()
-            total_tokens += (target_t != pad_id).sum().item()
-
+        # Calculate probabilities for current step
+        probs = torch.softmax(last_logits, dim=-1)
         
-        if all(eos_id in gen for gen in generated_ids):  # Stop if all sequences contain EOS
-            break
-
-        # Teacher forcing: use ground truth if provided
+        # Store logits for loss calculation if targets provided
+        if y_ids is not None and step < y_ids.size(1):
+            all_logits.append(last_logits)
+            all_targets.append(y_ids[:, step])
+        
+        # Select next token based on teacher forcing or model prediction
         if teacher_force and y_ids is not None and step < y_ids.size(1):
-            next_tokens = y_ids[:, step]
-        inp_t_emb = model.embed(next_tokens).unsqueeze(1) 
-        logits, memory, hidden = model(inp_t_emb, hidden=hidden, memory=memory)
-
+            next_token = y_ids[:, step]
+            next_emb = embed(next_token.unsqueeze(1))  # [B, 1, E]
+        else:
+            next_token = torch.argmax(last_logits, dim=-1)  # [B]
+            next_emb = embed(next_token.unsqueeze(1))  # [B, 1, E]
         
-    # Convert token IDs to strings
-    generated_strs = [tensor_to_string(torch.tensor(gen), id_to_char) for gen in generated_ids]
-    generated_strs_with_all_special_tokens = [
-        tensor_to_string(torch.tensor(gen), id_to_char) for gen in generated_ids
-    ]
-
-    # Calculate accuracies
-    avg_loss = total_loss / total_tokens if total_tokens > 0 else 0.0
-    avg_token_level_accuracy = total_correct / total_tokens if total_tokens > 0 else 0.0
-    avg_sample_level_accuracy = sum(
-        [1 for b in range(B) if generated_ids[b] == y_ids[b].tolist()]
-    ) / B if y_ids is not None else 0.0
-
+        # Store generated tokens and probabilities
+        for b in range(B):
+            if not finished[b]:
+                token_id = next_token[b].item()
+                generated_ids[b].append(token_id)
+                probs_batch[b].append(probs[b, token_id].item())
+                
+                # Check if sequence is finished
+                if token_id == eos_id:
+                    finished[b] = True
+        
+        # Break if all sequences have finished
+        if finished.all():
+            break
+            
+        # Get next prediction using the selected token
+        logits, memory, hidden = model(next_emb, hidden=hidden, memory=memory)
+        last_logits = logits[:, -1, :]  # [B, vocab_size]
+    
+    # Calculate metrics if targets provided
+    avg_loss = 0.0
+    avg_token_level_accuracy = 0.0
+    avg_sample_level_accuracy = 0.0
+    
+    if y_ids is not None and criterion is not None:
+        # Stack logits and targets
+        stacked_logits = torch.stack(all_logits, dim=1)  # [B, seq_len, vocab_size]
+        stacked_targets = torch.stack(all_targets, dim=1)  # [B, seq_len]
+        
+        # Calculate loss
+        loss = criterion(stacked_logits.view(-1, stacked_logits.size(-1)), 
+                        stacked_targets.view(-1))
+        avg_loss = loss.item()
+        
+        # Calculate accuracies
+        predictions = torch.argmax(stacked_logits, dim=-1)  # [B, seq_len]
+        token_correct = (predictions == stacked_targets).float()
+        avg_token_level_accuracy = token_correct.mean().item()
+        
+        # Sample-level accuracy (all tokens correct)
+        sample_correct = token_correct.all(dim=1).float()
+        avg_sample_level_accuracy = sample_correct.mean().item()
+    
+    # Convert generated IDs to strings
+    generated_strs = []
+    generated_strs_with_all_special_tokens = []
+    
+    for seq_ids in generated_ids:
+        # Remove EOS token and everything after it
+        if eos_id in seq_ids:
+            seq_ids = seq_ids[:seq_ids.index(eos_id)]
+            
+        # Convert to string without special tokens
+        clean_str = tensor_to_string(torch.tensor(seq_ids), id_to_char)
+        generated_strs.append(clean_str)
+        
+        # Convert to string with special tokens
+        full_str = tensor_to_string(torch.tensor([bos_id] + seq_ids + [eos_id]), id_to_char)
+        generated_strs_with_all_special_tokens.append(full_str)
+    
     return (
         generated_strs,
         generated_strs_with_all_special_tokens,
@@ -1570,248 +1676,35 @@ def generate_sequence_batched(model, x_ids, embed, char_to_id, id_to_char, max_s
         avg_sample_level_accuracy,
     )
 
-# def generate_sequence_batched(model, x_ids, embed, char_to_id, id_to_char, max_seq_len, device, 
-#                              criterion=None, y_ids=None, bos_token='<bos>', eos_token='<eos>', 
-#                              pad_token='<PAD>', verbose=False):
-#     """
-#     Debug-instrumented version of sequence generation.
-#     """
-#     if verbose:
-#         print("\n=== SEQUENCE GENERATION DEBUG ===")
-#         print(f"Input x_ids shape: {x_ids.shape}")
-#         print(f"First sequence in batch:")
-#         print(f"Raw x_ids: {x_ids[0].tolist()}")
-#         print(f"Decoded x_ids: {''.join([id_to_char[id.item()] for id in x_ids[0] if id.item() != 0])}")
-#         if y_ids is not None:
-#             print(f"\nTarget y_ids shape: {y_ids.shape}")
-#             print(f"Raw y_ids: {y_ids[0].tolist()}")
-#             print(f"Decoded y_ids: {''.join([id_to_char[id.item()] for id in y_ids[0] if id.item() != 0])}")
+class WarmupScheduler:
+        def __init__(self, optimizer, warmup_steps, base_lr, final_lr):
+            """
+            Args:
+                optimizer (torch.optim.Optimizer): The optimizer whose LR needs to be warmed up.
+                warmup_steps (int): Number of warmup steps.
+                base_lr (float): Initial learning rate (e.g., 0.0).
+                final_lr (float): Target learning rate after warmup.
+            """
+            self.optimizer = optimizer
+            self.warmup_steps = warmup_steps
+            self.base_lr = base_lr
+            self.final_lr = final_lr
+            self.current_step = 0
     
-#     model.eval()
+        def step(self):
+            """Perform one step of warmup."""
+            self.current_step += 1
+            if self.current_step <= self.warmup_steps:
+                # Linearly interpolate between base_lr and final_lr
+                warmup_lr = self.base_lr + (self.final_lr - self.base_lr) * (self.current_step / self.warmup_steps)
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = warmup_lr
+                print(f"warmup_lr, {warmup_lr}")
     
-#     # Get batch size and sequence length
-#     B, Lx = x_ids.shape
-    
-#     # Get special token IDs
-#     bos_id = char_to_id.get(bos_token, 1)
-#     eos_id = char_to_id.get(eos_token, 2)
-#     pad_id = char_to_id.get(pad_token, 0)
-
-#     # Debug info for dimensions and special tokens
-#     if verbose:
-#         print(f"\nBatch size: {B}, Input length: {Lx}")
-#         print(f"Special tokens - BOS: {bos_id}, EOS: {eos_id}, PAD: {pad_id}")
-
-#     # Pad sequences
-#     x_ids = torch.stack([
-#         F.pad(x_ids[i][x_ids[i] != 0], (0, x_ids.size(1) - (x_ids[i] != 0).sum()), value=0)
-#         for i in range(x_ids.size(0))
-#     ])
-    
-#     if verbose:
-#         print("\nAfter padding:")
-#         print(f"Padded x_ids: {x_ids[0].tolist()}")
-
-#     # Initial forward pass
-#     with torch.no_grad():
-#         prompt_emb = embed(x_ids)
-#         out_prompt, memory, hidden = model(prompt_emb, hidden=None, memory=None)
-#         if verbose:
-#             print(f"\nPrompt embedding shape: {prompt_emb.shape}")
-#             print(f"Initial output shape: {out_prompt.shape}")
-
-#     # Initialize generation lists
-#     generated_ids = []
-#     for b in range(B):
-#         row = x_ids[b].tolist()
-#         generated_ids.append(row[:])
-#         if verbose and b == 0:
-#             print(f"\nInitial generated_ids for batch 0: {row}")
-
-#     # Initialize tracking
-#     ended = [False]*B
-#     probs_batch = [[] for _ in range(B)]
-#     pred_seqs = [[] for _ in range(B)]
-#     all_logits = [[] for _ in range(B)]
-
-#     # Process targets
-#     target_seqs = []
-#     if y_ids is not None:
-#         if verbose:
-#             print("\nProcessing targets:")
-#         for b in range(B):
-#             tgt_seq = []
-#             for t in y_ids[b]:
-#                 tok = t.item()
-#                 if tok != pad_id:
-#                     tgt_seq.append(tok)
-#             target_seqs.append(tgt_seq)
-#             if verbose and b == 0:
-#                 print(f"Target sequence for batch 0: {tgt_seq}")
-#                 print(f"Decoded: {''.join([id_to_char[id] for id in tgt_seq])}")
-
-#     # Generation loop
-#     if verbose:
-#         print("\n=== Starting Generation ===")
-    
-#     for step_idx in range(max_seq_len):
-#         if all(ended):
-#             if verbose:
-#                 print("All sequences ended")
-#             break
-
-#         # Prepare input tokens
-#         tokens_to_feed = []
-#         for b in range(B):
-#             if ended[b]:
-#                 tokens_to_feed.append(pad_id)
-#             else:
-#                 last_token = generated_ids[b][-1]
-#                 tokens_to_feed.append(last_token)
-#                 if verbose and b == 0:
-#                     print(f"\nStep {step_idx}:")
-#                     print(f"Feeding token: {last_token} ({id_to_char.get(last_token, '?')})")
-
-#         # Forward pass
-#         tokens_tensor = torch.tensor(tokens_to_feed, dtype=torch.long, device=device)
-#         x_emb_step = embed(tokens_tensor.unsqueeze(1))
-
-#         with torch.no_grad():
-#             out_step, memory, hidden = model(x_emb_step, hidden=hidden, memory=memory)
-#             logits = out_step[:, -1, :]
-#             probs = F.softmax(logits, dim=-1)
-#             next_tokens = probs.argmax(dim=-1)
-            
-#             if verbose:
-#                 print(f"Generated token: {next_tokens[0].item()} ({id_to_char.get(next_tokens[0].item(), '?')})")
-#                 # Show top 5 probable tokens
-#                 top_k = 5
-#                 top_probs, top_indices = probs[0].topk(top_k)
-#                 print(f"Top {top_k} probable next tokens:")
-#                 for prob, idx in zip(top_probs, top_indices):
-#                     print(f"  {id_to_char.get(idx.item(), '?')}: {prob.item():.4f}")
-
-#         # Record predictions
-#         for b in range(B):
-#             if not ended[b]:
-#                 chosen_id = next_tokens[b].item()
-#                 pval = probs[b, chosen_id].item()
-#                 probs_batch[b].append(pval)
-#                 pred_seqs[b].append(chosen_id)
-#                 all_logits[b].append(logits[b])
-
-#         # Update sequences
-#         for b in range(B):
-#             if not ended[b]:
-#                 ntok = next_tokens[b].item()
-#                 generated_ids[b].append(ntok)
-#                 if ntok == eos_id:
-#                     ended[b] = True
-#                     if verbose and b == 0:
-#                         print("Sequence ended with EOS")
-
-#     # Generation results
-#     if verbose:
-#         print("\n=== Generation Complete ===")
-#         print("Batch 0 results:")
-#         print(f"Predictions: {pred_seqs[0]}")
-#         print(f"Decoded: {''.join([id_to_char.get(id, '?') for id in pred_seqs[0]])}")
-#         if y_ids is not None:
-#             print(f"Target: {target_seqs[0]}")
-#             print(f"Decoded: {''.join([id_to_char.get(id, '?') for id in target_seqs[0]])}")
-
-#     # Loss computation
-#     total_loss = 0.0
-#     total_correct = 0
-#     total_gentoks = 0
-
-#     if y_ids is not None and criterion is not None:
-#         if verbose:
-#             print("\n=== Computing Loss ===")
-#         for b in range(B):
-#             pred_len = len(pred_seqs[b])
-#             tgt_len = len(target_seqs[b])
-            
-#             if pred_len > 0 and tgt_len > 0:
-#                 min_len = min(pred_len, tgt_len)
-#                 batch_preds = pred_seqs[b][:min_len]
-#                 batch_targets = target_seqs[b][:min_len]
-#                 batch_logits = all_logits[b][:min_len]
-                
-#                 if len(batch_logits) > 0:
-#                     stacked_logits = torch.stack(batch_logits)
-#                     target_tensor = torch.tensor(batch_targets, device=device)
-                    
-#                     if verbose and b == 0:
-#                         print("\nToken-by-token comparison:")
-#                         for i, (p, t) in enumerate(zip(batch_preds, batch_targets)):
-#                             print(f"Position {i}: {id_to_char.get(p, '?')} vs {id_to_char.get(t, '?')}")
-                    
-#                     seq_loss = criterion(stacked_logits, target_tensor)
-#                     step_loss = seq_loss.item() * min_len
-#                     total_loss += step_loss
-                    
-#                     pred_tensor = torch.tensor(batch_preds, device=device)
-#                     step_correct = (pred_tensor == target_tensor).sum().item()
-#                     total_correct += step_correct
-#                     total_gentoks += min_len
-                    
-#                     if verbose and b == 0:
-#                         print(f"Sequence loss: {seq_loss.item()}")
-#                         print(f"Correct tokens: {step_correct}/{min_len}")
-
-#     # Calculate final metrics
-#     avg_loss = 0.0
-#     avg_accuracy = 0.0
-#     if total_gentoks > 0:
-#         avg_loss = total_loss / total_gentoks
-#         avg_accuracy = total_correct / total_gentoks
-
-#     # Build output strings
-#     generated_strs = []
-#     generated_strs_with_all_special_tokens = []
-
-#     for b in range(B):
-#         new_seq = generated_ids[b][Lx:]  
-#         skip_pad_chars = []
-#         all_chars = []
-
-#         for tid in new_seq:
-#             ch = id_to_char.get(tid, "?")
-#             all_chars.append(ch)
-#             if tid != pad_id:
-#                 skip_pad_chars.append(ch)
-
-#         generated_str = "".join(skip_pad_chars)
-#         full_str = "".join(all_chars)
-#         generated_strs.append(generated_str)
-#         generated_strs_with_all_special_tokens.append(full_str)
-
-#         if verbose and b == 0:
-#             print(f"\nGenerated string: '{generated_str}'")
-#             print(f"With special tokens: '{full_str}'")
-
-#     if verbose:
-#         print("\n=== Final Statistics ===")
-#         print(f"Total tokens evaluated: {total_gentoks}")
-#         print(f"Total correct: {total_correct}")
-#         print(f"Average loss: {avg_loss}")
-#         print(f"Average accuracy: {avg_accuracy}")
-#         print("=== Debug Complete ===\n")
-        
-#         # import pdb
-#         # pdb.set_trace()
-
-#     return (
-#         generated_strs,
-#         generated_strs_with_all_special_tokens,
-#         generated_ids,
-#         probs_batch,
-#         avg_loss,
-#         avg_accuracy
-#     )
-
-
+        def finished(self):
+            """Check if warmup is complete."""
+            print(f"finished warmup_lr!")
+            return self.current_step >= self.warmup_steps
 
 
 ##############################################################################
@@ -1819,7 +1712,7 @@ def generate_sequence_batched(model, x_ids, embed, char_to_id, id_to_char, max_s
 ##############################################################################
 def main():
     parser= argparse.ArgumentParser()
-    parser.add_argument("--arch", type=str, default="ntm", choices=["ntm","dnc","tra", "tdnc", "tntm"])
+    parser.add_argument("--arch", type=str, default="ntm", choices=["ntm","dnc","tra", "tdnc", "tntm", "simplelstm"])
     parser.add_argument("--task", type=str, default="copy",
                         choices=["copy","repeat_copy","associative_recall","add","sub","mul","div","fib","factorial"])
     parser.add_argument("--input_sample_length", type=int, default=2,
@@ -1883,17 +1776,23 @@ def main():
     vocab_size= len(vocab_list)
 
     # embed
-    embed= nn.Embedding(vocab_size, args.input_size, padding_idx=0).to(device)
-
+    # embed= nn.Embedding(vocab_size, args.input_size, padding_idx=0).to(device)
+    embed= nn.Embedding(vocab_size, args.input_size).to(device)
+    nn.init.orthogonal_(embed.weight)
+    
     # model
     if args.arch == "ntm":
         model = NTM(args.input_size, vocab_size, args.hidden_size, args.memory_size, args.head_size, args.num_heads, embed).to(device)
     elif args.arch == "dnc":
         model = DNC(args.input_size, vocab_size, args.hidden_size, args.memory_size, args.head_size, args.num_heads, embed).to(device)
     elif args.arch == "tdnc":
-        model = TransformerMemoryDNC(args.input_size, vocab_size, args.hidden_size, embed).to(device)
+        # TODO NOT TESTED YET
+        model = TransformerMemoryDNC(args.input_size, vocab_size, args.hidden_size, args.memory_size, args.head_size, args.num_heads, embed).to(device)
     elif args.arch == "tntm":
-        model = TransformerMemoryNTM(args.input_size, vocab_size, args.hidden_size, embed).to(device)    
+        # TODO NOT TESTED YET
+        model = TransformerMemoryNTM(args.input_size, vocab_size, args.hidden_size, args.memory_size, args.head_size, args.num_heads, embed).to(device)    
+    elif args.arch == "simplelstm":
+        model = SimpleLSTM(args.input_size, vocab_size, args.hidden_size, embed).to(device)  
     else:
         model = TransformerNTM(args.input_size, vocab_size, args.hidden_size, embed).to(device)
 
@@ -1901,12 +1800,12 @@ def main():
     
     # build optimizer
     params= list(model.parameters())+ list(embed.parameters())
-    if args.optimizer=="sgd":
-        optimizer= optim.Adam(params, lr=args.learning_rate, weight_decay=args.weight_decay)
+    if args.optimizer=="sgd": 
+        optimizer= optim.Adam(params, lr=args.learning_rate, weight_decay=args.weight_decay,  betas=(0.9, 0.999), eps=1e-08, amsgrad=False )
     else:
         # mezo uses the same optimizer for momentum, we'll do param.grad => momentum => param.data
         # optimizer= optim.SGD(params, lr=args.learning_rate, momentum=0.9, weight_decay=args.weight_decay)
-        optimizer= optim.Adam(params, lr=args.learning_rate, weight_decay=args.weight_decay)
+        optimizer= optim.Adam(params, lr=args.learning_rate, weight_decay=args.weight_decay,  betas=(0.9, 0.999), eps=1e-08, amsgrad=False )
 
     scheduler= None
     if args.cosine_lr:
@@ -2004,9 +1903,10 @@ def main():
         else:
             model.train()
             optimizer.zero_grad()
-            out, _, _= model(x_emb)
-            B,L,V= out.size()
-            loss= criterion(out.view(B*L, V), y_ids.view(B*L))
+            # out, _, _= model(x_emb)
+            # B,L,V= out.size()
+            # loss= criterion(out.view(B*L, V), y_ids.view(B*L))
+            loss = teacher_forcing_loss_emb(model, x_emb, y_ids, criterion)
             loss.backward()
             loss_val= loss.item()
         return loss_val
@@ -2015,6 +1915,14 @@ def main():
     if args.mezo_flavor == "mezo_rolling": 
         mezo_state = init_rolling_mezo(model, args.epsilon)
 
+    # Warmup scheduler
+    warmup_scheduler = WarmupScheduler(
+        optimizer=optimizer,
+        warmup_steps= args.warmup_steps,
+        base_lr=1e-9,
+        final_lr=args.learning_rate
+    )
+        
     ####################################
     # TRAIN LOOP
     ####################################
@@ -2043,14 +1951,17 @@ def main():
             cur_y= y_strs[start_idx:end_idx]
             
             # take all the excess padding out just in case
-            x_ids= str_to_tensor(cur_x, char_to_id, args.input_sample_length+1).to(device)
-            x_ids_trimmed = [x[x != 0] for x in x_ids]
-            x_ids = pad_sequence(x_ids_trimmed, batch_first=True, padding_value=0)
+            # x_ids= str_to_tensor(cur_x, char_to_id, args.input_sample_length+1).to(device)
+            # x_ids_trimmed = [x[x != 0] for x in x_ids]
+            # x_ids = pad_sequence(x_ids_trimmed, batch_first=True, padding_value=0)
 
-            y_ids= str_to_tensor(cur_y, char_to_id, args.input_sample_length+1).to(device)
-            y_ids_trimmed = [y[y != 0] for y in y_ids]
-            y_ids = pad_sequence(y_ids_trimmed, batch_first=True, padding_value=0)
-
+            # y_ids= str_to_tensor(cur_y, char_to_id, args.input_sample_length+1).to(device)
+            # y_ids_trimmed = [y[y != 0] for y in y_ids]
+            # y_ids = pad_sequence(y_ids_trimmed, batch_first=True, padding_value=0)
+            
+            
+            x_ids= str_to_tensor(cur_x, char_to_id).to(device)
+            y_ids= str_to_tensor(cur_y, char_to_id).to(device)
             x_emb= embed(x_ids)
             
                 
@@ -2092,61 +2003,40 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         
         # finally we step! 
+        
+        if False:
+            # check to see if any of the grads are 0 that means training is not happening.
+            params = list(model.parameters()) + list(embed.parameters())
+
+            for i, param in enumerate(params):
+                if param.grad is not None:
+                    grad_abs_sum = param.grad.abs().sum().item()
+                    if grad_abs_sum == 0:
+                        print(f"Param {i}: Gradient sum is 0. Name: {param.shape}")
+                else:
+                    print(f"Param {i}: No gradient calculated (None). Name: {param.shape}")
+            pdb.set_trace()
         optimizer.step()
 
         train_loss_mezo = micro_loss_sum / args.macro_batch_size
 
         # warmup: TODO, this is NOT implemented correclty but damn does it work lol
-        if scheduler is not None and iteration> args.warmup_steps:
-            scheduler.step()
-
-        # Something like this:
-        # class WarmupScheduler:
-        #     def __init__(self, optimizer, warmup_steps, base_lr, final_lr):
-        #         """
-        #         Args:
-        #             optimizer (torch.optim.Optimizer): The optimizer whose LR needs to be warmed up.
-        #             warmup_steps (int): Number of warmup steps.
-        #             base_lr (float): Initial learning rate (e.g., 0.0).
-        #             final_lr (float): Target learning rate after warmup.
-        #         """
-        #         self.optimizer = optimizer
-        #         self.warmup_steps = warmup_steps
-        #         self.base_lr = base_lr
-        #         self.final_lr = final_lr
-        #         self.current_step = 0
-        
-        #     def step(self):
-        #         """Perform one step of warmup."""
-        #         self.current_step += 1
-        #         if self.current_step <= self.warmup_steps:
-        #             # Linearly interpolate between base_lr and final_lr
-        #             warmup_lr = self.base_lr + (self.final_lr - self.base_lr) * (self.current_step / self.warmup_steps)
-        #             for param_group in self.optimizer.param_groups:
-        #                 param_group['lr'] = warmup_lr
-        
-        #     def finished(self):
-        #         """Check if warmup is complete."""
-        #         return self.current_step >= self.warmup_steps
-        # # Warmup scheduler
-        # warmup_scheduler = WarmupScheduler(
-        #     optimizer=optimizer,
-        #     warmup_steps=args.warmup_steps,
-        #     base_lr=0.0,
-        #     final_lr=args.learning_rate
-        # )
+        # if scheduler is not None and iteration> args.warmup_steps:
+        #     scheduler.step()
         
         # Warmup step
-        # if iteration <= args.warmup_steps:
-        #     warmup_scheduler.step()
-        # elif scheduler is not None:
-        #     scheduler.step()
+        if iteration <= args.warmup_steps:
+            warmup_scheduler.step()
+        elif scheduler is not None:
+            scheduler.step()
     
         if iteration % args.log_interval == 0:
             # compute train accuracy on last micro-batch
             with torch.no_grad():
-                x_ids = str_to_tensor(cur_x, char_to_id, args.max_seq_len).to(device)  # [B, Lx]
-                y_ids = str_to_tensor(cur_y, char_to_id, args.max_seq_len).to(device)  # [B, Ly]
+                # x_ids = str_to_tensor(cur_x, char_to_id, args.max_seq_len).to(device)  # [B, Lx]
+                # y_ids = str_to_tensor(cur_y, char_to_id, args.max_seq_len).to(device)  # [B, Ly]
+                x_ids = str_to_tensor(cur_x, char_to_id).to(device)  # [B, Lx]
+                y_ids = str_to_tensor(cur_y, char_to_id).to(device)  # [B, Ly]
             
                 generated_strs, generated_strs_with_padding, gen_ids_batch, probs_batch, train_loss, train_acc, train_acc_sample  = generate_sequence_batched(
                     model=model,
@@ -2245,8 +2135,10 @@ def main():
                     raise ValueError(f"Unknown task: {args.task} for val")
         
                 # Convert to tensors
-                vx_ids= str_to_tensor(vx, char_to_id, args.max_seq_len).to(device)
-                vy_ids= str_to_tensor(vy, char_to_id, args.max_seq_len).to(device)
+                # vx_ids= str_to_tensor(vx, char_to_id, args.max_seq_len).to(device)
+                # vy_ids= str_to_tensor(vy, char_to_id, args.max_seq_len).to(device)
+                vx_ids= str_to_tensor(vx, char_to_id).to(device)
+                vy_ids= str_to_tensor(vy, char_to_id).to(device)
         
                 # --------------------------------------------------------------------
                 # 1) Optionally, do a teacher-forced pass to measure "val_loss"
