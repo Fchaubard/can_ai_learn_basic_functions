@@ -16,6 +16,9 @@ NTM/DNC/Transformer code with ASCII tasks, plus:
 
 import os
 os.environ["WANDB_API_KEY"] = ""
+
+neptune_api_token = ""
+
 import sys
 import math
 import random
@@ -25,6 +28,7 @@ import pynvml
 import string
 import wandb
 import time
+import neptune
 
 import torch
 import torch.nn as nn
@@ -47,6 +51,112 @@ def pick_gpu_with_most_free_mem() -> int:
             best_index = i
     pynvml.nvmlShutdown()
     return best_index
+
+
+
+##############################################################################
+# VRAM calc
+##############################################################################
+import torch
+from torch.optim import Adam
+
+def calculate_vram_usage(model, train_micro_batch, x_emb, y_ids, optimizer, criterion, optimizer_type = "sgd",
+                                                               mezo_flavor = None):
+    """
+    Calculate the max VRAM usage of a model during training, with detailed breakdown for different optimizers.
+
+    Args:
+        model (torch.nn.Module): The model to analyze.
+        train_micro_batch (function): The training function (e.g., train_micro_batch).
+        x_emb (torch.Tensor): Input embeddings for the micro-batch.
+        y_ids (torch.Tensor): Target IDs for the micro-batch.
+        optimizer being used
+        optimizer_type SGD or Mezo
+        mezo_flavor single or layerwise
+
+    Returns:
+        dict: A dictionary with detailed VRAM usage statistics.
+    """
+    assert torch.cuda.is_available(), "CUDA is required for this calculation."
+
+    # Detect the current device of the model
+    device = next(model.parameters()).device
+
+    # Save the model's current device and temporarily move to GPU if not already there
+    original_device = device
+    if device.type != "cuda":
+        model = model.to("cuda")
+        x_emb = x_emb.to("cuda")
+        y_ids = y_ids.to("cuda")
+        device = torch.device("cuda")
+
+    # Initialize CUDA memory tracking
+    torch.cuda.reset_peak_memory_stats(device)
+    baseline_vram = torch.cuda.memory_allocated(device)  # VRAM used by other processes
+
+    # Measure VRAM for forward pass
+    torch.cuda.reset_peak_memory_stats(device)
+    loss_val = None
+    
+    if optimizer_type == "mezo":
+        if mezo_flavor == "mezo_layerwise":
+            loss_val = mezo_char_layerwise(model, x_emb, y_ids, criterion, epsilon=0.001)
+        elif mezo_flavor == "mezo_rolling":
+            loss_val = mezo_char_single_rolling(model, x_emb, y_ids, criterion, mezo_state)
+        elif mezo_flavor == "mezo_single":
+            loss_val = mezo_char_single(model, x_emb, y_ids, criterion, epsilon=0.001)
+        else:
+            raise Exception("Invalid MeZO flavor")
+    else:
+        # Traditional optimizer training
+        optimizer.zero_grad()
+        loss = teacher_forcing_loss_emb(model, x_emb, y_ids, criterion)
+        forward_vram = torch.cuda.max_memory_allocated(device) - baseline_vram
+
+        # Measure VRAM for backward pass
+        torch.cuda.reset_peak_memory_stats(device)
+        loss.backward()
+        backward_vram = torch.cuda.max_memory_allocated(device) - baseline_vram
+        loss_val = loss.item()
+
+    # Save the original learning rates
+    original_lrs = [group['lr'] for group in optimizer.param_groups]
+
+    # Temporarily set learning rates to 0
+    for group in optimizer.param_groups:
+        group['lr'] = 0
+
+    torch.cuda.reset_peak_memory_stats(device)
+    optimizer.step()  # Perform the step with zero learning rate (no actual update)
+    optimizer.zero_grad()
+    optimizer_vram = torch.cuda.max_memory_allocated(device) - baseline_vram
+
+    # Restore the original learning rates
+    for group, original_lr in zip(optimizer.param_groups, original_lrs):
+        group['lr'] = original_lr
+    
+    # Record peak memory usage across all phases
+    peak_vram = torch.cuda.max_memory_allocated(device) - baseline_vram
+
+    # Move model back to its original device
+    if original_device.type != "cuda":
+        model = model.to(original_device)
+
+    # Clean up
+    torch.cuda.empty_cache()
+
+    return {
+        "loss_value": loss_val,
+        "forward_vram_MB": forward_vram / (1024 ** 2) if optimizer_type != "mezo" else None,
+        "backward_vram_MB": backward_vram / (1024 ** 2) if optimizer_type != "mezo" else None,
+        "optimizer_vram_MB": optimizer_vram / (1024 ** 2),
+        "total_peak_vram_MB": peak_vram / (1024 ** 2),
+    }
+
+
+
+
+
 
 ##############################################################################
 # ASCII Vocab + Tokenizer (with <bos> and <eos>)
@@ -174,6 +284,62 @@ def shift_by_one_pairs(x_str, y_str):
 ##############################################################################
 # Task Generators
 ##############################################################################
+def generate_reverse_task_str(num_samples, input_sample_length, train=True):
+    """
+    Generates data for the reverse task.
+    
+    Args:
+        num_samples (int): Number of samples to generate.
+        input_sample_length (int): Length of each input sample.
+        train (bool): Whether the samples are for training or testing.
+                      If not train, input_sample_length is scaled up by a factor of 5.
+    
+    Returns:
+        tuple: (input strings, reversed output strings)
+    """
+    if not train:
+        input_sample_length *= 5
+
+    letters = string.ascii_uppercase
+    in_list, out_list = [], []
+
+    for _ in range(num_samples):
+        data_str = "".join(random.choice(letters) for _ in range(input_sample_length))
+        xinp = data_str
+        xtgt = data_str[::-1]  # Reverse the string
+        in_list.append(xinp)
+        out_list.append(xtgt)
+
+    return in_list, out_list
+
+def generate_sort_task_str(num_samples, input_sample_length, train=True):
+    """
+    Generates data for the sort task.
+    
+    Args:
+        num_samples (int): Number of samples to generate.
+        input_sample_length (int): Length of each input sample.
+        train (bool): Whether the samples are for training or testing.
+                      If not train, input_sample_length is scaled up by a factor of 5.
+    
+    Returns:
+        tuple: (input strings, sorted output strings)
+    """
+    if not train:
+        input_sample_length *= 5
+
+    letters = string.ascii_uppercase
+    in_list, out_list = [], []
+
+    for _ in range(num_samples):
+        data_str = "".join(random.choice(letters) for _ in range(input_sample_length))
+        xinp = data_str
+        xtgt = "".join(sorted(data_str))  # Sort the string lexicographically
+        in_list.append(xinp)
+        out_list.append(xtgt)
+
+    return in_list, out_list
+
 def generate_copy_task_str(num_samples, input_sample_length, train=True):
     # if not train => input_sample_length *=5 (but we may override with curriculum too)
     import random
@@ -375,7 +541,7 @@ class SimpleLSTM(nn.Module):
         self.controller_norm = nn.LayerNorm(output_size)
 
         # Controller with input normalization
-        self.controller = nn.LSTM(controller_input_size, hidden_size, proj_size=output_size, batch_first=True)
+        self.controller = nn.LSTM(controller_input_size, hidden_size, proj_size=output_size, num_layers=1, batch_first=True)
 
     def forward(self, x_emb, hidden=None, memory=None, skip_layer_norm=True):
         B, L, E = x_emb.size()
@@ -835,6 +1001,194 @@ class TransformerMemoryDNC(nn.Module):
 
 
 
+
+
+############
+# MAMBA
+#############
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MambaMultiheadSelfAttention(nn.Module):
+    """
+    Basic multi-head self-attention without relying on PyTorch's nn.MultiheadAttention.
+    """
+    def __init__(self, d_model, nhead=4, dropout=0.1):
+        """
+        Args:
+            d_model (int): Dimensionality of tokens/features (total).
+            nhead (int): Number of attention heads.
+            dropout (float): Dropout rate for attention.
+        """
+        super().__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead  # must divide evenly or handle leftover
+        assert d_model % nhead == 0, f"d_model={d_model} must be divisible by nhead={nhead}."
+
+        # Q, K, V projections
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+
+        # Final out projection
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, mask=None):
+        """
+        x: [B, L, d_model]
+        mask: optional
+        Returns: attn_out [B, L, d_model]
+        """
+        B, L, _ = x.shape
+
+        # 1) Q,K,V
+        Q = self.W_q(x)
+        K = self.W_k(x)
+        V = self.W_v(x)
+
+        # 2) Reshape => [B, nhead, L, head_dim]
+        Q = Q.view(B, L, self.nhead, self.head_dim).transpose(1, 2)
+        K = K.view(B, L, self.nhead, self.head_dim).transpose(1, 2)
+        V = V.view(B, L, self.nhead, self.head_dim).transpose(1, 2)
+
+        # 3) Scaled Dot-Product
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
+
+        if mask is not None:
+            # e.g. scores = scores.masked_fill(mask == 0, float('-inf'))
+            pass
+
+        probs = F.softmax(scores, dim=-1)
+        probs = self.dropout(probs)
+
+        attn_out = torch.matmul(probs, V)   # => [B, nhead, L, head_dim]
+
+        # 4) Merge heads => [B, L, d_model]
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+
+        # 5) Final linear
+        attn_out = self.out_proj(attn_out)
+        return attn_out
+
+
+class MambaEncoderBlock(nn.Module):
+    """
+    One Transformer encoder block: Self-Attn -> FFN, with residual + layernorm.
+    """
+    def __init__(self, d_model=128, nhead=4, dim_feedforward=256, dropout=0.1):
+        super().__init__()
+        self.self_attn = MambaMultiheadSelfAttention(d_model, nhead, dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+
+        # Feedforward
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+        )
+        self.dropout2 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, x, mask=None):
+        # 1) Self-Attn
+        attn_out = self.self_attn(x, mask=mask)
+        x = x + self.dropout1(attn_out)
+        x = self.norm1(x)
+
+        # 2) FFN
+        ffn_out = self.ffn(x)
+        x = x + self.dropout2(ffn_out)
+        x = self.norm2(x)
+
+        return x
+
+
+class MambaEncoder(nn.Module):
+    """
+    A stack of MambaEncoderBlocks
+    """
+    def __init__(self, d_model=128, nhead=4, num_layers=2, dim_feedforward=256, dropout=0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            MambaEncoderBlock(d_model, nhead, dim_feedforward, dropout)
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, x, mask=None):
+        for layer in self.layers:
+            x = layer(x, mask=mask)
+        return x
+
+
+class Mamba(nn.Module):
+    """
+    A minimal Transformer encoder that uses Mamba-based multihead self-attn,
+    but automatically adjusts head_size if there's a mismatch.
+    """
+    def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed):
+        """
+        Args:
+            input_size  (int): model dimension (d_model).
+            output_size (int): final projection dimension (e.g. vocab size).
+            hidden_size (int): feedforward dimension in each encoder block.
+            memory_size (int): not used in the forward pass, included for interface only.
+            head_size   (int): user-desired dimension per head.
+            num_heads   (int): number of attention heads.
+            embed       (nn.Embedding): embedding layer.
+        """
+        super().__init__()
+        self.embed = embed
+        self.input_size = input_size
+        self.output_size = output_size
+        self.hidden_size = hidden_size
+        self.memory_size = memory_size
+        self.num_heads = num_heads
+
+        # If user gave a mismatch, override head_size so that head_size * num_heads == input_size
+        if head_size * num_heads != input_size:
+            # automatically fix if possible
+            new_head_size = input_size // num_heads
+            if input_size % num_heads != 0:
+                # fallback approach: pick num_heads=1 if we can't do an even split
+                # or raise an error, your choice:
+                raise ValueError(f"Cannot evenly distribute input_size={input_size} among num_heads={num_heads}.\n"
+                                 f"Either adjust input_size or num_heads so they match, or set head_size accordingly.")
+            print(f"[Mamba] Overriding head_size from {head_size} -> {new_head_size} so that {new_head_size} * {num_heads} = {input_size}")
+            head_size = new_head_size
+
+        # Build the encoder
+        self.encoder = MambaEncoder(
+            d_model=input_size,
+            nhead=num_heads,
+            num_layers=2,                 # or parameterize further
+            dim_feedforward=hidden_size,
+            dropout=0.1
+        )
+
+        self.fc_out = nn.Linear(input_size, output_size)
+
+    def forward(self, x_emb, hidden=None, memory=None):
+        """
+        x_emb: [B, L, input_size]
+        hidden, memory: placeholders for interface parity
+        Returns: out: [B, L, output_size], None, (None, None)
+        """
+        enc_out = self.encoder(x_emb)
+        out = self.fc_out(enc_out)
+        return out, None, (None, None)
+
+
+
+
+############
+# DNC
+##############
 class DNC(nn.Module):
     def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed):
         super(DNC, self).__init__()
@@ -984,9 +1338,9 @@ class TransformerController(nn.Module):
         return self.encoder(x)
 
 
-class TransformerNTM(nn.Module):
+class Transformer(nn.Module):
     def __init__(self, input_size, output_size, hidden_size, embed):
-        super(TransformerNTM, self).__init__()
+        super(Transformer, self).__init__()
         self.embed = embed  # Assign the embedding layer
         self.transformer = TransformerController(
             d_model=input_size, nhead=4, num_layers=2, dim_feedforward=4 * input_size
@@ -1017,7 +1371,6 @@ def group_params_by_layer(named_params):
         layer_dict[layer_name].append((name, p))
     return layer_dict
 
-from torch.nn.utils.rnn import pad_sequence
 import pdb
 def teacher_forcing_loss_emb(model, x_emb, y_ids_unpadded, criterion, teacher_force=True):
     """
@@ -1707,24 +2060,76 @@ class WarmupScheduler:
             return self.current_step >= self.warmup_steps
 
 
+
+def generate_task_data(num_samples, task, context_len, maxn, train=True):
+    if task=="copy":
+        return generate_copy_task_str(num_samples, context_len, train=train)
+    elif task=="repeat_copy":
+        return generate_repeat_copy_task_str(num_samples, context_len, train=train)
+    elif task=="associative_recall":
+        return generate_associative_recall_task_str(num_samples, item_len=3, num_items=context_len, train=train)
+    elif task in ["add","sub","mul","div"]:
+        return generate_arithmetic_task_str(num_samples, context_len, task_type=task,
+                                            max_num=maxn, train=train)
+    elif task=="fib":
+        return generate_fibonacci_task_str(num_samples, context_len, max_n=maxn, train=train)
+    elif task=="reverse":
+        return generate_reverse_task_str(num_samples, context_len, train=train)
+    elif task=="sort":
+        return generate_sort_task_str(num_samples, context_len, train=train)
+    elif task=="factorial":
+        return generate_factorial_task_str(num_samples, context_len, max_n=maxn, train=train)
+    else:
+        raise ValueError(f"Unknown task {task}")
+
+
+
+# ++++++++ CURRICULUM LOGIC ++++++++
+# We'll do a naive approach:
+# For "copy" => start with input_sample_length=2, each time we see train_acc>0.95 for a consecutive # of times => +1
+# For "add" => start with max_num=5, each time train_acc>0.95 => max_num+=5
+# We'll track consecutive_succ
+# to start the curriculum
+# if copy => start with input_sample_length=2 (we ignore user param if they want, or we do min(2, user param) for train)
+# if add => start with max_num=5 if user param is bigger
+def maybe_update_curriculum(train_acc, current_context, current_maxnum, consecutive_succ):
+    # nonlocal consecutive_succ
+    threshold= 0.95
+    if train_acc> threshold:
+        consecutive_succ+=1
+    else:
+        consecutive_succ=0
+    # if we pass threshold 5 times in a row => increment difficulty
+    if consecutive_succ>=4:
+        consecutive_succ=0
+        
+        new_ct= current_context+1
+        print(f"[CURRICULUM] copy: increasing input_sample_length => {new_ct}")
+    
+        new_mn= current_maxnum+5
+        print(f"[CURRICULUM]: increasing max_num => {new_mn}")
+        return new_ct, new_mn, 0
+    return current_context, current_maxnum, consecutive_succ
+
+
 ##############################################################################
 # Main
 ##############################################################################
 def main():
     parser= argparse.ArgumentParser()
-    parser.add_argument("--arch", type=str, default="ntm", choices=["ntm","dnc","tra", "tdnc", "tntm", "simplelstm"])
+    parser.add_argument("--arch", type=str, default="ntm", choices=["ntm","dnc","tra", "tdnc", "tntm", "simplelstm", "mamba"])
     parser.add_argument("--task", type=str, default="copy",
                         choices=["copy","repeat_copy","associative_recall","add","sub","mul","div","fib","factorial"])
-    parser.add_argument("--input_sample_length", type=int, default=2,
+    parser.add_argument("--input_sample_length", type=int, default=20,
                         help="Base length for generating tasks. We'll do a simple curriculum on some tasks.")
     parser.add_argument("--max_seq_len", type=int, default=50,
-                        help="We pad/truncate all inputs/targets to this length.")
+                        help="For generation.")
 
     parser.add_argument("--micro_batch_size", type=int, default=1)
     parser.add_argument("--macro_batch_size", type=int, default=1)
     parser.add_argument("--max_iters", type=int, default=10000)
-    parser.add_argument("--max_num", type=int, default=100,
-                        help="This is the max number in the domain to use in training for arithmetic tasks. Min in the domain is 0. We'll do a simple curriculum for arithmetic if task in all. i.e. [add,sub,mul,div].")
+    parser.add_argument("--max_num", type=int, default=110,
+                        help="This is the max number in the domain to use in training for arithmetic tasks. Min in the train domain is 0. We'll do a simple curriculum for arithmetic if task in all. i.e. [add,sub,mul,div].")
 
     parser.add_argument("--input_size", type=int, default=32)
     parser.add_argument("--hidden_size", type=int, default=128)
@@ -1735,6 +2140,7 @@ def main():
     parser.add_argument("--optimizer", type=str, default="sgd", choices=["sgd","mezo"])
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
+    parser.add_argument("--tie_epsilon_to_lr_ratio", type=float, default=-1)
     parser.add_argument("--epsilon", type=float, default=1e-2, help="MeZO eps.")
     parser.add_argument("--mezo", action="store_true")
 
@@ -1745,6 +2151,7 @@ def main():
 
     parser.add_argument("--grad_norm", action="store_true")
     parser.add_argument("--grad_clip", type=float, default=0.0, help="If >0, grad norm clipped.")
+
     
     parser.add_argument("--pad_bias", type=float, default=0.0, help="Initial logit bias for <PAD> in final layer. NOT IMPLEMENTED YET")
     parser.add_argument("--log_interval", type=int, default=300)
@@ -1758,8 +2165,14 @@ def main():
 
     # wandb
     if args.wandb_proj is not None:
-        wandb.init(project=args.wandb_proj, name=args.wandb_run_name)
-        wandb.config.update(args)
+        run = neptune.init_run(
+                            project="fchaubard/mezornn",
+                            api_token=neptune_api_token,
+                            name=args.wandb_run_name
+                        )  # your credentials
+        run["parameters"] = args
+        # wandb.init(project=args.wandb_proj, name=args.wandb_run_name)
+        # wandb.config.update(args)
 
     
     # pick device
@@ -1788,15 +2201,50 @@ def main():
     elif args.arch == "tdnc":
         # TODO NOT TESTED YET
         model = TransformerMemoryDNC(args.input_size, vocab_size, args.hidden_size, args.memory_size, args.head_size, args.num_heads, embed).to(device)
+    elif args.arch == "mamba":
+        # TODO NOT TESTED YET
+        model = Mamba(args.input_size, vocab_size, args.hidden_size, args.memory_size, args.head_size, args.num_heads, embed).to(device)
     elif args.arch == "tntm":
         # TODO NOT TESTED YET
         model = TransformerMemoryNTM(args.input_size, vocab_size, args.hidden_size, args.memory_size, args.head_size, args.num_heads, embed).to(device)    
     elif args.arch == "simplelstm":
         model = SimpleLSTM(args.input_size, vocab_size, args.hidden_size, embed).to(device)  
     else:
-        model = TransformerNTM(args.input_size, vocab_size, args.hidden_size, embed).to(device)
+        model = Transformer(args.input_size, vocab_size, args.hidden_size, embed).to(device)
 
 
+    def train_micro_batch(x_emb, y_ids, mezo_state=None):
+        """
+        x_emb => [micro_batch_size, max_seq_len, embed_dim]
+        y_ids => [micro_batch_size, max_seq_len]
+        returns => float loss
+        """
+        if args.optimizer == "mezo":
+            
+            if args.tie_epsilon_to_lr_ratio>-1:
+                # if we have this bigger than default we will override epsilon by the weight tying amount. My suspicion is that its a ratio that matters. Like 1, 2 or 10.  
+                args.epsilon = args.tie_epsilon_to_lr_ratio * optimizer.param_groups[0]['lr']
+            if args.mezo_flavor == "mezo_layerwise":
+                loss_val= mezo_char_layerwise(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
+            elif args.mezo_flavor == "mezo_rolling": 
+                loss_val = mezo_char_single_rolling(model, x_emb, y_ids, criterion, mezo_state)
+    
+            elif args.mezo_flavor == "mezo_single":
+                loss_val= mezo_char_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
+            else:
+                raise Exception("No flavor")
+            
+    
+        else:
+            model.train()
+            optimizer.zero_grad()
+            # out, _, _= model(x_emb)
+            # B,L,V= out.size()
+            # loss= criterion(out.view(B*L, V), y_ids.view(B*L))
+            loss = teacher_forcing_loss_emb(model, x_emb, y_ids, criterion)
+            loss.backward()
+            loss_val= loss.item()
+        return loss_val
     
     # build optimizer
     params= list(model.parameters())+ list(embed.parameters())
@@ -1809,110 +2257,38 @@ def main():
 
     scheduler= None
     if args.cosine_lr:
-        scheduler= optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_iters, eta_min=1e-6)
-
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_iters, eta_min=1e-6)
+    else: 
+        # default is LR plateau
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer,
+                    mode='min',  # Minimize the validation loss
+                    factor=0.5,  # Reduce the LR by a factor of 0.5
+                    patience=100,  # Number of validation epochs with no improvement
+                    verbose=True,  # Log the change in LR
+                    min_lr=1e-8   # Minimum learning rate
+                )
+        
     
     criterion= nn.CrossEntropyLoss(ignore_index=0)
     global_step=0
 
     # track time
     train_start_time= time.time()
-
-    # ++++++++ CURRICULUM LOGIC ++++++++
-    # We'll do a naive approach:
-    # For "copy" => start with input_sample_length=2, each time we see train_acc>0.95 for a consecutive # of times => +1
-    # For "add" => start with max_num=5, each time train_acc>0.95 => max_num+=5
-    # We'll track consecutive_succ
     consecutive_succ=0
-    def maybe_update_curriculum(train_acc, current_context, current_maxnum, task):
-        nonlocal consecutive_succ
-        threshold= 0.95
-        if train_acc> threshold:
-            consecutive_succ+=1
-        else:
-            consecutive_succ=0
-        # if we pass threshold 5 times in a row => increment difficulty
-        if consecutive_succ>=5:
-            consecutive_succ=0
-            # update
-            if task=="copy":
-                new_ct= current_context+1
-                print(f"[CURRICULUM] copy: increasing input_sample_length => {new_ct}")
-                return new_ct, current_maxnum
-            elif task in ["add","sub","mul","div"]:
-                new_mn= current_maxnum+5
-                print(f"[CURRICULUM] {task}: increasing max_num => {new_mn}")
-                return current_context, new_mn
-        return current_context, current_maxnum
+    
+   
+    
+    current_context_len = 1 
+    current_max_num= 15 # used only in arithmetic functions
 
-    # to start the curriculum
-    # if copy => start with input_sample_length=2 (we ignore user param if they want, or we do min(2, user param) for train)
-    # if add => start with max_num=5 if user param is bigger
-    # if args.task=="copy":
-    #     current_context_len= min(args.input_sample_length,2)
-    # else:
-    current_context_len= args.input_sample_length
-
-    # if args.task in ["add","sub","mul","div"]:
-    #     current_max_num= min(args.max_num, 5)
-    # else:
-    current_max_num= args.max_num
-
-    def generate_task_data(num_samples, task, context_len, maxn, train=True):
-        # we do a simplified approach => if not train => we multiply context_len *5
-        # but if we want to keep it dynamic, let's do:
-        if not train:
-            # for copy => use 5x
-            # for add => use bigger range
-            pass
-        # now do the actual generation
-        if task=="copy":
-            return generate_copy_task_str(num_samples, context_len, train=train)
-        elif task=="repeat_copy":
-            return generate_repeat_copy_task_str(num_samples, context_len, train=train)
-        elif task=="associative_recall":
-            return generate_associative_recall_task_str(num_samples, item_len=3, num_items=context_len, train=train)
-        elif task in ["add","sub","mul","div"]:
-            return generate_arithmetic_task_str(num_samples, context_len, task_type=task,
-                                                max_num=maxn, train=train)
-        elif task=="fib":
-            return generate_fibonacci_task_str(num_samples, context_len, max_n=maxn, train=train)
-        elif task=="factorial":
-            return generate_factorial_task_str(num_samples, context_len, max_n=maxn, train=train)
-        else:
-            raise ValueError(f"Unknown task {task}")
-
-    def train_micro_batch(x_emb, y_ids, mezo_state=None):
-        """
-        x_emb => [micro_batch_size, max_seq_len, embed_dim]
-        y_ids => [micro_batch_size, max_seq_len]
-        returns => float loss
-        """
-        if args.optimizer == "mezo":
-            if args.mezo_flavor == "mezo_layerwise":
-                loss_val= mezo_char_layerwise(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
-            elif args.mezo_flavor == "mezo_rolling": 
-                loss_val = mezo_char_single_rolling(model, x_emb, y_ids, criterion, mezo_state)
-
-            elif args.mezo_flavor == "mezo_single":
-                loss_val= mezo_char_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
-            else:
-                raise Exception("No flavor")
-            
-
-        else:
-            model.train()
-            optimizer.zero_grad()
-            # out, _, _= model(x_emb)
-            # B,L,V= out.size()
-            # loss= criterion(out.view(B*L, V), y_ids.view(B*L))
-            loss = teacher_forcing_loss_emb(model, x_emb, y_ids, criterion)
-            loss.backward()
-            loss_val= loss.item()
-        return loss_val
+    # lets make sure the user knows how the curriculum works
+    assert current_max_num <= args.max_num, "Must have max_num > 15"
+    assert current_context_len <= args.input_sample_length, "Must have input_sample_length > 1"
 
     mezo_state = None
     if args.mezo_flavor == "mezo_rolling": 
+        # TODO, not tested
         mezo_state = init_rolling_mezo(model, args.epsilon)
 
     # Warmup scheduler
@@ -1931,11 +2307,14 @@ def main():
     while True:
         iteration+=1
         iter_start_time= time.time()
+        
 
         # generate data
         # we do a curriculum for train
+        this_sample_context_length = 1+np.random.randint(0,max(1,current_context_len)) # always at least generate 1.
+        this_sample_max_num = 1+np.random.randint(0,max(1,current_max_num)) # always at least generate 1.
         x_strs, y_strs= generate_task_data(total_samples_per_iter, args.task,
-                                           current_context_len, current_max_num,
+                                           this_sample_context_length, this_sample_max_num,
                                            train=True)
 
         model.zero_grad()
@@ -2003,7 +2382,6 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         
         # finally we step! 
-        
         if False:
             # check to see if any of the grads are 0 that means training is not happening.
             params = list(model.parameters()) + list(embed.parameters())
@@ -2020,70 +2398,16 @@ def main():
 
         train_loss_mezo = micro_loss_sum / args.macro_batch_size
 
-        # warmup: TODO, this is NOT implemented correclty but damn does it work lol
-        # if scheduler is not None and iteration> args.warmup_steps:
-        #     scheduler.step()
-        
-        # Warmup step
+        # Warmup step, TODO, not sure how much this adds TBH.. should ablate
         if iteration <= args.warmup_steps:
             warmup_scheduler.step()
         elif scheduler is not None:
-            scheduler.step()
+            if args.cosine_lr:
+                scheduler.step()
+            else:
+                scheduler.step(train_loss)
+                
     
-        if iteration % args.log_interval == 0:
-            # compute train accuracy on last micro-batch
-            with torch.no_grad():
-                # x_ids = str_to_tensor(cur_x, char_to_id, args.max_seq_len).to(device)  # [B, Lx]
-                # y_ids = str_to_tensor(cur_y, char_to_id, args.max_seq_len).to(device)  # [B, Ly]
-                x_ids = str_to_tensor(cur_x, char_to_id).to(device)  # [B, Lx]
-                y_ids = str_to_tensor(cur_y, char_to_id).to(device)  # [B, Ly]
-            
-                generated_strs, generated_strs_with_padding, gen_ids_batch, probs_batch, train_loss, train_acc, train_acc_sample  = generate_sequence_batched(
-                    model=model,
-                    x_ids=x_ids,
-                    embed=embed,
-                    char_to_id=char_to_id,
-                    id_to_char=id_to_char,
-                    max_seq_len=args.max_seq_len,
-                    device=device,
-                    criterion=criterion,
-                    y_ids=y_ids
-                )
-    
-                counter=0
-                for b in range(len(generated_strs)):
-                    print("="*30)
-                    print(f" [Sample {b}] Input: {cur_x[b]}")
-                    print(f" [Sample {b}] Target: {cur_y[b]}")
-                    print(f" [Sample {b}] Generated (w/ spec toks): {generated_strs_with_padding[b]}")
-                    print(f" [Sample {b}] Generated: {generated_strs[b]}")
-                    print(f" [Sample {b}] Token IDs: {gen_ids_batch[b]}")
-                    print(f" [Sample {b}] Probabilities: {probs_batch[b]}")
-                    print("="*30)
-                    counter+=1
-                    if counter>4:
-                        break
-                    
-                print(f"Generation loss: {train_loss}, Generation accuracy: {train_acc}, Generation sample accuracy: {train_acc_sample}")
-                print("="*30)
-                print("="*30)
-
-        # mask = (y_ids != 0)
-        # correct = 0
-        # total = 0
-        # for b in range(1):
-        #     # Compare gen_ids_batch[b] (list of length max_seq_len) with y_ids[b]
-        #     gen_tensor = torch.tensor(gen_ids_batch[b], device=device)
-        #     seq_len = y_ids.size(1)
-        #     min_len = min(gen_tensor.size(0), seq_len)
-        #     # apply mask
-        #     valid_mask = (mask[b, :min_len])
-        #     c = ((gen_tensor[:min_len] == y_ids[b, :min_len]) & valid_mask).sum().item()
-        #     t = valid_mask.sum().item()
-        #     correct += c
-        #     total += t
-        # train_acc = correct / total if total>0 else 1.0
-
         if verbose:
             pdb.set_trace()
 
@@ -2100,114 +2424,164 @@ def main():
         #       f"context_len={current_context_len}, max_num={current_max_num}")
         
         msg= (f"Iter={iteration}, train_loss={train_loss_mezo:.3f}, "
-              f"LR={lr_current:.6f}, iter_time={iteration_time:.2f}s, total_time={total_elapsed/60:.2f}m, "
+              f"LR={lr_current:.6f}, eps={args.epsilon:.6f}, iter_time={iteration_time:.2f}s, total_time={total_elapsed/60:.2f}m, "
               f"context_len={current_context_len}, max_num={current_max_num}")
 
         print(msg)
         sys.stdout.flush()
 
         ####################################
-        # VAL LOOP
+        # VALIDATION LOOP
         ####################################
         # validation every log_interval
         if iteration % args.log_interval == 0:
+
+            # compute train accuracy on last micro-batch
             with torch.no_grad():
-                val_samples = total_samples_per_iter
-                # Generate a validation batch (vx, vy)
-                if args.task=="copy":
-                    vx, vy= generate_copy_task_str(val_samples, current_context_len*5, train=False)
-                elif args.task=="repeat_copy":
-                    vx, vy= generate_repeat_copy_task_str(val_samples, current_context_len*5, train=False)
-                elif args.task=="associative_recall":
-                    vx, vy= generate_associative_recall_task_str(val_samples, item_len=3,
-                                                                 num_items=current_context_len*5, train=False)
-                elif args.task in ["add","sub","mul","div"]:
-                    vx, vy= generate_arithmetic_task_str(val_samples, input_sample_length=current_context_len,
-                                                         task_type=args.task,
-                                                         max_num=current_max_num, train=False)
-                elif args.task=="fib":
-                    vx, vy= generate_fibonacci_task_str(val_samples, current_context_len,
-                                                        max_n=current_max_num+5, train=False)
-                elif args.task=="factorial":
-                    vx, vy= generate_factorial_task_str(val_samples, current_context_len,
-                                                        max_n=current_max_num+5, train=False)
-                else:
-                    raise ValueError(f"Unknown task: {args.task} for val")
+                    # x_ids = str_to_tensor(cur_x, char_to_id, args.max_seq_len).to(device)  # [B, Lx]
+                    # y_ids = str_to_tensor(cur_y, char_to_id, args.max_seq_len).to(device)  # [B, Ly]
+                    x_ids = str_to_tensor(cur_x, char_to_id).to(device)  # [B, Lx]
+                    y_ids = str_to_tensor(cur_y, char_to_id).to(device)  # [B, Ly]
+    
+                    # iterate on the train just to show accuracy as mezo makes it difficult to get a good gauge on accuracy as the model is not ever truly represented
+                    generated_strs, generated_strs_with_padding, gen_ids_batch, probs_batch, train_loss, train_acc, train_acc_sample  = generate_sequence_batched(
+                        model=model,
+                        x_ids=x_ids,
+                        embed=embed,
+                        char_to_id=char_to_id,
+                        id_to_char=id_to_char,
+                        max_seq_len=args.max_seq_len,
+                        device=device,
+                        criterion=criterion,
+                        y_ids=y_ids
+                    )
         
-                # Convert to tensors
-                # vx_ids= str_to_tensor(vx, char_to_id, args.max_seq_len).to(device)
-                # vy_ids= str_to_tensor(vy, char_to_id, args.max_seq_len).to(device)
-                vx_ids= str_to_tensor(vx, char_to_id).to(device)
-                vy_ids= str_to_tensor(vy, char_to_id).to(device)
+                    counter=0
+                    for b in range(len(generated_strs)):
+                        print("="*30)
+                        print(f" [Sample {b}] Input: {cur_x[b]}")
+                        print(f" [Sample {b}] Target: {cur_y[b]}")
+                        print(f" [Sample {b}] Generated (w/ spec toks): {generated_strs_with_padding[b]}")
+                        print(f" [Sample {b}] Generated: {generated_strs[b]}")
+                        print(f" [Sample {b}] Token IDs: {gen_ids_batch[b]}")
+                        print(f" [Sample {b}] Probabilities: {probs_batch[b]}")
+                        print("="*30)
+                        counter+=1
+                        if counter>4:
+                            break
+                        
+                    print(f"Generation loss: {train_loss}, Generation accuracy: {train_acc}, Generation sample accuracy: {train_acc_sample}")
+                    print("="*30)
+                    print("="*30)
+    
+                    # Generate Val Samples that are hold out numbers and seq length
+                    this_sample_context_length_for_val = 1+np.random.randint(args.input_sample_length, args.input_sample_length*5)
         
-                # --------------------------------------------------------------------
-                # 1) Optionally, do a teacher-forced pass to measure "val_loss"
-                # --------------------------------------------------------------------
-                vx_emb= embed(vx_ids)
-                model.eval()
-                val_out, _, _= model(vx_emb)
-                B2,L2,V2= val_out.size()
-                val_loss= criterion(val_out.view(B2*L2, V2), vy_ids.view(B2*L2))
+                    this_sample_max_num_for_val = 1+np.random.randint(0,max(args.max_num,args.max_num*5)) # always at least generate 1.
+                    
+                    # TODO, maybe this should be different? can update later if we want
+                    val_samples = total_samples_per_iter 
+                    
+                    # Generate a validation batch (vx, vy)
+                    vx, vy= generate_task_data(val_samples, args.task,
+                                                   this_sample_context_length_for_val, this_sample_max_num_for_val,
+                                                   train=False)
+                    
+            
+                    # Convert to tensors
+                    # vx_ids= str_to_tensor(vx, char_to_id, args.max_seq_len).to(device)
+                    # vy_ids= str_to_tensor(vy, char_to_id, args.max_seq_len).to(device)
+                    vx_ids= str_to_tensor(vx, char_to_id).to(device)
+                    vy_ids= str_to_tensor(vy, char_to_id).to(device)
+            
+                    # --------------------------------------------------------------------
+                    # 1) Optionally, do a teacher-forced pass to measure "val_loss"
+                    # --------------------------------------------------------------------
+
+                    vx_emb = embed(vx_ids)
+                    vy_emb = embed(vy_ids)[:, :-1, :]  # Exclude last token from input since we'll predict it
+                    v_full = torch.cat([vx_emb, vy_emb], dim=1)  # Concatenate along sequence length dimension
+                    
+                    Bx, Lx, Vx = vx_emb.size()
+                    model.eval()
+                    outputs, _, _ = model(v_full)
+                    B2,L2,V2= outputs.size()
+                    
+                    logits = outputs[:, Lx-1:, :].contiguous()  # Get predictions starting from after input sequence
+                    logits = logits.view(-1, logits.size(-1))  # [batch_size * seq_len, num_classes]
         
-                # --------------------------------------------------------------------
-                # 2) Now do an auto-regressive generation pass
-                # --------------------------------------------------------------------
-                generated_strs,generated_strs_with_padding, gen_ids_batch, probs_batch, val_gen_loss, val_gen_acc, val_gen_acc_sample = generate_sequence_batched(
-                    model=model,
-                    x_ids=vx_ids,
-                    embed=embed,
-                    char_to_id=char_to_id,
-                    id_to_char=id_to_char,
-                    max_seq_len=args.max_seq_len,
-                    device=device,
-                    criterion=criterion,  # we pass it to measure cross-entropy while generating
-                    y_ids=vy_ids
-                )
-        
-                # For debugging, let's print a few random samples
-                sample_indices= random.sample(range(B2), min(3,B2))
-                print("\n[DEBUG] Random Val Samples:")
-                for idx in sample_indices:
-                    print(f"  [Val idx={idx}]")
-                    print(f"    Input:  '{vx[idx]}'")
-                    print(f"    Target: '{vy[idx]}'")
-                    print(f"    Generated(w/ spec toks): '{generated_strs_with_padding[idx]}'")
-                    generated_strs_with_padding
-                    print(f"    Generated: '{generated_strs[idx]}'")
-                    print(f"    Token IDs: {gen_ids_batch[idx]}")
-                    print(f"    Probabilities: {probs_batch[idx]}")
-        
-                    # If you want to see raw token IDs:
-                    # print(f"    gen_ids_batch[idx] = {gen_ids_batch[idx]}")
-        
-                    # If you'd like to see probabilities for newly generated tokens:
-                    # print(f"    probs_batch[idx] = {probs_batch[idx]}")
+        # Reshape targets
+                    targets = vy_ids.contiguous().view(-1)  # [batch_size * seq_len]
+    
+                    val_loss= criterion(logits, targets)
+
+                
+                    # --------------------------------------------------------------------
+                    # 2) Now do an auto-regressive generation pass
+                    # --------------------------------------------------------------------
+                    generated_strs,generated_strs_with_padding, gen_ids_batch, probs_batch, val_gen_loss, val_gen_acc, val_gen_acc_sample = generate_sequence_batched(
+                        model=model,
+                        x_ids=vx_ids,
+                        embed=embed,
+                        char_to_id=char_to_id,
+                        id_to_char=id_to_char,
+                        max_seq_len=args.max_seq_len,
+                        device=device,
+                        criterion=criterion,  # we pass it to measure cross-entropy while generating
+                        y_ids=vy_ids
+                    )
+
+            # we need this to accumulate grad so we can see the backprop impact on VRAM 
+            if False:
+                vram_usage = vram_usage = calculate_vram_usage(model, 
+                                                           train_micro_batch, 
+                                                           vx_emb, 
+                                                           vy_ids, 
+                                                           optimizer, 
+                                                           criterion,
+                                                           optimizer_type = args.optimizer,
+                                                           mezo_flavor = args.mezo_flavor
+                                                           )
+            else:
+                vram_usage = 32
+            print("\n[VRAM USAGE STATS]:")
+            print(vram_usage)
+            # For debugging, let's print a few val random samples
+            sample_indices= random.sample(range(B2), min(3,B2))
+            print("\n[DEBUG] Random Val Samples:")
+            for idx in sample_indices:
+                print(f"  [Val idx={idx}]")
+                print(f"    Input:  '{vx[idx]}'")
+                print(f"    Target: '{vy[idx]}'")
+                print(f"    Generated(w/ spec toks): '{generated_strs_with_padding[idx]}'")
+                generated_strs_with_padding
+                print(f"    Generated: '{generated_strs[idx]}'")
+                print(f"    Token IDs: {gen_ids_batch[idx]}")
+                print(f"    Probabilities: {probs_batch[idx]}")
+    
+                # If you want to see raw token IDs:
+                # print(f"    gen_ids_batch[idx] = {gen_ids_batch[idx]}")
+    
+                # If you'd like to see probabilities for newly generated tokens:
+                # print(f"    probs_batch[idx] = {probs_batch[idx]}")
 
 
-                print(f"Generation loss: {val_gen_loss}, Generation accuracy: {val_gen_acc}, Generation sample accuracy: {val_gen_acc_sample}")
-                print("="*30)
-                print("="*30)
+            print(f"Generation loss: {val_gen_loss}, Generation accuracy: {val_gen_acc}, Generation sample accuracy: {val_gen_acc_sample}")
+            print("="*30)
+            print("="*30)
 
-                print("[END DEBUG]\n")
-                # possibly update curriculum
-                if args.task in ["copy","add","sub","mul","div"]:
-                    new_ctx, new_mn= maybe_update_curriculum(train_acc, current_context_len, current_max_num, args.task)
-                    current_context_len= new_ctx
-                    current_max_num= new_mn
+            print("[END DEBUG]\n")
+            
+            # check to see if we should update curriculum
+            new_ctx, new_mn, consecutive_succ= maybe_update_curriculum(train_acc, current_context_len, current_max_num, consecutive_succ)
+            if current_context_len!=new_ctx:
+                print(f"!!!!! UPDATING CURRICULUM FROM {current_context_len} to {new_ctx}")
+                print(f"!!!!! UPDATING CURRICULUM FROM {current_context_len} to {new_ctx}")
+                print(f"!!!!! UPDATING CURRICULUM FROM {current_context_len} to {new_ctx}")
+                # pdb.set_trace()
+            current_context_len= new_ctx
+            current_max_num= new_mn
 
-        
-            # Now you have two sets of metrics:
-            # val_loss      => teacher-forced cross-entropy
-            # val_gen_loss  => cross-entropy measured from auto-regressive generation
-            # val_gen_acc   => accuracy from auto-regressive generation
-        
-            # msg_val= (
-            #    f"[VAL] Iter={iteration}, "
-            #    f"val_loss={val_loss.item():.3f}, "
-            #    f"val_gen_loss={val_gen_loss:.3f}, "
-            #    f"val_gen_acc={val_gen_acc:.3f}"
-            # )
-            # print(msg_val)
             sys.stdout.flush()
         
             if args.wandb_proj is not None:
@@ -2230,11 +2604,17 @@ def main():
                     "val_gen_loss": val_gen_loss,       # from generation
                     "val_gen_acc": val_gen_acc,
                     "weight_decay_loss": weight_decay_loss.item(),
+                    # "vram_usage":vram_usage,
                 }
                 print("="*30)
                 print("VAL STATS")
                 print(msg)
-                wandb.log(msg, step=iteration)
+                # wandb.log(msg, step=iteration)
+
+                # Log metrics to Neptune with the current iteration as the step
+                for key, value in msg.items():
+                    run[f"train/{key}"].log(value, step=iteration)
+
 
 
     print("Finished.")
