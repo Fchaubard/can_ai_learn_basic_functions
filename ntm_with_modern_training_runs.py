@@ -59,7 +59,7 @@ def pick_gpu_with_most_free_mem() -> int:
 ##############################################################################
 import torch
 from torch.optim import Adam
-
+# Key issues and fixes for VRAM calculation
 def calculate_vram_usage(model, train_micro_batch, x_emb, y_ids, optimizer, criterion, optimizer_type = "sgd",
                                                                mezo_flavor = None):
     """
@@ -81,32 +81,35 @@ def calculate_vram_usage(model, train_micro_batch, x_emb, y_ids, optimizer, crit
 
     # Detect the current device of the model
     device = next(model.parameters()).device
-
-    # Save the model's current device and temporarily move to GPU if not already there
-    original_device = device
-    if device.type != "cuda":
-        model = model.to("cuda")
-        x_emb = x_emb.to("cuda")
-        y_ids = y_ids.to("cuda")
-        device = torch.device("cuda")
-
+    
+    # move the model to cpu for a second
+    model = model.to('cpu')
+    x_emb = x_emb.to('cpu')
+    # Clean up
+    torch.cuda.empty_cache()
+    
     # Initialize CUDA memory tracking
     torch.cuda.reset_peak_memory_stats(device)
     baseline_vram = torch.cuda.memory_allocated(device)  # VRAM used by other processes
+
+    # move the model back to this gpu
+    model = model.to(device)
+    x_emb = x_emb.to(device)
 
     # Measure VRAM for forward pass
     torch.cuda.reset_peak_memory_stats(device)
     loss_val = None
     
     if optimizer_type == "mezo":
+        
         if mezo_flavor == "mezo_layerwise":
             loss_val = mezo_char_layerwise(model, x_emb, y_ids, criterion, epsilon=0.001)
-        elif mezo_flavor == "mezo_rolling":
-            loss_val = mezo_char_single_rolling(model, x_emb, y_ids, criterion, mezo_state)
         elif mezo_flavor == "mezo_single":
             loss_val = mezo_char_single(model, x_emb, y_ids, criterion, epsilon=0.001)
         else:
             raise Exception("Invalid MeZO flavor")
+        forward_vram = torch.cuda.max_memory_allocated(device) - baseline_vram
+        backward_vram = 0 # there is no backward pass
     else:
         # Traditional optimizer training
         optimizer.zero_grad()
@@ -117,40 +120,25 @@ def calculate_vram_usage(model, train_micro_batch, x_emb, y_ids, optimizer, crit
         torch.cuda.reset_peak_memory_stats(device)
         loss.backward()
         backward_vram = torch.cuda.max_memory_allocated(device) - baseline_vram
-        loss_val = loss.item()
-
-    # Save the original learning rates
-    original_lrs = [group['lr'] for group in optimizer.param_groups]
-
-    # Temporarily set learning rates to 0
-    for group in optimizer.param_groups:
-        group['lr'] = 0
 
     torch.cuda.reset_peak_memory_stats(device)
     optimizer.step()  # Perform the step with zero learning rate (no actual update)
     optimizer.zero_grad()
     optimizer_vram = torch.cuda.max_memory_allocated(device) - baseline_vram
 
-    # Restore the original learning rates
-    for group, original_lr in zip(optimizer.param_groups, original_lrs):
-        group['lr'] = original_lr
     
     # Record peak memory usage across all phases
     peak_vram = torch.cuda.max_memory_allocated(device) - baseline_vram
-
-    # Move model back to its original device
-    if original_device.type != "cuda":
-        model = model.to(original_device)
-
+    
     # Clean up
     torch.cuda.empty_cache()
 
     return {
-        "loss_value": loss_val,
-        "forward_vram_MB": forward_vram / (1024 ** 2) if optimizer_type != "mezo" else None,
-        "backward_vram_MB": backward_vram / (1024 ** 2) if optimizer_type != "mezo" else None,
-        "optimizer_vram_MB": optimizer_vram / (1024 ** 2),
-        "total_peak_vram_MB": peak_vram / (1024 ** 2),
+        "forward_vram_GB": forward_vram / (1024 ** 3),
+        "backward_vram_GB": backward_vram / (1024 ** 3),
+        "optimizer_vram_GB": optimizer_vram / (1024 ** 3),
+        "total_peak_vram_GB": peak_vram / (1024 ** 3),
+        "max_vram_GB": max(forward_vram,backward_vram,optimizer_vram) / (1024 ** 3),
     }
 
 
@@ -187,7 +175,180 @@ def get_char_vocab():
     return vocab_list, char_to_id, id_to_char
 
 
+def calculate_vram_usage_direct(
+    arch: str,
+    hidden_size: int,
+    memory_size: int,
+    head_size: int,
+    num_heads: int,
+    input_dim: int,
+    vocab_size: int,
+    micro_batch_size: int,
+    input_sample_length: int,
+    method: str ,
+    use_adam: bool
+):
+    """
+    Estimate VRAM usage (in GB) for a given architecture & training method.
+    
+    Fixes:
+      - MeZO does NOT scale with input_sample_length (since no BPTT).
+      - SGD DOES scale with input_sample_length for storing BPTT states.
+    
+    Args:
+      arch (str): One of ['dnc','tra','simplelstm','ntm'].
+      hidden_size (int): LSTM/controller hidden size (or transformer's d_model).
+      memory_size (int): For NTM/DNC. 
+      head_size (int): For NTM/DNC (heads).
+      num_heads (int): # of heads or LSTM layers, depending on arch.
+      input_dim (int): Dimension of input embeddings.
+      vocab_size (int): Output dimension (# classes).
+      micro_batch_size (int): Batch size for training.
+      input_sample_length (int): Sequence length for training (BPTT).
+      method (str): 
+        "sgd" => standard backprop 
+        "mezo_single" => single-perturbation MeZO
+        "mezo_layerwise" => layerwise MeZO
+      use_adam (bool): If True, we use Adam's extra states; else simpler momentum.
+    
+    Returns:
+      A dict with:
+        'params_gb', 'activations_gb', 'gradients_gb', 'ephemeral_gb', 'optimizer_gb', 'total_estimated_gb'
+      summarizing approximate memory usage in GB.
+    """
 
+    ################################################################
+    # 1) ESTIMATE PARAMETER COUNT
+    ################################################################
+    if arch == "simplelstm":
+        # For each LSTM layer, param_count ~ 4 * hidden_size * (hidden_size + input_dim)
+        # times num_layers. Then add some overhead for input->hidden
+        param_count_arch = 4 * hidden_size * (hidden_size + input_dim) * num_heads
+        activation_scale = 1
+
+    elif arch == "ntm":
+        # Roughly hidden_size^2 plus memory ops
+        param_count_arch = (hidden_size * hidden_size) + (hidden_size * memory_size * head_size)* num_heads
+        activation_scale = param_count_arch
+    elif arch == "dnc":
+        # Some bigger overhead for memory
+        param_count_arch = (hidden_size**2) + 2 * (hidden_size * memory_size * head_size)* num_heads
+        activation_scale = param_count_arch
+    elif arch == "tra":
+        # A rough guess for transformer param: hidden_size^2 * 4 * num_heads
+        param_count_arch = 4 * (hidden_size) * num_heads
+        activation_scale = num_heads*hidden_size**2
+    elif arch == "mamba":
+        # Param count for Mamba architecture
+        param_count_arch = 4 * (hidden_size * num_heads) + (hidden_size * input_dim)
+        activation_scale = hidden_size * num_heads
+    else:
+        raise Exception(f"No known arch! {arch}") #param_count_arch = hidden_size**2  # fallback if unknown
+
+    # Also consider embedding & final projection
+    embed_count = vocab_size * input_dim
+    proj_count = hidden_size * vocab_size
+
+    total_params = param_count_arch + embed_count + proj_count
+
+    # param memory in bytes
+    params_bytes = total_params * 4
+    params_gb = params_bytes / (1024**3)
+
+    ################################################################
+    # 2) ACTIVATIONS (Forward) for SGD's BPTT
+    ################################################################
+    # For standard sgd-based backprop, we store up to 
+    # micro_batch_size * input_sample_length * hidden_size
+    # (plus some overhead). For mezo => no big BPTT store
+    if method == "sgd":
+        # scale with B x L x hidden
+        # let's say factor=1 
+        activation_count = micro_batch_size * input_sample_length * hidden_size * activation_scale
+        params_gb*=2 # for adam momentum
+    else:
+        # MeZO => we do a forward pass or multiple forward passes
+        # but do NOT store activations for backprop
+        # so we keep it minimal, ignoring L
+        activation_count = micro_batch_size * hidden_size  # ignoring input_sample_length
+        params_gb*=2 # for adam momentum
+        
+    # If transformer, add ~some factor
+    if arch == "tra":
+        activation_count *= 2
+
+    activations_bytes = activation_count * 4
+    activations_gb = activations_bytes / (1024**3)
+
+    ################################################################
+    # 3) GRADIENT VRAM
+    ################################################################
+    # If we do BPTT (sgd method), we store gradient for each param => ~ param_count
+    # MeZO => no param grad for entire L
+    if method == "sgd":
+        gradients_bytes = total_params * 4
+    else:
+        gradients_bytes = 0
+    gradients_gb = gradients_bytes / (1024**3)
+
+    ################################################################
+    # 4) EPHEMERAL VRAM for multiple forward passes
+    ################################################################
+    #  - mezo_single => do 2 forward passes => ephemeral not scaling with L
+    #  - mezo_layerwise => multiple passes but each "layer" => also not scaling with L
+    #  - sgd => ephemeral = 0 here, because we've accounted for BPTT in "activations_gb"
+    ephemeral_bytes = 0
+    if method == "mezo_single":
+        # e.g. 2 forward passes => add 1 more chunk of (B * hidden_size) 
+#         ephemeral_count = micro_batch_size * hidden_size  # ignoring L
+#         ephemeral_count *= 1  # (we already included 1 pass in "activations_gb")
+#         ephemeral_bytes = ephemeral_count * 4
+        activations_gb/=1
+
+    elif method == "mezo_layerwise":
+        # we do multiple forward passes, but only 1 layer at a time => 
+        # let's do half or so 
+        activations_gb/=4
+#         ephemeral_count = micro_batch_size * hidden_size / 40
+#         ephemeral_bytes = ephemeral_count * 4
+
+    ephemeral_gb = ephemeral_bytes / (1024**3)
+
+    ################################################################
+    # 5) OPTIMIZER STATES
+    ################################################################
+    # If use_adam => ~ 2 param_count for moment1, moment2
+    # If not => maybe a small factor for momentum
+    if use_adam:
+        opt_bytes = total_params * 4 * 2
+    else:
+        # smaller overhead for simpler momentum
+        opt_bytes = total_params * 4 * 2  # arbitrary factor
+#         if method.startswith("mezo"):
+#             # mezo + sgd => maybe even less overhead
+#             opt_bytes *= 0.5
+
+    optimizer_gb = opt_bytes / (1024**3)
+
+    ################################################################
+    # 6) SUM
+    ################################################################
+    total_estimated_gb = (
+        params_gb + 
+        activations_gb + 
+        gradients_gb + 
+        ephemeral_gb + 
+        optimizer_gb
+    )
+
+    return {
+        "params_gb": params_gb,
+        "activations_gb": activations_gb,
+        "gradients_gb": gradients_gb,
+        "ephemeral_gb": ephemeral_gb,
+        "optimizer_gb": optimizer_gb,
+        "total_estimated_gb": total_estimated_gb
+    }
 
 
 ##############################################################################
@@ -527,47 +688,116 @@ def generate_factorial_task_str(num_samples, input_sample_length, max_n=6, train
 ##############################################################################
 # Model Classes
 ##############################################################################
+# class SimpleLSTM(nn.Module):
+#     def __init__(self, input_size, output_size, hidden_size, embed):
+#         super(SimpleLSTM, self).__init__()
+#         self.input_size = input_size
+#         self.output_size = output_size
+#         self.hidden_size = hidden_size
+#         self.embed = embed
+
+#         # Input normalization
+#         controller_input_size = input_size 
+#         self.input_norm = nn.LayerNorm(controller_input_size)
+#         self.controller_norm = nn.LayerNorm(output_size)
+
+#         # Controller with input normalization
+#         self.controller = nn.LSTM(controller_input_size, hidden_size, proj_size=output_size, num_layers=1, batch_first=True)
+
+#     def forward(self, x_emb, hidden=None, memory=None, skip_layer_norm=True):
+#         B, L, E = x_emb.size()
+
+#         # Correct hidden and cell state initialization
+#         if hidden is None:
+#             h0 = x_emb.new_zeros(1, B, self.output_size)  # Hidden state matches proj_size
+#             c0 = x_emb.new_zeros(1, B, self.hidden_size)  # Cell state matches hidden_size
+#             hidden = (h0, c0)
+
+#         outputs = []
+#         for t in range(L):
+#             controller_input = x_emb[:, t, :]
+#             if not skip_layer_norm:
+#                 controller_input = self.input_norm(controller_input)
+
+#             # Controller
+#             out_ctrl, hidden = self.controller(controller_input.unsqueeze(1), hidden)
+#             # out_ctrl = out_ctrl.squeeze(1)
+#             # Normalize output
+#             if not skip_layer_norm:
+#                 out_ctrl = self.controller_norm(out_ctrl)
+#             outputs.append(out_ctrl)
+
+#         outputs = torch.cat(outputs, dim=1)
+#         return outputs, memory, hidden
+import torch
+import torch.nn as nn
+
 class SimpleLSTM(nn.Module):
-    def __init__(self, input_size, output_size, hidden_size, embed):
+    def __init__(self, input_size, output_size, hidden_size, embed, num_layers=1):
+        """
+        Simple LSTM model with a separate projection layer.
+
+        Args:
+            input_size (int): Input feature size.
+            output_size (int): Desired output feature size.
+            hidden_size (int): Hidden size of the LSTM.
+            embed (nn.Module): Embedding layer.
+            num_layers (int): Number of LSTM layers (default=1).
+        """
         super(SimpleLSTM, self).__init__()
         self.input_size = input_size
         self.output_size = output_size
         self.hidden_size = hidden_size
+        self.num_layers = num_layers
         self.embed = embed
 
         # Input normalization
-        controller_input_size = input_size 
-        self.input_norm = nn.LayerNorm(controller_input_size)
-        self.controller_norm = nn.LayerNorm(output_size)
+        self.input_norm = nn.LayerNorm(input_size)
 
-        # Controller with input normalization
-        self.controller = nn.LSTM(controller_input_size, hidden_size, proj_size=output_size, num_layers=1, batch_first=True)
+        # Multi-layer LSTM
+        self.controller = nn.LSTM(
+            input_size, 
+            hidden_size, 
+            num_layers=num_layers, 
+            batch_first=True
+        )
 
-    def forward(self, x_emb, hidden=None, memory=None, skip_layer_norm=True):
+        # Projection layer to map hidden_size -> output_size
+        self.projection = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x_emb, hidden=None,  memory=None, skip_layer_norm=True):
+        """
+        Forward pass of the LSTM.
+
+        Args:
+            x_emb (torch.Tensor): Input embeddings [batch_size, seq_len, input_size].
+            hidden (tuple): Tuple of (h_0, c_0) for LSTM layers.
+            skip_layer_norm (bool): Whether to skip layer normalization.
+
+        Returns:
+            torch.Tensor: Projected output [batch_size, seq_len, output_size].
+            None: Placeholder for memory (not used in this implementation).
+            tuple: Updated (hidden, cell) states.
+        """
         B, L, E = x_emb.size()
 
-        # Correct hidden and cell state initialization
+        # Apply input layer normalization if not skipped
+        if not skip_layer_norm:
+            x_emb = self.input_norm(x_emb)
+
+        # Initialize hidden states if not provided
         if hidden is None:
-            h0 = x_emb.new_zeros(1, B, self.output_size)  # Hidden state matches proj_size
-            c0 = x_emb.new_zeros(1, B, self.hidden_size)  # Cell state matches hidden_size
+            h0 = x_emb.new_zeros(self.num_layers, B, self.hidden_size)
+            c0 = x_emb.new_zeros(self.num_layers, B, self.hidden_size)
             hidden = (h0, c0)
 
-        outputs = []
-        for t in range(L):
-            controller_input = x_emb[:, t, :]
-            if not skip_layer_norm:
-                controller_input = self.input_norm(controller_input)
+        # Forward pass through LSTM
+        lstm_out, hidden = self.controller(x_emb, hidden)  # lstm_out: [B, L, hidden_size]
 
-            # Controller
-            out_ctrl, hidden = self.controller(controller_input.unsqueeze(1), hidden)
-            # out_ctrl = out_ctrl.squeeze(1)
-            # Normalize output
-            if not skip_layer_norm:
-                out_ctrl = self.controller_norm(out_ctrl)
-            outputs.append(out_ctrl)
+        # Project LSTM outputs to desired output_size
+        projected_out = self.projection(lstm_out)  # [B, L, output_size]
 
-        outputs = torch.cat(outputs, dim=1)
-        return outputs, memory, hidden
+        return projected_out, None, hidden
 
 
 
@@ -1328,7 +1558,7 @@ class DNC(nn.Module):
 
 
 class TransformerController(nn.Module):
-    def __init__(self, d_model=128, nhead=4, num_layers=2, dim_feedforward=256, dropout=0.1):
+    def __init__(self, d_model=128, nhead=4, num_layers=2, dim_feedforward=256, dropout=0):
         super(TransformerController, self).__init__()
         encoder_layer= nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead,
                                                   dim_feedforward=dim_feedforward,
@@ -1339,19 +1569,33 @@ class TransformerController(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, input_size, output_size, hidden_size, embed):
+    def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed):
         super(Transformer, self).__init__()
-        self.embed = embed  # Assign the embedding layer
+        self.embed = embed
+        
+        # Project input to a dimension that's compatible with num_heads
+        # Make d_model a multiple of num_heads
+        self.d_model = num_heads * head_size  # This ensures d_model is divisible by num_heads
+        self.input_proj = nn.Linear(input_size, self.d_model)
+        
         self.transformer = TransformerController(
-            d_model=input_size, nhead=4, num_layers=2, dim_feedforward=4 * input_size
+            d_model=self.d_model,  # Use the projected dimension
+            nhead=num_heads,
+            num_layers=1,
+            dim_feedforward=4 * self.d_model  # Scale with d_model instead of input_size
         )
-        self.fc_out = nn.Linear(input_size, output_size)
-
+        self.fc_out = nn.Linear(self.d_model, output_size)
+        
     def forward(self, x_emb, hidden=None, memory=None):
-        trans_out = self.transformer(x_emb)
+        # Project input to transformer dimension
+        x_proj = self.input_proj(x_emb)
+        
+        # Pass through transformer
+        trans_out = self.transformer(x_proj)
+        
+        # Project to output size
         out = self.fc_out(trans_out)
         return out, None, (None, None)
-
 
 ##############################################################################
 # Grouping parameters by top-level "layer" for faster "layerwise" mezo
@@ -1457,106 +1701,6 @@ def teacher_forcing_loss_emb(model, x_emb, y_ids_unpadded, criterion, teacher_fo
 
     # Average loss across all valid tokens
     return total_loss/Ly #  / num_tokens if num_tokens > 0 else 0.0
-
-##############################################################################
-# MeZO single
-##############################################################################
-def mezo_char_single(model, x_emb, y, criterion, epsilon=1e-3):
-    """
-    Single-step MeZO + teacher forcing when 'x_emb' is [B, Lx, E] 
-    and 'y' is [B, Ly] (token IDs).
-
-    Steps:
-      0) local_seed = torch.randint(0, 2**32, (1,))
-      1) "Plus pass": 
-         - Set torch.manual_seed(local_seed)
-         - For each param p: p += ε * randn_like(p)
-         - forward => loss_plus = teacher_forcing_loss_emb(...)
-      2) "Minus pass":
-         - Set torch.manual_seed(local_seed)
-         - For each param p: p -= 2ε * randn_like(p)   (so net = θ - ε·d)
-         - forward => loss_minus
-      3) "Revert":
-         - Set torch.manual_seed(local_seed)
-         - For each param p: p += ε * randn_like(p)    (so net = θ again)
-      4) "Gradient":
-         - grad_est = (loss_plus - loss_minus) / (2ε)
-         - For each param p: p.grad += grad_est * randn_like(p)
-         (so your momentum/optimizer can apply the update)
-
-    Args:
-        model (nn.Module):
-            - Must define `model.embed` if you call it in teacher_forcing_loss_emb
-            - forward(...) returns shape [B, T, vocab] plus memory, hidden
-        x_emb (torch.Tensor): [B, Lx, E], the embedded input 
-        y (torch.LongTensor): [B, Ly] target token IDs
-        criterion (nn.Module): e.g. nn.CrossEntropyLoss()
-        epsilon (float): FD scale
-
-    Returns:
-        float: average (loss_plus + loss_minus)/2
-    """
-
-    # 0) local_seed => ensures the same directions in plus/minus
-    local_seed = torch.randint(0, 2**32, (1,)).item()
-    all_params = list(model.parameters())
-
-    # Zero out old gradients
-    for p in all_params:
-        if p.grad is not None:
-            p.grad.zero_()
-
-    # -----------------------------------------------------
-    # 1) PLUS pass: (θ -> θ + ε·d)
-    # -----------------------------------------------------
-    torch.manual_seed(local_seed)
-    with torch.no_grad():
-        for p in all_params:
-            if p.requires_grad:
-                d = torch.randn_like(p)
-                p.data.add_(epsilon * d)
-
-    loss_plus = teacher_forcing_loss_emb(model, x_emb, y, criterion)
-
-    # -----------------------------------------------------
-    # 2) MINUS pass: (from θ + ε·d => θ - ε·d)
-    # -----------------------------------------------------
-    torch.manual_seed(local_seed)
-    with torch.no_grad():
-        for p in all_params:
-            if p.requires_grad:
-                d = torch.randn_like(p)
-                p.data.sub_(2.0 * epsilon * d)
-
-    loss_minus = teacher_forcing_loss_emb(model, x_emb, y, criterion)
-
-    # -----------------------------------------------------
-    # 3) Revert => (θ - ε·d + ε·d => θ)
-    # -----------------------------------------------------
-    torch.manual_seed(local_seed)
-    with torch.no_grad():
-        for p in all_params:
-            if p.requires_grad:
-                d = torch.randn_like(p)
-                p.data.add_(epsilon * d)
-
-    # -----------------------------------------------------
-    # 4) Finite-Difference Gradient => p.grad += grad_est * d
-    # -----------------------------------------------------
-    grad_est = (loss_plus - loss_minus) / (2.0 * epsilon)
-
-    torch.manual_seed(local_seed)
-    for p in all_params:
-        if p.requires_grad:
-            d = torch.randn_like(p)
-            if p.grad is None:
-                p.grad = grad_est * d
-            else:
-                p.grad.add_(grad_est * d)
-
-    # Return the average of the two losses
-    return 0.5 * (loss_plus.item() + loss_minus.item())
-
 
 
 # UNTESTED AND NOT WORKING.. JUST A ROUGH IDEA! 
@@ -1735,64 +1879,91 @@ def mezo_char_single(model, x_emb, y, criterion, epsilon=1e-3):
 ##############################################################################
 # "Layerwise" mezo but grouped => fewer fwd passes
 ##############################################################################
-def mezo_char_layerwise(model, x, y, criterion, epsilon=1e-3):
-    named_params= list(model.named_parameters())
-    layer_dict= group_params_by_layer(named_params)
-    all_params= list(model.parameters())
-    for p in all_params:
-        if p.grad is not None:
-            p.grad.zero_()
+def mezo_char_layerwise(model, x_emb, y, criterion, epsilon=1e-3):
+    """
+    Layerwise MeZO with grouped parameter perturbations.
 
-    total_loss= 0.0
-    layer_count=0
+    Args:
+        model (nn.Module): The model being trained.
+        x_emb (torch.Tensor): Input embeddings [B, L, E].
+        y (torch.LongTensor): Target tensor [B, L].
+        criterion (nn.Module): Loss function.
+        epsilon (float): Finite difference step size.
+
+    Returns:
+        float: Average loss over all layers.
+    """
+    named_params = list(model.named_parameters())
+    layer_dict = group_params_by_layer(named_params)
+    all_params = list(model.parameters())
+    local_seed = torch.randint(0, 2**32, (1,)).item()
+
     with torch.no_grad():
+        # Zero out old gradients
+        for p in all_params:
+            if p.grad is not None:
+                p.grad.zero_()
+    
+        total_loss = 0.0
+        layer_count = 0
+
+    
         for layer_name, param_list in layer_dict.items():
-            layer_count+=1
-            orig_data= []
-            directions= []
-            for _, p in param_list:
-                orig_data.append(p.data.clone())
-                directions.append(torch.randn_like(p))
+            torch.cuda.empty_cache() 
+            layer_count += 1
 
-            # + eps
+            torch.manual_seed(local_seed)
+            torch.cuda.empty_cache() 
+            # + epsilon perturbation
             for i, (_, p) in enumerate(param_list):
-                p.data.add_(epsilon * directions[i])
+                d = torch.randn_like(p)
+                p.data.add_(epsilon * d)
 
-                # p.data.add_(epsilon * directions[i].sign())
+            # Forward pass for positively perturbed model
+            loss_plus = teacher_forcing_loss_emb(model, x_emb, y, criterion)
 
-            out_p,_,_= model(x)
-            Bp,Lp,Vp= out_p.size()
-            loss_plus= criterion(out_p.view(Bp*Lp, Vp), y.view(Bp*Lp))
-
-            # -2 eps
+            torch.cuda.empty_cache() 
+            # -2 epsilon perturbation
+            torch.manual_seed(local_seed)
             for i, (_, p) in enumerate(param_list):
-                p.data.sub_(2.0*epsilon * directions[i])
+                d = torch.randn_like(p)
+                p.data.sub_(2.0 * epsilon * d)
 
-                # p.data.sub_(2.0* epsilon* directions[i].sign())
+            # Forward pass for negatively perturbed model
+            loss_minus = teacher_forcing_loss_emb(model, x_emb, y, criterion)
 
-            out_m,_,_= model(x)
-            Bm,Lm,Vm= out_m.size()
-            loss_minus= criterion(out_m.view(Bm*Lm,Vm), y.view(Bm*Lm))
-
-            # restore
+            # Restore original parameters
+            torch.manual_seed(local_seed)
+            torch.cuda.empty_cache() 
+            
             for i, (_, p) in enumerate(param_list):
-                p.data.copy_(orig_data[i])
+                d = torch.randn_like(p)
+                p.data.add_(epsilon * d)
 
-            grad_est= (loss_plus- loss_minus)/(2*epsilon)
 
-            # accumulate param.grad
+            # Compute gradient estimate for this layer
+            grad_est = (loss_plus - loss_minus) / (2 * epsilon)
+
+            # Accumulate gradients
+            torch.manual_seed(local_seed)
+            torch.cuda.empty_cache() 
+            
             for i, (_, p) in enumerate(param_list):
+                d = torch.randn_like(p)
                 if p.grad is None:
-                    p.grad= grad_est* directions[i]#.sign()
+                    p.grad = grad_est * d
                 else:
-                    p.grad.add_( grad_est* directions[i])#.sign())
+                    p.grad.add_(grad_est * d)
 
-            avg_loss= 0.5*(loss_plus.item()+ loss_minus.item())
-            total_loss+= avg_loss
+            avg_loss = 0.5 * (loss_plus.item() + loss_minus.item())
+            total_loss += avg_loss
 
-    if layer_count>0:
-        total_loss/= float(layer_count)
+    # Average loss across layers
+    if layer_count > 0:
+        total_loss /= layer_count
+
     return total_loss
+
 
 
 
@@ -1807,25 +1978,29 @@ def mezo_char_single(model, x_emb, y, criterion, epsilon=1e-3, verbose=False):
 
     local_seed = torch.randint(0, 2**32, (1,)).item()
     all_params = list(model.parameters())
-
-    if verbose:
-        print(f"\nRandom seed: {local_seed}")
-        print("Parameter shapes:")
-        for i, p in enumerate(all_params):
-            if p.requires_grad:
-                print(f"Param {i}: {p.shape}")
-
-    # Zero gradients
-    for p in all_params:
-        if p.grad is not None:
-            p.grad.zero_()
-    
-    if verbose:
-        print("\n=== Plus Pass ===")
-
-    # Plus pass
-    torch.manual_seed(local_seed)
     with torch.no_grad():
+        torch.cuda.empty_cache() 
+                
+    
+        if verbose:
+            print(f"\nRandom seed: {local_seed}")
+            print("Parameter shapes:")
+            for i, p in enumerate(all_params):
+                if p.requires_grad:
+                    print(f"Param {i}: {p.shape}")
+    
+        # Zero gradients
+        for p in all_params:
+            if p.grad is not None:
+                p.grad.zero_()
+        
+        if verbose:
+            print("\n=== Plus Pass ===")
+    
+        # Plus pass
+        torch.cuda.empty_cache() 
+        torch.manual_seed(local_seed)
+        
         for i, p in enumerate(all_params):
             if p.requires_grad:
                 d = torch.randn_like(p)
@@ -1834,59 +2009,61 @@ def mezo_char_single(model, x_emb, y, criterion, epsilon=1e-3, verbose=False):
                     print(f"\nParam {i} perturbation statistics:")
                     print(f"Mean perturbation: {d.mean().item()}")
                     print(f"Std perturbation: {d.std().item()}")
-
-    loss_plus = teacher_forcing_loss_emb(model, x_emb, y, criterion)
-    if verbose:
-        print(f"Plus pass loss: {loss_plus.item()}")
-
-    if verbose:
-        print("\n=== Minus Pass ===")
-
-    # Minus pass
-    torch.manual_seed(local_seed)
-    with torch.no_grad():
+    
+        loss_plus = teacher_forcing_loss_emb(model, x_emb, y, criterion)
+        if verbose:
+            print(f"Plus pass loss: {loss_plus.item()}")
+    
+        if verbose:
+            print("\n=== Minus Pass ===")
+    
+        # Minus pass
+        torch.cuda.empty_cache() 
+        torch.manual_seed(local_seed)
         for p in all_params:
             if p.requires_grad:
                 d = torch.randn_like(p)
                 p.data.sub_(2.0 * epsilon * d)
-
-    loss_minus = teacher_forcing_loss_emb(model, x_emb, y, criterion)
-    if verbose:
-        print(f"Minus pass loss: {loss_minus.item()}")
-
-    # Revert parameters
-    torch.manual_seed(local_seed)
-    with torch.no_grad():
+    
+        loss_minus = teacher_forcing_loss_emb(model, x_emb, y, criterion)
+        if verbose:
+            print(f"Minus pass loss: {loss_minus.item()}")
+    
+        # Revert parameters
+        torch.manual_seed(local_seed)
+        torch.cuda.empty_cache() 
+        
         for p in all_params:
             if p.requires_grad:
                 d = torch.randn_like(p)
                 p.data.add_(epsilon * d)
-
-    # Compute and apply gradients
-    grad_est = (loss_plus - loss_minus) / (2.0 * epsilon)
-    if verbose:
-        print(f"\nEstimated gradient: {grad_est}")
-
-    torch.manual_seed(local_seed)
-    for i, p in enumerate(all_params):
-        if p.requires_grad:
-            d = torch.randn_like(p)
-            if p.grad is None:
-                p.grad = grad_est * d
-            else:
-                p.grad.add_(grad_est * d)
-            
-            if verbose and i < 3:  # Show first few params
-                print(f"\nParam {i} gradient statistics:")
-                print(f"Mean gradient: {p.grad.mean().item()}")
-                print(f"Std gradient: {p.grad.std().item()}")
-
-    avg_loss = 0.5 * (loss_plus.item() + loss_minus.item())
-    if verbose:
-        print(f"\nFinal average loss: {avg_loss}")
-        print("=== MEZO Single Complete ===\n")
-        # import pdb
-        # pdb.set_trace()
+    
+        # Compute and apply gradients
+        grad_est = (loss_plus - loss_minus) / (2.0 * epsilon)
+        if verbose:
+            print(f"\nEstimated gradient: {grad_est}")
+    
+        torch.manual_seed(local_seed)
+        torch.cuda.empty_cache() 
+        for i, p in enumerate(all_params):
+            if p.requires_grad:
+                d = torch.randn_like(p)
+                if p.grad is None:
+                    p.grad = grad_est * d
+                else:
+                    p.grad.add_(grad_est * d)
+                
+                if verbose and i < 3:  # Show first few params
+                    print(f"\nParam {i} gradient statistics:")
+                    print(f"Mean gradient: {p.grad.mean().item()}")
+                    print(f"Std gradient: {p.grad.std().item()}")
+    
+        avg_loss = 0.5 * (loss_plus.item() + loss_minus.item())
+        if verbose:
+            print(f"\nFinal average loss: {avg_loss}")
+            print("=== MEZO Single Complete ===\n")
+            # import pdb
+            # pdb.set_trace()
     return avg_loss
 
 
@@ -1935,6 +2112,7 @@ def generate_sequence_batched(model, x_ids, embed, char_to_id, id_to_char, max_s
     all_targets = []
     
     # Get initial prediction from the input sequence
+    
     logits, memory, hidden = model(x_emb, hidden=hidden, memory=memory)
     last_logits = logits[:, -1, :]  # Get predictions for next token after input
     
@@ -1995,8 +2173,14 @@ def generate_sequence_batched(model, x_ids, embed, char_to_id, id_to_char, max_s
         
         # Calculate accuracies
         predictions = torch.argmax(stacked_logits, dim=-1)  # [B, seq_len]
-        token_correct = (predictions == stacked_targets).float()
-        avg_token_level_accuracy = token_correct.mean().item()
+        mask = (stacked_targets != bos_id) & (stacked_targets != eos_id) & (stacked_targets != pad_id)
+
+        # Calculate token-level accuracy, ignoring special tokens
+        token_correct = (predictions == stacked_targets) & mask
+        # token_correct = (predictions == stacked_targets).float()
+        avg_token_level_accuracy = token_correct.sum().item() / mask.sum().item() if mask.sum().item() > 0 else 0.0
+
+        # avg_token_level_accuracy = token_correct.mean().item()
         
         # Sample-level accuracy (all tokens correct)
         sample_correct = token_correct.all(dim=1).float()
@@ -2111,7 +2295,36 @@ def maybe_update_curriculum(train_acc, current_context, current_maxnum, consecut
         return new_ct, new_mn, 0
     return current_context, current_maxnum, consecutive_succ
 
+def train_micro_batch(model, x_emb, y_ids, criterion, optimizer, mezo_flavor, args, mezo_state=None):
+        """
+        x_emb => [micro_batch_size, max_seq_len, embed_dim]
+        y_ids => [micro_batch_size, max_seq_len]
+        returns => float loss
+        """
+        # if optimizer == "mezo":
+        if args.tie_epsilon_to_lr_ratio>-1:
+                args.epsilon = args.tie_epsilon_to_lr_ratio * optimizer.param_groups[0]['lr']
+        if mezo_flavor == "mezo_layerwise":
+            loss_val= mezo_char_layerwise(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
+        elif mezo_flavor == "mezo_rolling": 
+            loss_val = mezo_char_single_rolling(model, x_emb, y_ids, criterion, mezo_state)
 
+        elif mezo_flavor == "mezo_single":
+            loss_val= mezo_char_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
+        # else:
+        #     raise Exception("No flavor")
+            
+    
+        else:
+            model.train()
+            optimizer.zero_grad()
+            # out, _, _= model(x_emb)
+            # B,L,V= out.size()
+            # loss= criterion(out.view(B*L, V), y_ids.view(B*L))
+            loss = teacher_forcing_loss_emb(model, x_emb, y_ids, criterion)
+            loss.backward()
+            loss_val= loss.item()
+        return loss_val
 ##############################################################################
 # Main
 ##############################################################################
@@ -2160,6 +2373,8 @@ def main():
     args= parser.parse_args()
 
     verbose = False 
+
+    
     
     total_samples_per_iter = args.micro_batch_size* args.macro_batch_size
 
@@ -2185,8 +2400,28 @@ def main():
         print("[INFO] Using CPU")
 
     # build vocab
-    vocab_list, char_to_id, id_to_char= get_char_vocab()
+    vocab_list, char_to_id, id_to_char = get_char_vocab()
     vocab_size= len(vocab_list)
+
+    if args.optimizer == "sgd":
+        mezo_flavor = "sgd"
+    else:
+        mezo_flavor = args.mezo_flavor
+        
+    vram_stats = calculate_vram_usage_direct(
+        args.arch,
+        args.hidden_size,
+        args.memory_size,
+        args.head_size,
+        args.num_heads,
+        args.input_size,
+        vocab_size,
+        args.micro_batch_size,
+        args.input_sample_length,
+        mezo_flavor,
+        True
+    )
+    total_estimated_vram_gb = vram_stats["total_estimated_gb"]
 
     # embed
     # embed= nn.Embedding(vocab_size, args.input_size, padding_idx=0).to(device)
@@ -2209,42 +2444,41 @@ def main():
         model = TransformerMemoryNTM(args.input_size, vocab_size, args.hidden_size, args.memory_size, args.head_size, args.num_heads, embed).to(device)    
     elif args.arch == "simplelstm":
         model = SimpleLSTM(args.input_size, vocab_size, args.hidden_size, embed).to(device)  
-    else:
-        model = Transformer(args.input_size, vocab_size, args.hidden_size, embed).to(device)
-
-
-    def train_micro_batch(x_emb, y_ids, mezo_state=None):
-        """
-        x_emb => [micro_batch_size, max_seq_len, embed_dim]
-        y_ids => [micro_batch_size, max_seq_len]
-        returns => float loss
-        """
-        if args.optimizer == "mezo":
+    else: # "tra"
+        model = Transformer(args.input_size, vocab_size, args.hidden_size, args.memory_size, args.head_size, args.num_heads, embed).to(device) 
+        
+    # def train_micro_batch(x_emb, y_ids, mezo_state=None):
+    #     """
+    #     x_emb => [micro_batch_size, max_seq_len, embed_dim]
+    #     y_ids => [micro_batch_size, max_seq_len]
+    #     returns => float loss
+    #     """
+    #     if args.optimizer == "mezo":
             
-            if args.tie_epsilon_to_lr_ratio>-1:
-                # if we have this bigger than default we will override epsilon by the weight tying amount. My suspicion is that its a ratio that matters. Like 1, 2 or 10.  
-                args.epsilon = args.tie_epsilon_to_lr_ratio * optimizer.param_groups[0]['lr']
-            if args.mezo_flavor == "mezo_layerwise":
-                loss_val= mezo_char_layerwise(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
-            elif args.mezo_flavor == "mezo_rolling": 
-                loss_val = mezo_char_single_rolling(model, x_emb, y_ids, criterion, mezo_state)
+    #         if args.tie_epsilon_to_lr_ratio>-1:
+    #             # if we have this bigger than default we will override epsilon by the weight tying amount. My suspicion is that its a ratio that matters. Like 1, 2 or 10.  
+    #             args.epsilon = args.tie_epsilon_to_lr_ratio * optimizer.param_groups[0]['lr']
+    #         if args.mezo_flavor == "mezo_layerwise":
+    #             loss_val= mezo_char_layerwise(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
+    #         elif args.mezo_flavor == "mezo_rolling": 
+    #             loss_val = mezo_char_single_rolling(model, x_emb, y_ids, criterion, mezo_state)
     
-            elif args.mezo_flavor == "mezo_single":
-                loss_val= mezo_char_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
-            else:
-                raise Exception("No flavor")
+    #         elif args.mezo_flavor == "mezo_single":
+    #             loss_val= mezo_char_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
+    #         else:
+    #             raise Exception("No flavor")
             
     
-        else:
-            model.train()
-            optimizer.zero_grad()
-            # out, _, _= model(x_emb)
-            # B,L,V= out.size()
-            # loss= criterion(out.view(B*L, V), y_ids.view(B*L))
-            loss = teacher_forcing_loss_emb(model, x_emb, y_ids, criterion)
-            loss.backward()
-            loss_val= loss.item()
-        return loss_val
+    #     else:
+    #         model.train()
+    #         optimizer.zero_grad()
+    #         # out, _, _= model(x_emb)
+    #         # B,L,V= out.size()
+    #         # loss= criterion(out.view(B*L, V), y_ids.view(B*L))
+    #         loss = teacher_forcing_loss_emb(model, x_emb, y_ids, criterion)
+    #         loss.backward()
+    #         loss_val= loss.item()
+    #     return loss_val
     
     # build optimizer
     params= list(model.parameters())+ list(embed.parameters())
@@ -2276,10 +2510,12 @@ def main():
     # track time
     train_start_time= time.time()
     consecutive_succ=0
+    gen_efficiency_token = 0
+    gen_efficiency_sample = 0
     
    
-    
-    current_context_len = 1 
+    minimum_starting_point_context_length = 1
+    current_context_len = minimum_starting_point_context_length
     current_max_num= 15 # used only in arithmetic functions
 
     # lets make sure the user knows how the curriculum works
@@ -2308,13 +2544,17 @@ def main():
         iteration+=1
         iter_start_time= time.time()
         
-
         # generate data
         # we do a curriculum for train
-        this_sample_context_length = 1+np.random.randint(0,max(1,current_context_len)) # always at least generate 1.
+        this_sample_context_length = 1 + np.random.randint( 
+                                            minimum_starting_point_context_length, 
+                                            max(1,current_context_len+1)
+                        ) # always at least generate 1.
+        
         this_sample_max_num = 1+np.random.randint(0,max(1,current_max_num)) # always at least generate 1.
         x_strs, y_strs= generate_task_data(total_samples_per_iter, args.task,
-                                           this_sample_context_length, this_sample_max_num,
+                                           this_sample_context_length,
+                                           this_sample_max_num,
                                            train=True)
 
         model.zero_grad()
@@ -2343,8 +2583,8 @@ def main():
             y_ids= str_to_tensor(cur_y, char_to_id).to(device)
             x_emb= embed(x_ids)
             
-                
-            loss_val= train_micro_batch(x_emb, y_ids, mezo_state)
+            loss_val = train_micro_batch(model,x_emb, y_ids, criterion, optimizer, mezo_flavor, args, mezo_state)
+            
             micro_loss_sum+= loss_val
 
             if verbose:
@@ -2425,7 +2665,7 @@ def main():
         
         msg= (f"Iter={iteration}, train_loss={train_loss_mezo:.3f}, "
               f"LR={lr_current:.6f}, eps={args.epsilon:.6f}, iter_time={iteration_time:.2f}s, total_time={total_elapsed/60:.2f}m, "
-              f"context_len={current_context_len}, max_num={current_max_num}")
+              f"context_len={current_context_len}, max_num={current_max_num}, gen_eff_token={gen_efficiency_token}, gen_eff_sample={gen_efficiency_sample}")
 
         print(msg)
         sys.stdout.flush()
@@ -2475,9 +2715,9 @@ def main():
                     print("="*30)
     
                     # Generate Val Samples that are hold out numbers and seq length
-                    this_sample_context_length_for_val = 1+np.random.randint(args.input_sample_length, args.input_sample_length*5)
+                    this_sample_context_length_for_val = 1+np.random.randint(args.input_sample_length, args.input_sample_length+5)
         
-                    this_sample_max_num_for_val = 1+np.random.randint(0,max(args.max_num,args.max_num*5)) # always at least generate 1.
+                    this_sample_max_num_for_val = 1+np.random.randint(0,max(args.max_num,args.max_num+5)) # always at least generate 1.
                     
                     # TODO, maybe this should be different? can update later if we want
                     val_samples = total_samples_per_iter 
@@ -2531,21 +2771,6 @@ def main():
                         y_ids=vy_ids
                     )
 
-            # we need this to accumulate grad so we can see the backprop impact on VRAM 
-            if False:
-                vram_usage = vram_usage = calculate_vram_usage(model, 
-                                                           train_micro_batch, 
-                                                           vx_emb, 
-                                                           vy_ids, 
-                                                           optimizer, 
-                                                           criterion,
-                                                           optimizer_type = args.optimizer,
-                                                           mezo_flavor = args.mezo_flavor
-                                                           )
-            else:
-                vram_usage = 32
-            print("\n[VRAM USAGE STATS]:")
-            print(vram_usage)
             # For debugging, let's print a few val random samples
             sample_indices= random.sample(range(B2), min(3,B2))
             print("\n[DEBUG] Random Val Samples:")
@@ -2558,6 +2783,7 @@ def main():
                 print(f"    Generated: '{generated_strs[idx]}'")
                 print(f"    Token IDs: {gen_ids_batch[idx]}")
                 print(f"    Probabilities: {probs_batch[idx]}")
+                
     
                 # If you want to see raw token IDs:
                 # print(f"    gen_ids_batch[idx] = {gen_ids_batch[idx]}")
@@ -2565,8 +2791,17 @@ def main():
                 # If you'd like to see probabilities for newly generated tokens:
                 # print(f"    probs_batch[idx] = {probs_batch[idx]}")
 
-
+            gen_efficiency_token = val_gen_acc * 100.0 / (total_estimated_vram_gb * (total_elapsed / 3600.0))
+            gen_efficiency_sample = val_gen_acc_sample * 100.0 / (total_estimated_vram_gb * (total_elapsed / 3600.0))
             print(f"Generation loss: {val_gen_loss}, Generation accuracy: {val_gen_acc}, Generation sample accuracy: {val_gen_acc_sample}")
+            print(f"Generalization Efficiency:")
+            print(f"    VRAM: {total_estimated_vram_gb}")
+            print(f"    Wall-Clock Hrs: {total_elapsed / 3600.0}")
+            print(f"    val_gen_acc: {val_gen_acc}")
+            print(f"    val_gen_acc_sample: {val_gen_acc_sample}")
+            print(f"    Gen Eff (token): {gen_efficiency_token}")
+            print(f"    Gen Eff (sample): {gen_efficiency_sample}")
+                
             print("="*30)
             print("="*30)
 
@@ -2603,17 +2838,25 @@ def main():
                     "val_loss": val_loss.item(),        # teacher-forced
                     "val_gen_loss": val_gen_loss,       # from generation
                     "val_gen_acc": val_gen_acc,
+                    "total_estimated_vram_gb":total_estimated_vram_gb,
+                    "gen_efficiency_token":gen_efficiency_token,
+                    "gen_efficiency_sample":gen_efficiency_sample,
                     "weight_decay_loss": weight_decay_loss.item(),
                     # "vram_usage":vram_usage,
                 }
                 print("="*30)
                 print("VAL STATS")
                 print(msg)
-                # wandb.log(msg, step=iteration)
+                try:
+                    # wandb.log(msg, step=iteration)
+    
+                    # Log metrics to Neptune with the current iteration as the step
+                    for key, value in msg.items():
+                        run[f"{key}"].log(value, step=iteration)
+                except Exception as e:
+                        print(f"Neptune logging failed at iteration {iteration}. Error: {str(e)}")
 
-                # Log metrics to Neptune with the current iteration as the step
-                for key, value in msg.items():
-                    run[f"train/{key}"].log(value, step=iteration)
+                    
 
 
 
