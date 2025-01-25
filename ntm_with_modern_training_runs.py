@@ -13,12 +13,16 @@ NTM/DNC/Transformer code with ASCII tasks, plus:
  - MeZO now uses momentum from the chosen optimizer (e.g. Adam) by setting param.grad, not param.data
  - A simple curriculum for 'copy' and 'add' tasks
 """
-
+# from mongo_wandb import *
 import os
 os.environ["WANDB_API_KEY"] = ""
 
-neptune_api_token = ""
+# neptune_api_token = ""
+# db_url = ""
+# db_name="wandb"
+# db_project="MeZORNN"
 
+import pdb
 import sys
 import math
 import random
@@ -60,86 +64,86 @@ def pick_gpu_with_most_free_mem() -> int:
 import torch
 from torch.optim import Adam
 # Key issues and fixes for VRAM calculation
-def calculate_vram_usage(model, train_micro_batch, x_emb, y_ids, optimizer, criterion, optimizer_type = "sgd",
-                                                               mezo_flavor = None):
-    """
-    Calculate the max VRAM usage of a model during training, with detailed breakdown for different optimizers.
+# def calculate_vram_usage(model, train_micro_batch, x_emb, y_ids, optimizer, criterion, optimizer_type = "sgd",
+#                                                                mezo_flavor = None):
+#     """
+#     Calculate the max VRAM usage of a model during training, with detailed breakdown for different optimizers.
 
-    Args:
-        model (torch.nn.Module): The model to analyze.
-        train_micro_batch (function): The training function (e.g., train_micro_batch).
-        x_emb (torch.Tensor): Input embeddings for the micro-batch.
-        y_ids (torch.Tensor): Target IDs for the micro-batch.
-        optimizer being used
-        optimizer_type SGD or Mezo
-        mezo_flavor single or layerwise
+#     Args:
+#         model (torch.nn.Module): The model to analyze.
+#         train_micro_batch (function): The training function (e.g., train_micro_batch).
+#         x_emb (torch.Tensor): Input embeddings for the micro-batch.
+#         y_ids (torch.Tensor): Target IDs for the micro-batch.
+#         optimizer being used
+#         optimizer_type SGD or Mezo
+#         mezo_flavor single or layerwise
 
-    Returns:
-        dict: A dictionary with detailed VRAM usage statistics.
-    """
-    assert torch.cuda.is_available(), "CUDA is required for this calculation."
+#     Returns:
+#         dict: A dictionary with detailed VRAM usage statistics.
+#     """
+#     assert torch.cuda.is_available(), "CUDA is required for this calculation."
 
-    # Detect the current device of the model
-    device = next(model.parameters()).device
+#     # Detect the current device of the model
+#     device = next(model.parameters()).device
     
-    # move the model to cpu for a second
-    model = model.to('cpu')
-    x_emb = x_emb.to('cpu')
-    # Clean up
-    torch.cuda.empty_cache()
+#     # move the model to cpu for a second
+#     model = model.to('cpu')
+#     x_emb = x_emb.to('cpu')
+#     # Clean up
+#     #torch.cuda.empty_cache()
     
-    # Initialize CUDA memory tracking
-    torch.cuda.reset_peak_memory_stats(device)
-    baseline_vram = torch.cuda.memory_allocated(device)  # VRAM used by other processes
+#     # Initialize CUDA memory tracking
+#     torch.cuda.reset_peak_memory_stats(device)
+#     baseline_vram = torch.cuda.memory_allocated(device)  # VRAM used by other processes
 
-    # move the model back to this gpu
-    model = model.to(device)
-    x_emb = x_emb.to(device)
+#     # move the model back to this gpu
+#     model = model.to(device)
+#     x_emb = x_emb.to(device)
 
-    # Measure VRAM for forward pass
-    torch.cuda.reset_peak_memory_stats(device)
-    loss_val = None
+#     # Measure VRAM for forward pass
+#     torch.cuda.reset_peak_memory_stats(device)
+#     loss_val = None
     
-    if optimizer_type == "mezo":
+#     if optimizer_type == "mezo":
         
-        if mezo_flavor == "mezo_layerwise":
-            loss_val = mezo_char_layerwise(model, x_emb, y_ids, criterion, epsilon=0.001)
-        elif mezo_flavor == "mezo_single":
-            loss_val = mezo_char_single(model, x_emb, y_ids, criterion, epsilon=0.001)
-        else:
-            raise Exception("Invalid MeZO flavor")
-        forward_vram = torch.cuda.max_memory_allocated(device) - baseline_vram
-        backward_vram = 0 # there is no backward pass
-    else:
-        # Traditional optimizer training
-        optimizer.zero_grad()
-        loss = teacher_forcing_loss_emb(model, x_emb, y_ids, criterion)
-        forward_vram = torch.cuda.max_memory_allocated(device) - baseline_vram
+#         if mezo_flavor == "mezo_layerwise":
+#             loss_val = mezo_char_layerwise(model, x_emb, y_ids, criterion, epsilon=0.001)
+#         elif mezo_flavor == "mezo_single":
+#             loss_val = mezo_char_single(model, x_emb, y_ids, criterion, epsilon=0.001)
+#         else:
+#             raise Exception("Invalid MeZO flavor")
+#         forward_vram = torch.cuda.max_memory_allocated(device) - baseline_vram
+#         backward_vram = 0 # there is no backward pass
+#     else:
+#         # Traditional optimizer training
+#         optimizer.zero_grad()
+#         loss = teacher_forcing_loss_emb(model, x_emb, y_ids, criterion, backward=True)
+#         forward_vram = torch.cuda.max_memory_allocated(device) - baseline_vram
 
-        # Measure VRAM for backward pass
-        torch.cuda.reset_peak_memory_stats(device)
-        loss.backward()
-        backward_vram = torch.cuda.max_memory_allocated(device) - baseline_vram
+#         # Measure VRAM for backward pass
+#         torch.cuda.reset_peak_memory_stats(device)
+#         loss.backward()
+#         backward_vram = torch.cuda.max_memory_allocated(device) - baseline_vram
 
-    torch.cuda.reset_peak_memory_stats(device)
-    optimizer.step()  # Perform the step with zero learning rate (no actual update)
-    optimizer.zero_grad()
-    optimizer_vram = torch.cuda.max_memory_allocated(device) - baseline_vram
+#     torch.cuda.reset_peak_memory_stats(device)
+#     optimizer.step()  # Perform the step with zero learning rate (no actual update)
+#     optimizer.zero_grad()
+#     optimizer_vram = torch.cuda.max_memory_allocated(device) - baseline_vram
 
     
-    # Record peak memory usage across all phases
-    peak_vram = torch.cuda.max_memory_allocated(device) - baseline_vram
+#     # Record peak memory usage across all phases
+#     peak_vram = torch.cuda.max_memory_allocated(device) - baseline_vram
     
-    # Clean up
-    torch.cuda.empty_cache()
+#     # Clean up
+#     #torch.cuda.empty_cache()
 
-    return {
-        "forward_vram_GB": forward_vram / (1024 ** 3),
-        "backward_vram_GB": backward_vram / (1024 ** 3),
-        "optimizer_vram_GB": optimizer_vram / (1024 ** 3),
-        "total_peak_vram_GB": peak_vram / (1024 ** 3),
-        "max_vram_GB": max(forward_vram,backward_vram,optimizer_vram) / (1024 ** 3),
-    }
+#     return {
+#         "forward_vram_GB": forward_vram / (1024 ** 3),
+#         "backward_vram_GB": backward_vram / (1024 ** 3),
+#         "optimizer_vram_GB": optimizer_vram / (1024 ** 3),
+#         "total_peak_vram_GB": peak_vram / (1024 ** 3),
+#         "max_vram_GB": max(forward_vram,backward_vram,optimizer_vram) / (1024 ** 3),
+#     }
 
 
 
@@ -150,30 +154,59 @@ def calculate_vram_usage(model, train_micro_batch, x_emb, y_ids, optimizer, crit
 # ASCII Vocab + Tokenizer (with <bos> and <eos>)
 ##############################################################################
 
+# def get_char_vocab():
+#     """
+#     Defines a character vocabulary with:
+#       - Special tokens: <PAD>, <bos>, <eos>, <UNK>
+#       - Digits: 0..9
+#       - Uppercase and lowercase letters: A..Z, a..z
+#       - Operators: + - * / =
+#       - Other symbols: space and '|'
+#     """
+#     special = ['<PAD>', '<bos>', '<eos>', '<UNK>']  # Add <UNK>
+#     digits = list(string.digits)
+#     letters_upper = list(string.ascii_uppercase)
+#     letters_lower = list(string.ascii_lowercase)
+#     operators = ['+', '-', '*', '/', '=', ' ', '|']
+
+#     # Combine all into the vocabulary list
+#     vocab_list = special + digits + letters_upper + letters_lower + operators
+
+#     # Create mapping dictionaries
+#     char_to_id = {ch: i for i, ch in enumerate(vocab_list)}
+#     id_to_char = {i: ch for i, ch in enumerate(vocab_list)}
+
+#     return vocab_list, char_to_id, id_to_char
+
 def get_char_vocab():
-    """
-    Defines a character vocabulary with:
-      - Special tokens: <PAD>, <bos>, <eos>, <UNK>
-      - Digits: 0..9
-      - Uppercase and lowercase letters: A..Z, a..z
-      - Operators: + - * / =
-      - Other symbols: space and '|'
-    """
-    special = ['<PAD>', '<bos>', '<eos>', '<UNK>']  # Add <UNK>
-    digits = list(string.digits)
-    letters_upper = list(string.ascii_uppercase)
-    letters_lower = list(string.ascii_lowercase)
-    operators = ['+', '-', '*', '/', '=', ' ', '|']
-
-    # Combine all into the vocabulary list
-    vocab_list = special + digits + letters_upper + letters_lower + operators
-
+    # Special tokens
+    special = ['<PAD>', '<bos>', '<eos>', '<UNK>']
+    
+    # Numbers row (non-shifted and shifted)
+    numbers = list('1234567890')
+    numbers_shifted = list('!@#$%^&*()')
+    
+    # Letter rows
+    letters = list(string.ascii_lowercase)  # a-z
+    letters_upper = list(string.ascii_uppercase)  # A-Z
+    
+    # Keyboard rows with symbols (non-shifted)
+    symbols = list('`-=[]\\;\',./')
+    # Shifted versions of those symbols
+    symbols_shifted = list('~_+{}|:"<>?')
+    
+    # Space and tab
+    whitespace = [' ', '\t']
+    
+    # Combine all into vocabulary list
+    vocab_list = (numbers + special + numbers_shifted + letters + 
+                 letters_upper + symbols + symbols_shifted + whitespace)
+    
     # Create mapping dictionaries
     char_to_id = {ch: i for i, ch in enumerate(vocab_list)}
     id_to_char = {i: ch for i, ch in enumerate(vocab_list)}
-
+    
     return vocab_list, char_to_id, id_to_char
-
 
 def calculate_vram_usage_direct(
     arch: str,
@@ -403,7 +436,7 @@ def str_to_tensor(batch_strs, char_to_id):
     # 4) Fill in the token IDs
     for i, tokens in enumerate(token_lists):
         for j, tok in enumerate(tokens):
-            out[i, j] = char_to_id.get(tok, 0)
+            out[i, j] = char_to_id.get(tok, char_to_id["<UNK>"])
 
     return out
 
@@ -445,6 +478,84 @@ def shift_by_one_pairs(x_str, y_str):
 ##############################################################################
 # Task Generators
 ##############################################################################
+import random
+from datasets import load_dataset
+
+
+# OWT open web text 
+def generate_openwebtext_task_str(
+    num_samples: int,
+    context_length: int,
+    max_n=None,   # unused in OWT, but we keep the signature to match the others
+    train: bool = True,
+    min_total_seq_len=100,
+    vebose=False
+):
+    split_name = "train" if train else "validation"
+    ds = load_dataset("haritzpuerto/the_pile_00_OpenWebText2", split=split_name, cache_dir = "/hf_cache/")
+    size_of_ds = len(ds)
+    in_list = []
+    out_list = []
+    
+    while len(in_list) < num_samples:
+        # Keep trying docs until we find one that meets our length requirement
+        max_tries = 100  # Avoid infinite loop
+        tries = 0
+        valid_doc = False
+        
+        while not valid_doc and tries < max_tries:
+            doc_idx = random.randint(0, size_of_ds - 1)
+            doc = ds[doc_idx]
+            text = doc["text"] if doc["text"] else ""
+            
+            # Calculate total sequence length including special tokens
+            # Length will be: len(<bos> + prefix) + len(remainder + <eos>)
+            # = 5 + len(text) [5 comes from <bos> and <eos>]
+            total_seq_len = len(text) + 5  # +5 for <bos> and <eos>
+            
+            if total_seq_len >= min_total_seq_len and total_seq_len<70000: # crazy large number
+                valid_doc = True
+            else:
+                tries += 1
+        
+        # If we couldn't find a long enough doc after max_tries,
+        # pad the last one we found
+        if not valid_doc:
+            needed = min_total_seq_len - total_seq_len
+            text = text + (" " * needed)
+            
+        # Now ensure text is at least context_length
+        if len(text) < context_length:
+            needed = context_length - len(text)
+            text = text + (" " * needed)
+            
+        # Split into prefix and remainder
+        prefix = text[:context_length]
+        remainder = text[context_length:]
+        
+        # Create input and target strings
+        input_str = f"<bos>{prefix}"
+        target_str = f"{remainder}<eos>"
+        
+        in_list.append(input_str)
+        out_list.append(target_str)
+        
+    # Debug prints
+    if vebose:
+        min_in_len = min(len(i) for i in in_list)
+        min_out_len = min(len(i) for i in out_list)
+        max_in_len = max(len(i) for i in in_list)
+        max_out_len = max(len(i) for i in out_list)
+    
+        print(f"Sequence length stats:")
+        print(f"Input lengths: min={min_in_len}, max={max_in_len}")
+        print(f"Output lengths: min={min_out_len}, max={max_out_len}")
+        print(f"Min total lengths: {[len(i) + len(j) for i,j in zip(in_list, out_list)]}")
+
+    return in_list, out_list
+
+
+
 def generate_reverse_task_str(num_samples, input_sample_length, train=True):
     """
     Generates data for the reverse task.
@@ -1615,48 +1726,48 @@ def group_params_by_layer(named_params):
         layer_dict[layer_name].append((name, p))
     return layer_dict
 
-import pdb
-def teacher_forcing_loss_emb(model, x_emb, y_ids_unpadded, criterion, teacher_force=True):
-    """
-    Teacher-forcing loss for step-by-step sequence generation.
+
+# def teacher_forcing_loss_emb(model, x_emb, y_ids_unpadded, criterion, teacher_force=True):
+#     """
+#     Teacher-forcing loss for step-by-step sequence generation.
     
-    Args:
-        model (nn.Module): The sequence-to-sequence model.
-        x_emb (torch.Tensor): [B, Lx, E], embedded input sequence.
-        y_ids (torch.LongTensor): [B, Ly], token IDs for the target sequence.
-        criterion (nn.Module): Loss function (e.g., CrossEntropyLoss).
+#     Args:
+#         model (nn.Module): The sequence-to-sequence model.
+#         x_emb (torch.Tensor): [B, Lx, E], embedded input sequence.
+#         y_ids (torch.LongTensor): [B, Ly], token IDs for the target sequence.
+#         criterion (nn.Module): Loss function (e.g., CrossEntropyLoss).
 
-    Returns:
-        torch.Tensor: Average loss per token.
-    """
-    B, Lx, E = x_emb.size()
-    # y_ids_trimmed = [y[y != 0] for y in y_ids]
-    # y_ids_unpadded = pad_sequence(y_ids_trimmed, batch_first=True, padding_value=0)
+#     Returns:
+#         torch.Tensor: Average loss per token.
+#     """
+#     B, Lx, E = x_emb.size()
+#     # y_ids_trimmed = [y[y != 0] for y in y_ids]
+#     # y_ids_unpadded = pad_sequence(y_ids_trimmed, batch_first=True, padding_value=0)
 
-    Ly = y_ids_unpadded.size(1)
-    device = x_emb.device
+#     Ly = y_ids_unpadded.size(1)
+#     device = x_emb.device
 
 
-    # Initialize hidden states
-    hidden = None
-    memory = None
+#     # Initialize hidden states
+#     hidden = None
+#     memory = None
 
-    y_emb_input = model.embed(y_ids_unpadded)[:, :-1, :]  # shape [B, L_y-1, E]
+#     y_emb_input = model.embed(y_ids_unpadded)[:, :-1, :]  # shape [B, L_y-1, E]
 
-    # Concatenate input and partial target
-    # e.g. shape [B, L_x + (L_y-1), E]
-    full_input = torch.cat([x_emb, y_emb_input], dim=1)
+#     # Concatenate input and partial target
+#     # e.g. shape [B, L_x + (L_y-1), E]
+#     full_input = torch.cat([x_emb, y_emb_input], dim=1)
     
-    # Now feed this entire sequence to the LSTM "in one shot"
-    outputs, _, (h, c) = model(full_input)  # shape of outputs is [B, L_x + (L_y - 1), something]
-    logits = outputs[:, Lx-1:, :].contiguous()  # Get predictions starting from after input sequence
-    logits = logits.view(-1, logits.size(-1))  # [batch_size * seq_len, num_classes]
+#     # Now feed this entire sequence to the LSTM "in one shot"
+#     outputs, _, (h, c) = model(full_input)  # shape of outputs is [B, L_x + (L_y - 1), something]
+#     logits = outputs[:, Lx-1:, :].contiguous()  # Get predictions starting from after input sequence
+#     logits = logits.view(-1, logits.size(-1))  # [batch_size * seq_len, num_classes]
     
-    # Reshape targets
-    targets = y_ids_unpadded.contiguous().view(-1)  # [batch_size * seq_len]
+#     # Reshape targets
+#     targets = y_ids_unpadded.contiguous().view(-1)  # [batch_size * seq_len]
     
-    total_loss = criterion(logits, targets)
-    return total_loss/Ly 
+#     total_loss = criterion(logits, targets)
+#     return total_loss/Ly 
 
 
     # # # Forward input sequence step-by-step
@@ -1700,7 +1811,265 @@ def teacher_forcing_loss_emb(model, x_emb, y_ids_unpadded, criterion, teacher_fo
     #     logits, memory, hidden = model(target_t_emb, hidden=hidden, memory=memory) # TODO, hidden may need a transpose?
 
     # Average loss across all valid tokens
-    return total_loss/Ly #  / num_tokens if num_tokens > 0 else 0.0
+#    return total_loss/Ly #  / num_tokens if num_tokens > 0 else 0.0
+
+
+
+# def teacher_forcing_loss_emb(
+#     model,
+#     x_emb,          # [B, Lx, E] embedded input
+#     y_ids_unpadded, # [B, Ly] target IDs
+#     criterion,
+#     chunk_size=256*8
+# ):
+#     """
+#     A "chunked" teacher-forcing approach that avoids storing large outputs.
+#     Instead of feeding (x_emb + y_emb_input) all at once, we break it
+#     into smaller chunks (up to `chunk_size` tokens each) and process them
+#     in a rolling fashion, carrying over (hidden, memory) between chunks.
+
+#     - The first (Lx-1) frames are "input frames" only and do not produce
+#       predictions. After that, frames produce predictions that map to `y_ids_unpadded`.
+#     - We accumulate cross-entropy chunk by chunk, skipping the frames
+#       that belong to the "input only" region. 
+#     - This avoids OOM for very large sequences, 
+#       and also avoids storing a big `outputs_list` in VRAM.
+
+#     Returns:
+#         avg_loss: the total cross-entropy over all predicted tokens,
+#                   divided by the total # of predicted tokens (i.e. Ly).
+#     """
+
+#     B, Lx, E = x_emb.shape         # x_emb is [B, Lx, E]
+#     Ly = y_ids_unpadded.shape[1]   # y_ids_unpadded is [B, Ly]
+
+#     # Build the teacher-forcing partial input for the target side
+#     y_emb_input = model.embed(y_ids_unpadded)[:, :-1, :]  # shape [B, Ly-1, E]
+#     # The full input is x_emb + partial target embeddings, total length = Lx + (Ly - 1)
+#     full_input = torch.cat([x_emb, y_emb_input], dim=1)   
+#     full_len = full_input.size(1)  # Lx + (Ly - 1)
+
+#     # We'll do a rolling forward pass, chunk by chunk
+#     hidden = None
+#     memory = None
+
+#     # We'll accumulate cross-entropy in a running sum
+#     total_loss = 0.0
+#     total_predicted_tokens = 0
+
+#     pos = 0
+#     while pos < full_len:
+#         chunk_end = min(pos + chunk_size, full_len)
+#         input_chunk = full_input[:, pos:chunk_end, :]  # shape [B, chunk_len, E]
+#         chunk_len = input_chunk.size(1)
+
+#         out_chunk, mem_new, hidden_new = model(
+#             input_chunk, hidden=hidden, memory=memory
+#         )
+#         # out_chunk has shape [B, chunk_len, vocab_size or something]
+
+#         # Update hidden/memory for next chunk
+#         hidden = hidden_new
+#         memory = mem_new
+
+#         # ----------------------------------------------------------
+#         # Determine how many frames in this chunk correspond to *predictions*
+#         # We skip the frames from the "input only" region if pos < Lx-1.
+#         # The first (Lx-1) frames do not produce predictions.
+#         # local_pred_start = how many frames in this chunk are "input only"?
+#         # E.g. if pos=0 and Lx-1=10, chunk_len=8 => local_pred_start= max(0, 10 - 0)=10, but that's >8 => no predictions
+#         # The portion from local_pred_start.. chunk_len are valid predicted frames in out_chunk.
+#         # local_pred_start = max(0, (Lx - 1) - pos).
+#         #
+#         local_pred_start = max(0, (Lx - 1) - pos)
+#         local_pred_len = chunk_len - local_pred_start
+
+#         if local_pred_len > 0:
+#             # out_chunk_pred => [B, local_pred_len, vocab_size]
+#             out_chunk_pred = out_chunk[:, local_pred_start:, :]
+
+#             # Flatten for the criterion
+#             out_chunk_pred = out_chunk_pred.reshape(B * local_pred_len, -1)
+
+#             # Now find the corresponding targets in y_ids_unpadded
+#             # The global predicted frames are from [pos + local_pred_start .. pos + chunk_len).
+#             # But the first (Lx-1) frames do not produce a target => 
+#             # effectively, target offset in y is 
+#             #   startY = (pos + local_pred_start) - (Lx -1)
+#             #   endY   = (pos + chunk_len)         - (Lx -1)
+#             # We clamp these to [0.. Ly] because the model only predicts Ly tokens in total.
+#             global_startY = (pos + local_pred_start) - (Lx - 1)
+#             global_endY   = (pos + chunk_len)         - (Lx - 1)
+
+#             # clamp
+#             global_startY_clamped = max(0, global_startY)
+#             global_endY_clamped   = min(Ly, global_endY)
+
+#             # The # of tokens we actually have here
+#             actual_lenY = global_endY_clamped - global_startY_clamped
+
+#             if actual_lenY > 0:
+#                 # The corresponding slice of y_ids_unpadded is [ global_startY_clamped : global_endY_clamped ]
+#                 targets_slice = y_ids_unpadded[:, global_startY_clamped : global_endY_clamped]
+#                 # Flatten
+#                 targets_slice = targets_slice.reshape(-1)
+
+#                 # If there's a mismatch in shape vs. out_chunk_pred => we might need to slice out_chunk_pred further
+#                 # because local_pred_len might exceed actual_lenY if the doc ended.
+#                 # So let's also clamp out_chunk_pred if actual_lenY < local_pred_len
+#                 # difference = local_pred_len - actual_lenY
+#                 if actual_lenY < local_pred_len:
+#                     # out_chunk_pred has shape [B * local_pred_len, vocab]
+#                     # we want only the first B*actual_lenY
+#                     needed_elems = B * actual_lenY
+#                     out_chunk_pred = out_chunk_pred[:needed_elems, :]
+
+#                 # Compute partial cross-entropy
+#                 partial_loss = criterion(out_chunk_pred, targets_slice)
+
+#                 total_loss += partial_loss * actual_lenY  # sum of losses
+#                 total_predicted_tokens += actual_lenY
+
+#         pos = chunk_end  # move on
+
+#     # end while
+
+#     if total_predicted_tokens == 0:
+#         # Means the entire input was smaller than (Lx-1), or we had no valid prediction frames
+#         # Return 0 to avoid dividing by zero
+#         return 0.0
+
+#     # average cross-entropy across all predicted tokens
+#     avg_loss = total_loss / total_predicted_tokens
+#     return avg_loss
+
+def teacher_forcing_loss_emb(model, x_emb, y_ids_unpadded, criterion, chunk_size=32, backward=False):
+    B, Lx, E = x_emb.shape
+    Ly = y_ids_unpadded.shape[1]
+
+    hidden = None
+    memory = None
+    total_loss = 0.0
+    total_predicted_tokens = 0
+    
+    # Process input sequence first
+    pos = 0
+    while pos < Lx:
+        chunk_end = min(pos + chunk_size, Lx)
+        input_chunk = x_emb[:, pos:chunk_end, :]
+        
+        out_chunk, mem_new, hidden_new = model(input_chunk, hidden=hidden, memory=memory)
+        hidden = hidden_new
+        memory = mem_new
+        pos = chunk_end
+
+    # Now process target sequence chunk by chunk
+    pos = 0
+    while pos < Ly - 1:  # -1 because we don't embed the last target token
+        chunk_end = min(pos + chunk_size, Ly - 1)
+        # Only embed the current chunk of target sequence
+        y_chunk = y_ids_unpadded[:, pos:chunk_end]
+        y_emb_chunk = model.embed(y_chunk)
+        
+        out_chunk, mem_new, hidden_new = model(y_emb_chunk, hidden=hidden, memory=memory)
+        
+        # Update states
+        hidden = hidden_new
+        memory = mem_new
+
+        # Compute loss for this chunk
+        out_chunk = out_chunk.reshape(-1, out_chunk.size(-1))
+        targets = y_ids_unpadded[:, pos+1:chunk_end+1].reshape(-1)  # shift by 1 for next-token prediction
+        
+        if targets.size(0) > 0:  # ensure we have targets
+            chunk_loss = criterion(out_chunk, targets)
+            # if backward:
+            #     chunk_loss.backward()
+            total_loss += chunk_loss * targets.size(0)
+            total_predicted_tokens += targets.size(0)
+        
+        pos = chunk_end
+
+    if total_predicted_tokens == 0:
+        pdb.set_trace()
+        return 0.0
+
+    avg_loss = total_loss / total_predicted_tokens
+    return avg_loss
+
+
+
+
+def teacher_forcing_loss_emb_detatch_version(model, x_emb, y_ids_unpadded, criterion, chunk_size=256, backward=False):
+    B, Lx, E = x_emb.shape
+    Ly = y_ids_unpadded.shape[1]
+    total_loss = 0.0
+    total_predicted_tokens = 0
+    
+    # Initialize states
+    hidden = None
+    memory = None
+    
+    # Process input sequence first
+    pos = 0
+    while pos < Lx:
+        chunk_end = min(pos + chunk_size, Lx)
+        # Process input chunk
+        input_chunk = x_emb[:, pos:chunk_end, :]
+        out_chunk, mem_new, hidden_new = model(input_chunk, hidden=hidden, memory=memory)
+        
+        # Update states with detached versions
+        if isinstance(hidden_new, tuple):
+            hidden = tuple(h for h in hidden_new)
+        else:
+            hidden = hidden_new if hidden_new is not None else None
+        memory = mem_new if mem_new is not None else None
+        
+        del out_chunk, mem_new, hidden_new
+        torch.cuda.empty_cache()
+        pos = chunk_end
+
+    # Now process target sequence
+    pos = 0
+    while pos < Ly - 1:  # -1 because we predict next token
+        chunk_end = min(pos + chunk_size, Ly - 1)
+        
+        # Get target chunk
+        y_chunk = y_ids_unpadded[:, pos:chunk_end]
+        y_emb_chunk = model.embed(y_chunk)
+        
+        # Forward pass
+        out_chunk, mem_new, hidden_new = model(y_emb_chunk, hidden=hidden, memory=memory)
+        
+        # Compute loss for this chunk
+        out_chunk_flat = out_chunk.reshape(-1, out_chunk.size(-1))
+        targets = y_ids_unpadded[:, pos+1:chunk_end+1].reshape(-1)  # shift by 1 for next-token prediction
+        
+        if targets.size(0) > 0:  # ensure we have targets
+            if backward:
+                chunk_loss = criterion(out_chunk_flat, targets)
+                chunk_loss.backward()
+                total_loss += chunk_loss * targets.size(0)
+            else:
+                with torch.no_grad():
+                    chunk_loss = criterion(out_chunk_flat, targets)
+                    total_loss += chunk_loss * targets.size(0)
+            total_predicted_tokens += targets.size(0)
+        
+        # Update states with detached versions
+        if isinstance(hidden_new, tuple):
+            hidden = tuple(h.detach() for h in hidden_new)
+        else:
+            hidden = hidden_new.detach() if hidden_new is not None else None
+        memory = mem_new.detach() if mem_new is not None else None
+        
+        # Clean up
+        del out_chunk, out_chunk_flat, mem_new, hidden_new, y_emb_chunk, y_chunk
+        torch.cuda.empty_cache()
+        pos = chunk_end
+
+    return total_loss / total_predicted_tokens if total_predicted_tokens > 0 else 0.0
+
 
 
 # UNTESTED AND NOT WORKING.. JUST A ROUGH IDEA! 
@@ -1898,7 +2267,7 @@ def mezo_char_layerwise(model, x_emb, y, criterion, epsilon=1e-3):
     all_params = list(model.parameters())
     local_seed = torch.randint(0, 2**32, (1,)).item()
 
-    with torch.no_grad():
+    with torch.inference_mode():
         # Zero out old gradients
         for p in all_params:
             if p.grad is not None:
@@ -1909,11 +2278,11 @@ def mezo_char_layerwise(model, x_emb, y, criterion, epsilon=1e-3):
 
     
         for layer_name, param_list in layer_dict.items():
-            torch.cuda.empty_cache() 
+            #torch.cuda.empty_cache() 
             layer_count += 1
 
             torch.manual_seed(local_seed)
-            torch.cuda.empty_cache() 
+            #torch.cuda.empty_cache() 
             # + epsilon perturbation
             for i, (_, p) in enumerate(param_list):
                 d = torch.randn_like(p)
@@ -1922,7 +2291,7 @@ def mezo_char_layerwise(model, x_emb, y, criterion, epsilon=1e-3):
             # Forward pass for positively perturbed model
             loss_plus = teacher_forcing_loss_emb(model, x_emb, y, criterion)
 
-            torch.cuda.empty_cache() 
+            #torch.cuda.empty_cache() 
             # -2 epsilon perturbation
             torch.manual_seed(local_seed)
             for i, (_, p) in enumerate(param_list):
@@ -1934,7 +2303,7 @@ def mezo_char_layerwise(model, x_emb, y, criterion, epsilon=1e-3):
 
             # Restore original parameters
             torch.manual_seed(local_seed)
-            torch.cuda.empty_cache() 
+            #torch.cuda.empty_cache() 
             
             for i, (_, p) in enumerate(param_list):
                 d = torch.randn_like(p)
@@ -1946,7 +2315,7 @@ def mezo_char_layerwise(model, x_emb, y, criterion, epsilon=1e-3):
 
             # Accumulate gradients
             torch.manual_seed(local_seed)
-            torch.cuda.empty_cache() 
+            #torch.cuda.empty_cache() 
             
             for i, (_, p) in enumerate(param_list):
                 d = torch.randn_like(p)
@@ -1966,9 +2335,691 @@ def mezo_char_layerwise(model, x_emb, y, criterion, epsilon=1e-3):
 
 
 
+##############################################################################
+# Activity-based Node Perturbation (ANP) : NOT TESTED! TODO 
+##############################################################################
+def anp_single(model, x_emb, y, criterion, epsilon=1e-3, decorrelation_matrix=None, verbose=False):
+    """
+    Implements Activity-based Node Perturbation (ANP) for gradient-free training with decorrelation.
+
+    Args:
+        model (torch.nn.Module): The neural network model to train.
+        x_emb (torch.Tensor): Input embeddings (sequence data or feature vectors).
+        y (torch.Tensor): Ground truth labels.
+        criterion (callable): Loss function.
+        epsilon (float): Perturbation magnitude.
+        decorrelation_matrix (torch.Tensor): Decorrelation matrix to be updated and persisted across time steps.
+        verbose (bool): If True, prints detailed debug information.
+
+    Returns:
+        float: Average loss across the perturbed passes.
+        torch.Tensor: Updated decorrelation matrix.
+    """
+    with torch.no_grad():
+        if verbose:
+            print("\n=== ANP SINGLE DEBUG ===")  # Debug output header
+            print(f"Input shape: {x_emb.shape}")  # Print input tensor shape
+            print(f"Target shape: {y.shape}")  # Print target tensor shape
+    
+        # Initialize a random seed for reproducibility of perturbations
+        local_seed = torch.randint(0, 2**32, (1,)).item()  # Generate random seed
+        all_params = list(model.parameters())  # Get all model parameters
+    
+        # Ensure no gradients persist
+        for p in all_params:
+            if p.grad is not None:
+                p.grad.zero_()  # Zero out gradients
+    
+        if verbose:
+            print(f"\nRandom seed: {local_seed}")  # Print random seed
+            print("Parameter shapes:")  # Print parameter shapes for debugging
+            for i, p in enumerate(all_params):
+                if p.requires_grad:
+                    print(f"Param {i}: {p.shape}")  # Print each parameter shape
+    
+        # === Decorrelation Mechanism ===
+        if decorrelation_matrix is None:
+            decorrelation_matrix = torch.eye(x_emb.shape[-1], device=x_emb.device)  # Initialize decorrelation matrix if not provided
+    
+        def decorrelate(inputs, decorrelation_matrix):
+            # Apply decorrelation: x* = D * x
+            return torch.matmul(inputs, decorrelation_matrix)
+    
+        decorrelated_inputs = decorrelate(x_emb, decorrelation_matrix)  # Apply decorrelation to inputs
+    
+        def update_decorrelation_matrix(decorrelation_matrix, decorrelated_inputs):
+            # Update decorrelation matrix: ΔD = (x* x*^T - diag(x* x*)) D
+            batch_size, seq_len, feature_dim = decorrelated_inputs.shape
+            decorrelated_inputs_flat = decorrelated_inputs.reshape(batch_size * seq_len, feature_dim)
+            covariance = torch.matmul(decorrelated_inputs_flat.T, decorrelated_inputs_flat) / (batch_size * seq_len)
+            diagonal = torch.diag(torch.diag(covariance))
+            update = torch.matmul(covariance - diagonal, decorrelation_matrix)
+            return decorrelation_matrix - epsilon * update
+    
+        decorrelation_matrix = update_decorrelation_matrix(decorrelation_matrix, decorrelated_inputs)
+    
+        if verbose:
+            print("\nDecorrelated inputs computed and decorrelation matrix updated.")  # Debug output for decorrelation
+    
+        # === Clean Pass ===
+        if verbose:
+            print("\n=== Clean Pass ===")  # Debug output for clean pass
+    
+        outputs_clean = model(decorrelated_inputs)  # Forward pass without perturbation
+        if isinstance(outputs_clean, tuple):  # Ensure output is a tensor
+            outputs_clean = outputs_clean[0]
+        outputs_clean = outputs_clean.view(-1, outputs_clean.size(-1))  # Flatten output
+        y = y.view(-1)  # Flatten target
+        loss_clean = criterion(outputs_clean, y)  # Compute clean loss
+    
+        # Capture pre-activations during the clean pass
+        pre_activations_clean = {}
+        for name, module in model.named_modules():
+            if hasattr(module, 'weight') and module.weight.requires_grad:
+                pre_activations_clean[name] = module.weight.data.clone()
+    
+        if verbose:
+            print(f"Clean pass loss: {loss_clean.item()}")
+    
+        # === Noisy Pass ===
+        if verbose:
+            print("\n=== Noisy Pass ===")  # Debug output for noisy pass
+    
+        torch.manual_seed(local_seed)  # Reset the seed for reproducibility
+    
+        pre_activation_differences = {}
+        for i, (name, module) in enumerate(model.named_modules()):
+            if hasattr(module, 'weight') and module.weight.requires_grad:
+                torch.manual_seed(local_seed + i)  # Reset seed for unique perturbations
+                perturbation = torch.randn_like(module.weight) * epsilon  # Generate random perturbation
+                module.weight.data.add_(perturbation)  # Apply perturbation to weights
+    
+                # Compute pre-activation difference
+                pre_activation_differences[name] = module.weight.data.clone() - pre_activations_clean[name]
+    
+        outputs_noisy = model(decorrelated_inputs)  # Forward pass with perturbed weights
+        if isinstance(outputs_noisy, tuple):
+            outputs_noisy = outputs_noisy[0]  # Use the logits tensor
+        outputs_noisy = outputs_noisy.view(-1, outputs_noisy.size(-1))  # Flatten output
+        loss_noisy = criterion(outputs_noisy, y)  # Compute noisy loss
+    
+        if verbose:
+            print(f"Noisy pass loss: {loss_noisy.item()}")
+    
+        # Revert the weights to original state
+        for i, (name, module) in enumerate(model.named_modules()):
+            if hasattr(module, 'weight') and module.weight.requires_grad:
+                torch.manual_seed(local_seed + i)  # Reset the seed
+                perturbation = torch.randn_like(module.weight) * epsilon  # Generate identical perturbation
+                module.weight.data.sub_(perturbation)  # Revert to original weights
+    
+        # === Compute Gradients ===
+        grad_estimate = (loss_noisy - loss_clean) / (2.0 * epsilon)  # Estimate gradient
+    
+        for name, module in model.named_modules():
+            if hasattr(module, 'weight') and module.weight.requires_grad:
+                if name in pre_activation_differences:
+                    pre_diff = pre_activation_differences[name]
+                    normalized_pre_diff = pre_diff / (torch.norm(pre_diff) + 1e-8)  # Avoid division by zero
+                    if module.weight.grad is None:
+                        module.weight.grad = grad_estimate * normalized_pre_diff  # Initialize gradient
+                    else:
+                        module.weight.grad.add_(grad_estimate * normalized_pre_diff)  # Accumulate gradient
+    
+        # === Average Loss ===
+        avg_loss = 0.5 * (loss_clean.item() + loss_noisy.item())  # Compute average loss
+    
+        if verbose:
+            print(f"\nFinal average loss: {avg_loss}")  # Print average loss
+            print("=== ANP Single Complete ===\n")  # Debug output footer
+
+    return avg_loss, decorrelation_matrix  # Return average loss and updated decorrelation matrix
 
 
 
+
+
+
+
+
+
+
+##############################################################################
+# Warm single mezo  (warm_single_mezo)
+##############################################################################
+
+def mezo_char_single_with_warm_start(
+    model, 
+    x_emb, 
+    y, 
+    criterion, 
+    epsilon=1e-3, 
+    verbose=False,
+    max_perturbations=1,
+    min_acceptable_loss_percent_diff=0.001,
+    init_seed=None
+):
+    """
+    Instrumented version of mezo_char_single with multiple perturbations and warm start based on last best direction found.
+    
+    We attempt up to `max_perturbations` different random directions.
+    Each time:
+      1) We do a plus pass and minus pass, reusing the same random seed
+         to produce +/- directions consistently.
+      2) We compute the absolute difference between (loss_plus) and (loss_minus),
+         then normalize by the average => percent_diff = diff_val / avg_val.
+      3) If percent_diff >= min_acceptable_loss_percent_diff, we immediately
+         accept that direction, apply the gradient update, and return.
+      4) Otherwise, we keep track of whichever attempt had the highest percent_diff,
+         calling that our "best direction so far."
+    If, after all attempts, none meets the threshold, we do one more pass with
+    the best direction found so far and finalize an update using that.
+
+    Args:
+        model (nn.Module): The model being trained.
+        x_emb (torch.Tensor): Input embeddings [B, L, E].
+        y (torch.LongTensor): Target tensor [B, L].
+        criterion (nn.Module): Loss function.
+        epsilon (float): Finite difference step size.
+        verbose (bool): Verbosity flag.
+        max_perturbations (int): Maximum number of random directions to try.
+        min_acceptable_loss_percent_diff (float):
+            Minimum required percentage-difference in losses
+            for us to accept the gradient update immediately.
+        init_seed (int or None):
+            Optional user-provided seed to try first. If None, we pick randomly.
+
+    Returns:
+        float: The final average loss (0.5 * (L+ + L-)) for whichever direction
+               we actually used for the gradient update.
+        int:   The seed used for the final update (so the caller can reuse it).
+    """
+    all_params = list(model.parameters())
+
+    # We'll record the "best" direction so far
+    best_percent_diff = -1.0
+    best_seed = None
+    best_loss_plus = None
+    best_loss_minus = None
+
+    # Whether we've found a direction that meets our threshold
+    early_success = False
+    final_seed_used = None
+    final_loss = 0.0
+
+    def plus_minus_pass(local_seed):
+        """
+        Helper function that:
+          (a) Zeroes grads
+          (b) Does the plus pass (+εd), minus pass (-εd), reverts, 
+          (c) Returns (loss_plus, loss_minus, percent_diff).
+        Does NOT apply any gradient. That’s done separately if accepted.
+        """
+        # 1) Zero grads
+        for p in all_params:
+            if p.grad is not None:
+                p.grad.zero_()
+
+        with torch.no_grad():
+            #torch.cuda.empty_cache()
+
+            # -------------------------
+            #     PLUS PASS
+            # -------------------------
+            #torch.cuda.empty_cache()
+            torch.manual_seed(local_seed)
+            for p in all_params:
+                if p.requires_grad:
+                    d = torch.randn_like(p)
+                    p.data.add_(epsilon * d)
+
+            loss_plus = teacher_forcing_loss_emb(model, x_emb, y, criterion)
+
+            # -------------------------
+            #     MINUS PASS
+            # -------------------------
+            #torch.cuda.empty_cache()
+            torch.manual_seed(local_seed)
+            for p in all_params:
+                if p.requires_grad:
+                    d = torch.randn_like(p)
+                    p.data.sub_(2.0 * epsilon * d)
+
+            loss_minus = teacher_forcing_loss_emb(model, x_emb, y, criterion)
+
+            # -------------------------
+            #     REVERT PARAMS
+            # -------------------------
+            torch.manual_seed(local_seed)
+            #torch.cuda.empty_cache()
+            for p in all_params:
+                if p.requires_grad:
+                    d = torch.randn_like(p)
+                    p.data.add_(epsilon * d)
+
+        # Compute percent-diff
+        diff_val = abs(loss_plus.item() - loss_minus.item())
+        avg_val = 0.5 * (loss_plus.item() + loss_minus.item())
+        percent_diff = (diff_val / avg_val) if avg_val > 0 else 0.0
+
+        return loss_plus, loss_minus, percent_diff, avg_val
+
+    def apply_grad(local_seed, loss_plus, loss_minus):
+        """
+        Given the final accepted direction (loss_plus, loss_minus),
+        compute grad_est and apply p.grad for each param.
+        """
+        grad_est = (loss_plus - loss_minus) / (2.0 * epsilon)
+        torch.manual_seed(local_seed)
+        #torch.cuda.empty_cache()
+        for p in all_params:
+            if p.requires_grad:
+                d = torch.randn_like(p)
+                if p.grad is None:
+                    p.grad = grad_est * d
+                else:
+                    p.grad.add_(grad_est * d)
+
+    # Main loop: try up to max_perturbations times
+    for attempt in range(max_perturbations):
+        # Pick the seed: if attempt=0 and init_seed!=None => use init_seed
+        if (attempt == 0) and (init_seed is not None):
+            local_seed = init_seed
+        else:
+            local_seed = torch.randint(0, 2**32, (1,)).item()
+
+        if verbose:
+            print(f"\n=== MEZO Attempt {attempt+1}/{max_perturbations} ===")
+            print(f"Using seed: {local_seed}")
+
+        loss_plus, loss_minus, percent_diff, avg_val = plus_minus_pass(local_seed)
+
+        if verbose:
+            print(f"  loss_plus={loss_plus.item():.6f}, loss_minus={loss_minus.item():.6f}")
+            print(f"  percent_diff={percent_diff:.4%}, min_needed={min_acceptable_loss_percent_diff:.4%}")
+
+        # Update "best" if this attempt is better
+        if percent_diff > best_percent_diff:
+            best_percent_diff = percent_diff
+            best_seed = local_seed
+            best_loss_plus = loss_plus
+            best_loss_minus = loss_minus
+
+        # If it meets threshold => accept immediately, break
+        if percent_diff >= min_acceptable_loss_percent_diff:
+            apply_grad(local_seed, loss_plus, loss_minus)
+            final_seed_used = local_seed
+            final_loss = avg_val
+            early_success = True
+            break
+        else:
+            if verbose:
+                print("  => Not sufficient. Trying a new seed...")
+
+    # If we never “broke” early, we still do an update using the best direction
+    if not early_success:
+        if best_seed is not None:
+            if verbose:
+                print(f"\nNo direction above {min_acceptable_loss_percent_diff:.4%}, "
+                      f"but we'll use the best attempt with seed={best_seed} (percent_diff={best_percent_diff:.4%}).")
+            # We must re-run plus/minus to re-derive the same random directions, then apply grad.
+            # We'll do a second pass with best_seed
+            loss_plus, loss_minus, _, avg_val = plus_minus_pass(best_seed)
+            apply_grad(best_seed, loss_plus, loss_minus)
+            final_seed_used = best_seed
+            final_loss = avg_val
+        else:
+            # This is extremely unlikely, but in case no best_seed was set
+            if verbose:
+                print("No valid attempts found and best_seed is None. No gradient update.")
+            return 0.0, None
+
+    if verbose:
+        print(f"\n[MEZO SINGLE] Final seed used: {final_seed_used}, final avg loss: {final_loss:.6f}\n")
+
+    return final_loss, final_seed_used
+
+##############################################################################
+# Fast Single MeZO using the new sampling approach: d ~ Normal(adam ratio, 1.0)
+##############################################################################
+def flatten_params(model):
+    """
+    Flatten all model parameters into a single 1D tensor (param_data).
+    Also return a list of (shape, numel, device) to reconstruct each parameter.
+    """
+    param_tensors = []
+    meta = []
+    for p in model.parameters():
+        flat = p.data.view(-1)
+        param_tensors.append(flat)
+        meta.append((p.shape, flat.numel(), p.device))
+    param_data = torch.cat(param_tensors, dim=0)
+    return param_data, meta
+
+
+def unflatten_into_params(param_data, model, meta):
+    """
+    Unflatten 'param_data' (1D) back into each model parameter's .data
+    using the (shape, numel, device) info in 'meta'.
+    """
+    offset = 0
+    for p, (shape, numel, dev) in zip(model.parameters(), meta):
+        slice_ = param_data[offset : offset + numel]
+        offset += numel
+        p.data = slice_.view(shape).to(dev)
+
+
+
+def flatten_adam_ratio_data(model, optimizer):
+    """
+    For each parameter p, fetch the Adam state:
+        exp_avg  (m_t)
+        exp_avg_sq (v_t)
+    and compute ratio = (exp_avg / sqrt(exp_avg_sq + 1e-8)).
+
+    If the state doesn't exist (or mismatch shape),
+    fallback to zeros or random as desired. Here we'll fallback to zeros.
+
+    Returns a single 1D tensor 'ratio_data' concatenating all parameters.
+    """
+    ratio_list = []
+    for p in model.parameters():
+        state = optimizer.state.get(p, {})
+        exp_avg = state.get("exp_avg", None)
+        exp_avg_sq = state.get("exp_avg_sq", None)
+
+        if (exp_avg is not None) and (exp_avg_sq is not None):
+            # Flatten
+            ratio_1d = (exp_avg / torch.sqrt(exp_avg_sq + 1e-8)).view(-1)
+            ratio_list.append(ratio_1d)
+        else:
+            # Fallback => zeros
+            ratio_list.append(torch.zeros(p.data.numel(), device=p.data.device))
+
+    ratio_data = torch.cat(ratio_list, dim=0)
+    return ratio_data
+
+
+def mezo_adaptive_sampling_fast(
+    model,
+    x_emb,
+    y,
+    criterion,
+    optimizer,            # Adam or similar
+    epsilon=1e-3,
+    verbose=False,
+    adaptive=True
+):
+    """
+    A fast version of MeZO that:
+      1) Flattens all model parameters -> param_data
+      2) Computes ratio_data = (exp_avg / sqrt(exp_avg_sq+1e-8)) for each param, flattened
+      3) Samples a single big d_data ~ Normal(mean=ratio_data, std=1.0)
+      4) Does plus pass (param_data += epsilon*d_data), minus pass (param_data -= 2*epsilon*d_data),
+         and revert (param_data += epsilon*d_data) with minimal unflatten calls.
+      5) Applies the finite difference gradient to p.grad.
+
+    Returns:
+        float: 0.5*(loss_plus + loss_minus)
+    """
+    if verbose:
+        print("\n=== MEZO SINGLE ADAM FAST v2 DEBUG ===")
+        print(f"Input shape: {x_emb.shape}, target shape: {y.shape}")
+
+    # 1) Flatten parameters
+    orig_param_data, meta = flatten_params(model)
+    # We'll keep a copy of the original so we can revert easily
+    param_data_orig = orig_param_data.clone()
+
+    # 2) Flatten the ratio_data = exp_avg / sqrt(exp_avg_sq + 1e-8)
+    ratio_data = flatten_adam_ratio_data(model, optimizer)
+    device = orig_param_data.device
+
+    # Zero existing grads
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad.zero_()
+
+    # 3) local_seed for reproducibility
+    local_seed = torch.randint(0, 2**32, (1,)).item()
+    if verbose:
+        print(f"\nRandom seed: {local_seed}")
+        print(f"Flattened param_data shape: {orig_param_data.shape}, ratio_data shape: {ratio_data.shape}")
+
+    # We'll define a small forward helper
+    def forward_loss():
+        with torch.inference_mode():
+            loss = teacher_forcing_loss_emb(model, x_emb, y, criterion)
+            #torch.cuda.empty_cache()
+            return loss
+
+    # 4) Sample d_data ~ Normal(ratio_data, std=1.0)
+    torch.manual_seed(local_seed)
+    z_data = torch.randn_like(ratio_data, device=device)  # standard normal
+    if adaptive:
+        d_data = ratio_data + z_data  # => Normal(mean=ratio_data, std=1.0)
+    else:
+        d_data = z_data
+
+    #  --- PLUS PASS ---
+    param_data_plus = param_data_orig + epsilon * d_data
+    unflatten_into_params(param_data_plus, model, meta)
+    loss_plus = forward_loss()
+    if verbose:
+        print(f"Plus pass loss: {loss_plus.item():.6f}")
+
+    #  --- MINUS PASS ---
+    param_data_minus = param_data_orig - epsilon * d_data
+    unflatten_into_params(param_data_minus, model, meta)
+    loss_minus = forward_loss()
+    if verbose:
+        print(f"Minus pass loss: {loss_minus.item():.6f}")
+
+    #  --- REVERT ---
+    # We revert to original (for subsequent steps in training)
+    unflatten_into_params(param_data_orig, model, meta)
+
+    # 5) Compute grad_est = (loss_plus - loss_minus) / (2*epsilon)
+    grad_est = (loss_plus - loss_minus) / (2.0 * epsilon)
+    if verbose:
+        print(f"\nEstimated gradient: {grad_est.item():.6f}")
+
+    # Construct a single grad_data = grad_est * d_data
+    grad_data = grad_est * d_data
+    
+    # Unflatten grad_data into p.grad
+    offset = 0
+    for p, (shape, numel, dev) in zip(model.parameters(), meta):
+        slice_ = grad_data[offset : offset + numel]
+        offset += numel
+        if p.grad is None:
+            p.grad = slice_.view(shape).to(dev)
+        else:
+            p.grad.add_(slice_.view(shape).to(dev))
+
+    del grad_data,d_data
+    #torch.cuda.empty_cache()
+    avg_loss = 0.5 * (loss_plus.item() + loss_minus.item())
+    if verbose:
+        print(f"\nFinal average loss: {avg_loss:.6f}")
+        print("=== MEZO SINGLE ADAM FAST v2 COMPLETE ===\n")
+
+    return avg_loss
+
+
+    
+##############################################################################
+# Single mezo adaptive sampling
+##############################################################################
+def mezo_adaptive_sampling(
+    model,
+    x_emb,
+    y,
+    criterion,
+    optimizer,         # The Adam (or Adam-like) optimizer with exp_avg, exp_avg_sq
+    epsilon=1e-3,
+    verbose=False
+):
+    """
+    Adam-based adaptive version of mezo_char_single that does NOT store directions.
+    For each parameter p, we sample the probe direction from:
+        d ~ Normal(mean = exp_avg, std = sqrt(exp_avg_sq + 1e-8))
+    using the Adam state. If that state doesn't exist yet, we fallback
+    to standard Gaussian torch.randn_like(p).
+
+    We do three passes:
+      1) Plus pass  (p += epsilon*d)
+      2) Minus pass (p -= 2*epsilon*d)
+      3) Revert     (p += epsilon*d)
+    Each pass calls torch.manual_seed(local_seed) so that the same random calls
+    produce identical directions, avoiding storage of 'd' in memory.
+
+    Args:
+        model (nn.Module): The model being trained.
+        x_emb (torch.Tensor): [B, L, E], input embeddings.
+        y (torch.Tensor): [B, L], target IDs.
+        criterion (callable): Loss function (e.g., cross-entropy).
+        optimizer (torch.optim.Optimizer):
+            Adam or similar, with 'exp_avg', 'exp_avg_sq' in optimizer.state[p].
+        epsilon (float): Magnitude of the finite difference steps.
+        verbose (bool): Whether to print debug info.
+
+    Returns:
+        float: Average of the plus and minus losses (0.5*(L+ + L-)).
+    """
+    if verbose:
+        print("\n=== MEZO SINGLE ADAM DEBUG ===")
+        print(f"Input shape: {x_emb.shape}")
+        print(f"Target shape: {y.shape}")
+
+    # We'll still pick a local seed to ensure reproducible directions
+    local_seed = torch.randint(0, 2**32, (1,)).item()
+
+    # Gather parameters
+    all_params = list(model.parameters())
+
+    with torch.no_grad():
+        #torch.cuda.empty_cache()
+
+        if verbose:
+            print(f"\nRandom seed: {local_seed}")
+            print("Parameter shapes:")
+            for i, p in enumerate(all_params):
+                if p.requires_grad:
+                    print(f"Param {i}: {p.shape}")
+
+        # 0) Zero out existing grads
+        for p in all_params:
+            if p.grad is not None:
+                p.grad.zero_()
+
+        def calc_d(optimizer):
+            state = optimizer.state.get(p, {})
+            exp_avg = state.get("exp_avg", None)     # Adam first moment
+            exp_avg_sq = state.get("exp_avg_sq", None)  # Adam second moment
+            if (exp_avg is not None) and (exp_avg_sq is not None):
+                std_t = torch.sqrt(exp_avg_sq + 1e-8)  # shape same as p
+                d = torch.normal(mean=exp_avg/std_t, std=1.)
+                if d.shape != p.shape:
+                    # Fallback if shape mismatch
+                    d = torch.randn_like(p)
+            else:
+                d = torch.randn_like(p)
+            return d
+        # ------------------------------------------------------
+        #               PLUS PASS
+        # ------------------------------------------------------
+        if verbose:
+            print("\n=== Plus Pass ===")
+        #torch.cuda.empty_cache()
+        torch.manual_seed(local_seed)  # Ensures consistent random calls
+
+        # For each parameter, sample direction from N(exp_avg, sqrt(exp_avg_sq+1e-8)),
+        # or fallback to torch.randn_like(p) if no state is found
+        for i, p in enumerate(all_params):
+            if not p.requires_grad:
+                continue
+
+            # p.data += epsilon * d
+            p.data.add_(epsilon * calc_d(optimizer))
+
+            if verbose and i < 3:
+                print(f"Param {i} ADAM-perturbation stats: mean(d)={d.mean().item():.6f}, std(d)={d.std().item():.6f}")
+
+        loss_plus = teacher_forcing_loss_emb(model, x_emb, y, criterion)
+        if verbose:
+            print(f"Plus pass loss: {loss_plus.item()}")
+
+        # ------------------------------------------------------
+        #               MINUS PASS
+        # ------------------------------------------------------
+        if verbose:
+            print("\n=== Minus Pass ===")
+        #torch.cuda.empty_cache()
+        torch.manual_seed(local_seed)  # Same seed => same random calls => same d
+
+        for i, p in enumerate(all_params):
+            if not p.requires_grad:
+                continue
+
+            # p.data -= 2.0 * epsilon * d
+            p.data.sub_(2.0 * epsilon * calc_d(optimizer))
+
+        loss_minus = teacher_forcing_loss_emb(model, x_emb, y, criterion)
+        if verbose:
+            print(f"Minus pass loss: {loss_minus.item()}")
+
+        # ------------------------------------------------------
+        #               REVERT
+        # ------------------------------------------------------
+        torch.manual_seed(local_seed)
+        #torch.cuda.empty_cache()
+
+        for i, p in enumerate(all_params):
+            if not p.requires_grad:
+                continue
+
+            # p.data += epsilon * d
+            p.data.add_(epsilon * calc_d(optimizer))
+
+        # ------------------------------------------------------
+        #               APPLY GRADIENT
+        # ------------------------------------------------------
+        grad_est = (loss_plus - loss_minus) / (2.0 * epsilon)
+        if verbose:
+            print(f"\nEstimated gradient: {grad_est.item()}")
+
+        # We do a fresh random pass for the actual gradient direction
+        torch.manual_seed(local_seed)
+        #torch.cuda.empty_cache()
+
+        for i, p in enumerate(all_params):
+            if not p.requires_grad:
+                continue
+
+            # p.grad += grad_est * d
+            if p.grad is None:
+                p.grad = grad_est * calc_d(optimizer)
+            else:
+                p.grad.add_(grad_est * calc_d(optimizer))
+
+            if verbose and i < 3:
+                print(f"\nParam {i} gradient stats:")
+                print(f"Mean(grad): {p.grad.mean().item():.6f}, Std(grad): {p.grad.std().item():.6f}")
+
+        # Final average loss
+        avg_loss = 0.5 * (loss_plus.item() + loss_minus.item())
+        if verbose:
+            print(f"\nFinal average loss: {avg_loss}")
+            print("=== MEZO SINGLE ADAM COMPLETE ===\n")
+
+    return avg_loss
+
+
+
+##############################################################################
+# Single mezo
+##############################################################################
 def mezo_char_single(model, x_emb, y, criterion, epsilon=1e-3, verbose=False):
     """Instrumented version of mezo_char_single"""
     if verbose:
@@ -1978,8 +3029,8 @@ def mezo_char_single(model, x_emb, y, criterion, epsilon=1e-3, verbose=False):
 
     local_seed = torch.randint(0, 2**32, (1,)).item()
     all_params = list(model.parameters())
-    with torch.no_grad():
-        torch.cuda.empty_cache() 
+    with torch.inference_mode():
+        #torch.cuda.empty_cache() 
                 
     
         if verbose:
@@ -1998,7 +3049,7 @@ def mezo_char_single(model, x_emb, y, criterion, epsilon=1e-3, verbose=False):
             print("\n=== Plus Pass ===")
     
         # Plus pass
-        torch.cuda.empty_cache() 
+        #torch.cuda.empty_cache() 
         torch.manual_seed(local_seed)
         
         for i, p in enumerate(all_params):
@@ -2018,7 +3069,7 @@ def mezo_char_single(model, x_emb, y, criterion, epsilon=1e-3, verbose=False):
             print("\n=== Minus Pass ===")
     
         # Minus pass
-        torch.cuda.empty_cache() 
+        #torch.cuda.empty_cache() 
         torch.manual_seed(local_seed)
         for p in all_params:
             if p.requires_grad:
@@ -2031,7 +3082,7 @@ def mezo_char_single(model, x_emb, y, criterion, epsilon=1e-3, verbose=False):
     
         # Revert parameters
         torch.manual_seed(local_seed)
-        torch.cuda.empty_cache() 
+        #torch.cuda.empty_cache() 
         
         for p in all_params:
             if p.requires_grad:
@@ -2044,7 +3095,7 @@ def mezo_char_single(model, x_emb, y, criterion, epsilon=1e-3, verbose=False):
             print(f"\nEstimated gradient: {grad_est}")
     
         torch.manual_seed(local_seed)
-        torch.cuda.empty_cache() 
+        #torch.cuda.empty_cache() 
         for i, p in enumerate(all_params):
             if p.requires_grad:
                 d = torch.randn_like(p)
@@ -2263,6 +3314,8 @@ def generate_task_data(num_samples, task, context_len, maxn, train=True):
         return generate_sort_task_str(num_samples, context_len, train=train)
     elif task=="factorial":
         return generate_factorial_task_str(num_samples, context_len, max_n=maxn, train=train)
+    elif task=="owt":
+        return generate_openwebtext_task_str(num_samples, context_len, max_n=maxn, train=train, min_total_seq_len=2*context_len)
     else:
         raise ValueError(f"Unknown task {task}")
 
@@ -2295,7 +3348,7 @@ def maybe_update_curriculum(train_acc, current_context, current_maxnum, consecut
         return new_ct, new_mn, 0
     return current_context, current_maxnum, consecutive_succ
 
-def train_micro_batch(model, x_emb, y_ids, criterion, optimizer, mezo_flavor, args, mezo_state=None):
+def train_micro_batch(model, x_emb, y_ids, criterion, optimizer, mezo_flavor, args, mezo_state=None, decorrelation_matrix=None, best_seed=None):
         """
         x_emb => [micro_batch_size, max_seq_len, embed_dim]
         y_ids => [micro_batch_size, max_seq_len]
@@ -2306,11 +3359,30 @@ def train_micro_batch(model, x_emb, y_ids, criterion, optimizer, mezo_flavor, ar
                 args.epsilon = args.tie_epsilon_to_lr_ratio * optimizer.param_groups[0]['lr']
         if mezo_flavor == "mezo_layerwise":
             loss_val= mezo_char_layerwise(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
-        elif mezo_flavor == "mezo_rolling": 
-            loss_val = mezo_char_single_rolling(model, x_emb, y_ids, criterion, mezo_state)
+        elif mezo_flavor == "warm_single_mezo": 
+            loss_val, best_seed = mezo_char_single_with_warm_start(
+                                    model, 
+                                    x_emb, 
+                                    y_ids, 
+                                    criterion, 
+                                    epsilon=args.epsilon, 
+                                    max_perturbations=1,
+                                    min_acceptable_loss_percent_diff=0.001,
+                                    init_seed=best_seed,
+                                    verbose=False,
+                                )
+        elif mezo_flavor == "rolling_mezo": 
+            loss_val = mezo_char_single_rolling(model, x_emb, y_ids, criterion, mezo_state) # NOT TESTED! TODO
 
+        elif mezo_flavor == "anp":
+
+            loss_val, decorrelation_matrix = anp_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon, decorrelation_matrix=decorrelation_matrix, verbose=False)
+            
         elif mezo_flavor == "mezo_single":
             loss_val= mezo_char_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
+        elif mezo_flavor == "mezo_adaptive_sampling":
+            loss_val= mezo_adaptive_sampling(model, x_emb, y_ids, criterion, optimizer, epsilon=args.epsilon)
+            
         # else:
         #     raise Exception("No flavor")
             
@@ -2321,10 +3393,47 @@ def train_micro_batch(model, x_emb, y_ids, criterion, optimizer, mezo_flavor, ar
             # out, _, _= model(x_emb)
             # B,L,V= out.size()
             # loss= criterion(out.view(B*L, V), y_ids.view(B*L))
-            loss = teacher_forcing_loss_emb(model, x_emb, y_ids, criterion)
-            loss.backward()
+            loss = teacher_forcing_loss_emb(model, x_emb, y_ids, criterion, backward=True)
+            # loss.backward()
             loss_val= loss.item()
-        return loss_val
+        return loss_val, decorrelation_matrix, best_seed
+
+
+
+def prepare_model_for_fast_inference(model, dummy_data, optim="sgd"):
+    """
+    1) model.eval()
+    2) flatten_parameters() on any LSTM module
+    3) possibly torch.compile() if PyTorch >=2.0
+    """
+    import torch
+    import torch.backends.cudnn as cudnn
+    
+    cudnn.benchmark = True
+    
+    
+    # 1) Run a dummy pass:
+    model(dummy_data)  # or however your LSTM is called
+    
+    # 2) Then flatten
+    for module in model.modules():
+        if isinstance(module, torch.nn.LSTM):
+            module.flatten_parameters()
+    
+    # 3) Now compile
+    if optim=="sgd":
+        model = torch.compile(model, mode="reduce-overhead")
+    # Flatten LSTM parameters if any
+    for m in model.modules():
+        if isinstance(m, torch.nn.LSTM):
+            m.flatten_parameters()
+
+    
+    return model
+
+
+
+
 ##############################################################################
 # Main
 ##############################################################################
@@ -2332,15 +3441,15 @@ def main():
     parser= argparse.ArgumentParser()
     parser.add_argument("--arch", type=str, default="ntm", choices=["ntm","dnc","tra", "tdnc", "tntm", "simplelstm", "mamba"])
     parser.add_argument("--task", type=str, default="copy",
-                        choices=["copy","repeat_copy","associative_recall","add","sub","mul","div","fib","factorial"])
-    parser.add_argument("--input_sample_length", type=int, default=20,
+                        choices=["copy","repeat_copy","associative_recall","add","sub","mul","div","fib","factorial","owt"])
+    parser.add_argument("--input_sample_length", type=int, default=150,
                         help="Base length for generating tasks. We'll do a simple curriculum on some tasks.")
-    parser.add_argument("--max_seq_len", type=int, default=50,
+    parser.add_argument("--max_seq_len", type=int, default=150,
                         help="For generation.")
 
     parser.add_argument("--micro_batch_size", type=int, default=1)
     parser.add_argument("--macro_batch_size", type=int, default=1)
-    parser.add_argument("--max_iters", type=int, default=10000)
+    parser.add_argument("--max_iters", type=int, default=1000)
     parser.add_argument("--max_num", type=int, default=110,
                         help="This is the max number in the domain to use in training for arithmetic tasks. Min in the train domain is 0. We'll do a simple curriculum for arithmetic if task in all. i.e. [add,sub,mul,div].")
 
@@ -2357,10 +3466,10 @@ def main():
     parser.add_argument("--epsilon", type=float, default=1e-2, help="MeZO eps.")
     parser.add_argument("--mezo", action="store_true")
 
-    parser.add_argument("--mezo_flavor", type=str, default="None", choices=["mezo_single","mezo_layerwise", "mezo_rolling","None"])
+    parser.add_argument("--mezo_flavor", type=str, default="None", choices=["mezo_single","mezo_layerwise", "mezo_rolling", "anp", "warm_single_mezo", "mezo_adaptive_sampling", "mezo_adaptive_sampling_fast", "mezo_single_fast", "None"])
     
     parser.add_argument("--cosine_lr", action="store_true")
-    parser.add_argument("--warmup_steps", type=int, default=0)
+    parser.add_argument("--warmup_steps", type=int, default=100)
 
     parser.add_argument("--grad_norm", action="store_true")
     parser.add_argument("--grad_clip", type=float, default=0.0, help="If >0, grad norm clipped.")
@@ -2370,26 +3479,14 @@ def main():
     parser.add_argument("--log_interval", type=int, default=300)
     parser.add_argument("--wandb_proj", type=str, default=None)
     parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--minimum_starting_point_context_length", type=int, default=100, help="min seq length fed into the model to start the curriculum learning")
+    
     args= parser.parse_args()
 
     verbose = False 
 
-    
-    
-    total_samples_per_iter = args.micro_batch_size* args.macro_batch_size
+    total_samples_per_iter = args.micro_batch_size * args.macro_batch_size
 
-    # wandb
-    if args.wandb_proj is not None:
-        run = neptune.init_run(
-                            project="fchaubard/mezornn",
-                            api_token=neptune_api_token,
-                            name=args.wandb_run_name
-                        )  # your credentials
-        run["parameters"] = args
-        # wandb.init(project=args.wandb_proj, name=args.wandb_run_name)
-        # wandb.config.update(args)
-
-    
     # pick device
     if torch.cuda.is_available():
         gpu_index= pick_gpu_with_most_free_mem()
@@ -2422,6 +3519,41 @@ def main():
         True
     )
     total_estimated_vram_gb = vram_stats["total_estimated_gb"]
+
+    
+    # wandb
+    if args.wandb_proj is not None:
+        msg = vars(args)
+        msg["total_estimated_vram_gb"] = total_estimated_vram_gb
+        msg["total_samples_per_iter"] = total_samples_per_iter
+        # setattr(args, "total_estimated_vram_gb", total_estimated_vram_gb)
+        # setattr(args, "total_samples_per_iter", total_samples_per_iter)
+    
+        # For neptune:
+        # run = neptune.init_run(
+        #                     project="fchaubard/mezornn",
+        #                     api_token=neptune_api_token,
+        #                     name=args.wandb_run_name
+        #                 )  # your credentials
+        # run["parameters"] = args
+
+        # For custom mongo db:
+        # run = init_run_mongo(
+        #             db_url=db_url,
+        #             db_name=db_name,
+        #             project=db_project,
+        #             name=args.wandb_run_name,
+        #             params=msg
+        #         )
+
+
+
+        # For wandb:
+        wandb.init(project=args.wandb_proj, name=args.wandb_run_name)
+        wandb.config.update(msg)
+        
+        print(f"Logging to run:{args.wandb_run_name}")
+        print(f"w/ config:{msg}")
 
     # embed
     # embed= nn.Embedding(vocab_size, args.input_size, padding_idx=0).to(device)
@@ -2491,7 +3623,7 @@ def main():
 
     scheduler= None
     if args.cosine_lr:
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_iters, eta_min=1e-6)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_iters, eta_min=args.learning_rate/20)    
     else: 
         # default is LR plateau
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -2510,17 +3642,18 @@ def main():
     # track time
     train_start_time= time.time()
     consecutive_succ=0
-    gen_efficiency_token = 0
-    gen_efficiency_sample = 0
+    gen_efficiency_gen_loss = 0
+    gen_efficiency_val_loss = 0
+    decorrelation_matrix = None
     
    
-    minimum_starting_point_context_length = 1
+    minimum_starting_point_context_length = args.minimum_starting_point_context_length
     current_context_len = minimum_starting_point_context_length
     current_max_num= 15 # used only in arithmetic functions
 
     # lets make sure the user knows how the curriculum works
     assert current_max_num <= args.max_num, "Must have max_num > 15"
-    assert current_context_len <= args.input_sample_length, "Must have input_sample_length > 1"
+    assert current_context_len <= args.input_sample_length, f"Must have input_sample_length > 1: current_context_len:{current_context_len} and input_sample_length:{args.input_sample_length}"
 
     mezo_state = None
     if args.mezo_flavor == "mezo_rolling": 
@@ -2534,13 +3667,41 @@ def main():
         base_lr=1e-9,
         final_lr=args.learning_rate
     )
-        
+
+    best_seed = None
+
+    print("Optimizing the model")
+    
+    dummy_data = torch.zeros(args.micro_batch_size,
+        args.minimum_starting_point_context_length,
+        args.input_size,
+        device=device
+    )
+
+    torch.cuda.reset_peak_memory_stats(device)
+    # verbose = True
+    if args.optimizer=="sgd":
+        # optimize the model
+        prepare_model_for_fast_inference(model, dummy_data)
+    else:
+        # you can use half prec if using 
+        # model = model.half()
+        # dummy_data = dummy_data.half()
+        model.eval()
+        with torch.no_grad():
+            prepare_model_for_fast_inference(model, dummy_data)
+    print(torch.cuda.max_memory_allocated(device) / (1024 ** 3), "GiB")
+    print("Memory stats:")
+    print(torch.cuda.memory_summary(device))
+    print("Done")
     ####################################
     # TRAIN LOOP
     ####################################
     #for iteration in range(1, args.max_iters+1):
     iteration = -1
     while True:
+        torch.cuda.reset_peak_memory_stats(device)        
+        
         iteration+=1
         iter_start_time= time.time()
         
@@ -2556,11 +3717,13 @@ def main():
                                            this_sample_context_length,
                                            this_sample_max_num,
                                            train=True)
+        
 
         model.zero_grad()
         embed.zero_grad()
 
         micro_loss_sum= 0.0
+
 
         # micro/macro approach
         for micro_i in range(args.macro_batch_size):
@@ -2583,9 +3746,73 @@ def main():
             y_ids= str_to_tensor(cur_y, char_to_id).to(device)
             x_emb= embed(x_ids)
             
-            loss_val = train_micro_batch(model,x_emb, y_ids, criterion, optimizer, mezo_flavor, args, mezo_state)
+            # loss_val, decorrelation_matrix, best_seed = train_micro_batch(model, x_emb, y_ids, criterion, optimizer, mezo_flavor, args, mezo_state, decorrelation_matrix, best_seed)
             
+            if args.tie_epsilon_to_lr_ratio>-1:
+                args.epsilon = args.tie_epsilon_to_lr_ratio * optimizer.param_groups[0]['lr']
+
+            if args.optimizer=="mezo":
+                with torch.inference_mode():
+                    # x_emb = x_emb.half()
+                    if mezo_flavor == "mezo_layerwise":
+                        loss_val= mezo_char_layerwise(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
+                    elif mezo_flavor == "warm_single_mezo": 
+                        loss_val, best_seed = mezo_char_single_with_warm_start(
+                                                model, 
+                                                x_emb, 
+                                                y_ids, 
+                                                criterion, 
+                                                epsilon=args.epsilon, 
+                                                max_perturbations=1,
+                                                min_acceptable_loss_percent_diff=0.001,
+                                                init_seed=best_seed,
+                                                verbose=False,
+                                            )
+                    elif mezo_flavor == "rolling_mezo": 
+                        loss_val = mezo_char_single_rolling(model, x_emb, y_ids, criterion, mezo_state) # NOT TESTED! TODO
+            
+                    elif mezo_flavor == "anp":
+            
+                        loss_val, decorrelation_matrix = anp_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon, decorrelation_matrix=decorrelation_matrix, verbose=False)
+                        
+                    elif mezo_flavor == "mezo_single":
+                        loss_val= mezo_char_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
+        
+                    
+                    elif mezo_flavor == "mezo_single_fast":
+                        loss_val= mezo_adaptive_sampling_fast(model, x_emb, y_ids, criterion, optimizer, epsilon=args.epsilon,adaptive=False)
+                    elif mezo_flavor == "mezo_adaptive_sampling":
+                        if iteration<=args.warmup_steps:
+                            loss_val= mezo_char_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
+                        
+                        else:
+                            loss_val= mezo_adaptive_sampling(model, x_emb, y_ids, criterion, optimizer, epsilon=args.epsilon)
+                            
+                    elif mezo_flavor == "mezo_adaptive_sampling_fast":
+                        if iteration<=args.warmup_steps:
+                            loss_val= mezo_adaptive_sampling_fast(model, x_emb, y_ids, criterion, optimizer, epsilon=args.epsilon, adaptive=False)
+                            
+                        else:
+                            loss_val= mezo_adaptive_sampling_fast(model, x_emb, y_ids, criterion, optimizer, epsilon=args.epsilon, adaptive=True)
+                            
+                
+                    else:
+                        raise Exception("No flavor")
+                        
+            
+            else:
+                model.train()
+                optimizer.zero_grad()
+                # out, _, _= model(x_emb)
+                # B,L,V= out.size()
+                # loss= criterion(out.view(B*L, V), y_ids.view(B*L))
+                loss = teacher_forcing_loss_emb(model, x_emb, y_ids, criterion)
+                loss.backward()
+                loss_val= loss.item()
+
             micro_loss_sum+= loss_val
+            #torch.cuda.empty_cache()
+                
 
             if verbose:
                 print(f"start_idx: {start_idx}")
@@ -2621,19 +3848,19 @@ def main():
         if args.grad_clip>0.0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         
-        # finally we step! 
-        if False:
-            # check to see if any of the grads are 0 that means training is not happening.
-            params = list(model.parameters()) + list(embed.parameters())
+        # # finally we step! 
+        # if False:
+        #     # check to see if any of the grads are 0 that means training is not happening.
+        #     params = list(model.parameters()) + list(embed.parameters())
 
-            for i, param in enumerate(params):
-                if param.grad is not None:
-                    grad_abs_sum = param.grad.abs().sum().item()
-                    if grad_abs_sum == 0:
-                        print(f"Param {i}: Gradient sum is 0. Name: {param.shape}")
-                else:
-                    print(f"Param {i}: No gradient calculated (None). Name: {param.shape}")
-            pdb.set_trace()
+        #     for i, param in enumerate(params):
+        #         if param.grad is not None:
+        #             grad_abs_sum = param.grad.abs().sum().item()
+        #             if grad_abs_sum == 0:
+        #                 print(f"Param {i}: Gradient sum is 0. Name: {param.shape}")
+        #         else:
+        #             print(f"Param {i}: No gradient calculated (None). Name: {param.shape}")
+        #     pdb.set_trace()
         optimizer.step()
 
         train_loss_mezo = micro_loss_sum / args.macro_batch_size
@@ -2662,13 +3889,17 @@ def main():
         # msg= (f"Iter={iteration}, train_loss={train_loss_mezo:.3f}, train_acc={train_acc:.3f}, "
         #       f"LR={lr_current:.6f}, iter_time={iteration_time:.2f}s, total_time={total_elapsed/60:.2f}m, "
         #       f"context_len={current_context_len}, max_num={current_max_num}")
-        
+        vram_inferred = torch.cuda.max_memory_allocated(device)/1024**3
+
         msg= (f"Iter={iteration}, train_loss={train_loss_mezo:.3f}, "
-              f"LR={lr_current:.6f}, eps={args.epsilon:.6f}, iter_time={iteration_time:.2f}s, total_time={total_elapsed/60:.2f}m, "
-              f"context_len={current_context_len}, max_num={current_max_num}, gen_eff_token={gen_efficiency_token}, gen_eff_sample={gen_efficiency_sample}")
+              f"LR={lr_current:.6f}, eps={args.epsilon:.6f}, vram_inferred={vram_inferred:.6f} GB iter_time={iteration_time:.2f}s, total_time={total_elapsed/60:.2f}m, "
+              f"context_len={current_context_len}, max_num={current_max_num}, gen_eff_token={gen_efficiency_gen_loss}, gen_eff_sample={gen_efficiency_val_loss}")
 
         print(msg)
         sys.stdout.flush()
+
+        if train_loss_mezo>1000:
+            raise Exception(f"Ending training train_loss_mezo diverging: {train_loss_mezo}")
 
         ####################################
         # VALIDATION LOOP
@@ -2677,7 +3908,7 @@ def main():
         if iteration % args.log_interval == 0:
 
             # compute train accuracy on last micro-batch
-            with torch.no_grad():
+            with torch.inference_mode():
                     # x_ids = str_to_tensor(cur_x, char_to_id, args.max_seq_len).to(device)  # [B, Lx]
                     # y_ids = str_to_tensor(cur_y, char_to_id, args.max_seq_len).to(device)  # [B, Ly]
                     x_ids = str_to_tensor(cur_x, char_to_id).to(device)  # [B, Lx]
@@ -2739,21 +3970,22 @@ def main():
                     # --------------------------------------------------------------------
 
                     vx_emb = embed(vx_ids)
-                    vy_emb = embed(vy_ids)[:, :-1, :]  # Exclude last token from input since we'll predict it
-                    v_full = torch.cat([vx_emb, vy_emb], dim=1)  # Concatenate along sequence length dimension
+                    #             vy_emb = embed(vy_ids)[:, :-1, :]  # Exclude last token from input since we'll predict it
+                    #             v_full = torch.cat([vx_emb, vy_emb], dim=1)  # Concatenate along sequence length dimension
+                                
+                    #             Bx, Lx, Vx = vx_emb.size()
+                    #             model.eval()
+                    #             outputs, _, _ = model(v_full)
+                    #             B2,L2,V2= outputs.size()
+                                
+                    #             logits = outputs[:, Lx-1:, :].contiguous()  # Get predictions starting from after input sequence
+                    #             logits = logits.view(-1, logits.size(-1))  # [batch_size * seq_len, num_classes]
                     
-                    Bx, Lx, Vx = vx_emb.size()
-                    model.eval()
-                    outputs, _, _ = model(v_full)
-                    B2,L2,V2= outputs.size()
-                    
-                    logits = outputs[:, Lx-1:, :].contiguous()  # Get predictions starting from after input sequence
-                    logits = logits.view(-1, logits.size(-1))  # [batch_size * seq_len, num_classes]
-        
-        # Reshape targets
-                    targets = vy_ids.contiguous().view(-1)  # [batch_size * seq_len]
-    
-                    val_loss= criterion(logits, targets)
+                    # # Reshape targets
+                    #             targets = vy_ids.contiguous().view(-1)  # [batch_size * seq_len]
+                
+                    #             val_loss= criterion(logits, targets)
+                    val_loss = teacher_forcing_loss_emb(model, vx_emb, vy_ids, criterion)
 
                 
                     # --------------------------------------------------------------------
@@ -2772,7 +4004,7 @@ def main():
                     )
 
             # For debugging, let's print a few val random samples
-            sample_indices= random.sample(range(B2), min(3,B2))
+            sample_indices= random.sample(range(len(generated_strs)), min(3,len(generated_strs)))
             print("\n[DEBUG] Random Val Samples:")
             for idx in sample_indices:
                 print(f"  [Val idx={idx}]")
@@ -2791,16 +4023,16 @@ def main():
                 # If you'd like to see probabilities for newly generated tokens:
                 # print(f"    probs_batch[idx] = {probs_batch[idx]}")
 
-            gen_efficiency_token = val_gen_acc * 100.0 / (total_estimated_vram_gb * (total_elapsed / 3600.0))
-            gen_efficiency_sample = val_gen_acc_sample * 100.0 / (total_estimated_vram_gb * (total_elapsed / 3600.0))
+            gen_efficiency_gen_loss = val_gen_loss * 100.0 / (total_estimated_vram_gb * (total_elapsed / 3600.0))
+            gen_efficiency_val_loss = val_loss * 100.0 / (total_estimated_vram_gb * (total_elapsed / 3600.0))
             print(f"Generation loss: {val_gen_loss}, Generation accuracy: {val_gen_acc}, Generation sample accuracy: {val_gen_acc_sample}")
             print(f"Generalization Efficiency:")
             print(f"    VRAM: {total_estimated_vram_gb}")
             print(f"    Wall-Clock Hrs: {total_elapsed / 3600.0}")
             print(f"    val_gen_acc: {val_gen_acc}")
             print(f"    val_gen_acc_sample: {val_gen_acc_sample}")
-            print(f"    Gen Eff (token): {gen_efficiency_token}")
-            print(f"    Gen Eff (sample): {gen_efficiency_sample}")
+            print(f"    Gen Eff (token): {gen_efficiency_gen_loss}")
+            print(f"    Gen Eff (sample): {gen_efficiency_val_loss}")
                 
             print("="*30)
             print("="*30)
@@ -2832,35 +4064,44 @@ def main():
                     "train_acc": train_acc,
                     "lr": lr_current,
                     "iter_time_s": iteration_time,
-                    "total_time_min": total_elapsed / 60.0,
+                    "total_time_hours": total_elapsed / 3600.0,
                     "curr_context_len": current_context_len,
                     "curr_max_num": current_max_num,
                     "val_loss": val_loss.item(),        # teacher-forced
                     "val_gen_loss": val_gen_loss,       # from generation
                     "val_gen_acc": val_gen_acc,
                     "total_estimated_vram_gb":total_estimated_vram_gb,
-                    "gen_efficiency_token":gen_efficiency_token,
-                    "gen_efficiency_sample":gen_efficiency_sample,
+                    "GPU(GB)-Hours":total_estimated_vram_gb*total_elapsed / 3600.0,
+                    "gen_efficiency_gen_loss":gen_efficiency_gen_loss,
+                    "gen_efficiency_val_loss":gen_efficiency_val_loss,
                     "weight_decay_loss": weight_decay_loss.item(),
+                    "vram_inferred":vram_inferred
                     # "vram_usage":vram_usage,
                 }
                 print("="*30)
                 print("VAL STATS")
                 print(msg)
                 try:
-                    # wandb.log(msg, step=iteration)
+                    # if wandb
+                    wandb.log(msg, step=iteration)
     
-                    # Log metrics to Neptune with the current iteration as the step
-                    for key, value in msg.items():
-                        run[f"{key}"].log(value, step=iteration)
+                    # if neptune or mdb
+                    # for key, value in msg.items():
+                    #     run[f"{key}"].log(value, step=iteration)
+                    
+                   
+
                 except Exception as e:
-                        print(f"Neptune logging failed at iteration {iteration}. Error: {str(e)}")
+                        print(f"logging failed at iteration {iteration}. Error: {str(e)}")
 
                     
 
 
 
-    print("Finished.")
+    print("Finished.") 
+    if args.wandb_proj is not None:
+        # Finish the run
+        run.finish()
 
 
 if __name__=="__main__":
