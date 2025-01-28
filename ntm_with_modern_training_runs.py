@@ -33,7 +33,7 @@ import string
 import wandb
 import time
 import neptune
-
+import copy
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -486,13 +486,14 @@ from datasets import load_dataset
 def generate_openwebtext_task_str(
     num_samples: int,
     context_length: int,
+    ds,
     max_n=None,   # unused in OWT, but we keep the signature to match the others
     train: bool = True,
     min_total_seq_len=100,
     vebose=False
 ):
     split_name = "train" if train else "validation"
-    ds = load_dataset("haritzpuerto/the_pile_00_OpenWebText2", split=split_name, cache_dir = "/hf_cache/")
+
     size_of_ds = len(ds)
     in_list = []
     out_list = []
@@ -513,7 +514,7 @@ def generate_openwebtext_task_str(
             # = 5 + len(text) [5 comes from <bos> and <eos>]
             total_seq_len = len(text) + 5  # +5 for <bos> and <eos>
             
-            if total_seq_len >= min_total_seq_len and total_seq_len<70000: # crazy large number
+            if total_seq_len >= min_total_seq_len and total_seq_len<20000: # crazy large number
                 valid_doc = True
             else:
                 tries += 1
@@ -531,7 +532,7 @@ def generate_openwebtext_task_str(
             
         # Split into prefix and remainder
         prefix = text[:context_length]
-        remainder = text[context_length:]
+        remainder = text[context_length:min_total_seq_len] # HACKY! TODO TO CLEAN UP BUT ONLY THING I CAN DO TO MAKE NTM AND DNC FASTER
         
         # Create input and target strings
         input_str = f"<bos>{prefix}"
@@ -541,6 +542,9 @@ def generate_openwebtext_task_str(
         out_list.append(target_str)
         
     # Debug prints
+    max_out_len = max(len(i) for i in out_list)
+    print(f"   Max lengths: max={max_out_len}")
+
     if vebose:
         min_in_len = min(len(i) for i in in_list)
         min_out_len = min(len(i) for i in out_list)
@@ -1048,308 +1052,308 @@ class NTM(nn.Module):
 
 
 
-class TransformerBlock(nn.Module):
-    def __init__(self, d_model, nhead=8, dim_feedforward=2048, dropout=0.1):
-        super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-        self.activation = nn.GELU()
+# class TransformerBlock(nn.Module):
+#     def __init__(self, d_model, nhead=8, dim_feedforward=2048, dropout=0.1):
+#         super().__init__()
+#         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+#         self.linear1 = nn.Linear(d_model, dim_feedforward)
+#         self.linear2 = nn.Linear(dim_feedforward, d_model)
+#         self.norm1 = nn.LayerNorm(d_model)
+#         self.norm2 = nn.LayerNorm(d_model)
+#         self.dropout = nn.Dropout(dropout)
+#         self.activation = nn.GELU()
 
-    def forward(self, x, key_padding_mask=None):
-        attn_out, _ = self.self_attn(x, x, x, key_padding_mask=key_padding_mask)
-        x = self.norm1(x + self.dropout(attn_out))
-        ff_out = self.linear2(self.dropout(self.activation(self.linear1(x))))
-        x = self.norm2(x + self.dropout(ff_out))
-        return x
+#     def forward(self, x, key_padding_mask=None):
+#         attn_out, _ = self.self_attn(x, x, x, key_padding_mask=key_padding_mask)
+#         x = self.norm1(x + self.dropout(attn_out))
+#         ff_out = self.linear2(self.dropout(self.activation(self.linear1(x))))
+#         x = self.norm2(x + self.dropout(ff_out))
+#         return x
 
-class TransformerMemoryNTM(nn.Module):
-    def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.memory_size = memory_size
-        self.head_size = head_size
-        self.embed = embed
+# class TransformerMemoryNTM(nn.Module):
+#     def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed):
+#         super().__init__()
+#         self.hidden_size = hidden_size
+#         self.num_heads = num_heads
+#         self.memory_size = memory_size
+#         self.head_size = head_size
+#         self.embed = embed
 
-        # Input normalization
-        self.input_norm = nn.LayerNorm(input_size + num_heads * head_size)
+#         # Input normalization
+#         self.input_norm = nn.LayerNorm(input_size + num_heads * head_size)
 
-        # Keep LSTM controller
-        self.controller = nn.LSTM(input_size + num_heads * head_size, hidden_size, batch_first=True)
-        self.controller_norm = nn.LayerNorm(hidden_size)
+#         # Keep LSTM controller
+#         self.controller = nn.LSTM(input_size + num_heads * head_size, hidden_size, batch_first=True)
+#         self.controller_norm = nn.LayerNorm(hidden_size)
 
-        # Memory operation layers
-        self.fc_read_keys = nn.Linear(hidden_size, num_heads * head_size)
-        self.fc_write_keys = nn.Linear(hidden_size, num_heads * head_size)
-        self.fc_write_strength = nn.Linear(hidden_size, num_heads)
-        self.fc_erase_vector = nn.Linear(hidden_size, num_heads * head_size)
+#         # Memory operation layers
+#         self.fc_read_keys = nn.Linear(hidden_size, num_heads * head_size)
+#         self.fc_write_keys = nn.Linear(hidden_size, num_heads * head_size)
+#         self.fc_write_strength = nn.Linear(hidden_size, num_heads)
+#         self.fc_erase_vector = nn.Linear(hidden_size, num_heads * head_size)
 
-        # Add transformer for memory processing
-        self.memory_transformer = TransformerBlock(head_size, nhead=4, dim_feedforward=2*head_size)
+#         # Add transformer for memory processing
+#         self.memory_transformer = TransformerBlock(head_size, nhead=4, dim_feedforward=2*head_size)
         
-        # Normalization layers
-        self.read_keys_norm = nn.LayerNorm(head_size)
-        self.write_keys_norm = nn.LayerNorm(head_size)
-        self.memory_norm = nn.LayerNorm(head_size)
+#         # Normalization layers
+#         self.read_keys_norm = nn.LayerNorm(head_size)
+#         self.write_keys_norm = nn.LayerNorm(head_size)
+#         self.memory_norm = nn.LayerNorm(head_size)
         
-        # Output layers
-        total_output_size = hidden_size + num_heads * head_size
-        self.pre_output_norm = nn.LayerNorm(total_output_size)
-        self.fc_proj = nn.Linear(total_output_size, output_size)
+#         # Output layers
+#         total_output_size = hidden_size + num_heads * head_size
+#         self.pre_output_norm = nn.LayerNorm(total_output_size)
+#         self.fc_proj = nn.Linear(total_output_size, output_size)
 
-        self.reset_parameters()
+#         self.reset_parameters()
 
-    def reset_parameters(self):
-        """Initialize parameters"""
-        # Initialize LSTM params
-        for name, p in self.controller.named_parameters():
-            if 'weight' in name:
-                nn.init.orthogonal_(p)
-            elif 'bias' in name:
-                nn.init.constant_(p, 0)
+#     def reset_parameters(self):
+#         """Initialize parameters"""
+#         # Initialize LSTM params
+#         for name, p in self.controller.named_parameters():
+#             if 'weight' in name:
+#                 nn.init.orthogonal_(p)
+#             elif 'bias' in name:
+#                 nn.init.constant_(p, 0)
 
-        # Initialize memory operation layers
-        for name, p in self.named_parameters():
-            if 'fc_' in name and 'weight' in name:
-                nn.init.uniform_(p, -0.1, 0.1)
-            elif 'fc_' in name and 'bias' in name:
-                nn.init.constant_(p, 0)
+#         # Initialize memory operation layers
+#         for name, p in self.named_parameters():
+#             if 'fc_' in name and 'weight' in name:
+#                 nn.init.uniform_(p, -0.1, 0.1)
+#             elif 'fc_' in name and 'bias' in name:
+#                 nn.init.constant_(p, 0)
 
-    def _addressing(self, memory, read_keys, write_keys, write_strengths, erase_vectors):
-        """Memory addressing with transformer-enhanced memory"""
-        B, N, W = memory.size()
+#     def _addressing(self, memory, read_keys, write_keys, write_strengths, erase_vectors):
+#         """Memory addressing with transformer-enhanced memory"""
+#         B, N, W = memory.size()
 
-        # Transform memory using transformer
-        memory = self.memory_transformer(memory)
+#         # Transform memory using transformer
+#         memory = self.memory_transformer(memory)
         
-        # Normalize memory and keys
-        memory_normalized = self.memory_norm(memory)
-        read_keys = self.read_keys_norm(read_keys.view(-1, W)).view(B, self.num_heads, W)
-        write_keys = self.write_keys_norm(write_keys.view(-1, W)).view(B, self.num_heads, W)
+#         # Normalize memory and keys
+#         memory_normalized = self.memory_norm(memory)
+#         read_keys = self.read_keys_norm(read_keys.view(-1, W)).view(B, self.num_heads, W)
+#         write_keys = self.write_keys_norm(write_keys.view(-1, W)).view(B, self.num_heads, W)
     
-        # Read operation
-        read_weights = torch.einsum('bnk,bmk->bnm', read_keys, memory_normalized)
-        read_weights = F.softmax(read_weights, dim=-1)
-        read_content = torch.einsum('bnm,bmh->bnh', read_weights, memory)
+#         # Read operation
+#         read_weights = torch.einsum('bnk,bmk->bnm', read_keys, memory_normalized)
+#         read_weights = F.softmax(read_weights, dim=-1)
+#         read_content = torch.einsum('bnm,bmh->bnh', read_weights, memory)
     
-        # Write operation
-        write_weights = torch.einsum('bnk,bmk->bnm', write_keys, memory_normalized)
-        write_weights = F.softmax(write_weights, dim=-1)
+#         # Write operation
+#         write_weights = torch.einsum('bnk,bmk->bnm', write_keys, memory_normalized)
+#         write_weights = F.softmax(write_weights, dim=-1)
         
-        # Memory update
-        erase_vectors_expanded = torch.einsum('bnm,bnh->bmh', write_weights, erase_vectors)
-        memory = memory * (1 - erase_vectors_expanded)
+#         # Memory update
+#         erase_vectors_expanded = torch.einsum('bnm,bnh->bmh', write_weights, erase_vectors)
+#         memory = memory * (1 - erase_vectors_expanded)
     
-        add_content = write_strengths.unsqueeze(-1) * write_keys
-        add_content_expanded = torch.einsum('bnm,bnh->bmh', write_weights, add_content)
-        memory = memory + add_content_expanded
+#         add_content = write_strengths.unsqueeze(-1) * write_keys
+#         add_content_expanded = torch.einsum('bnm,bnh->bmh', write_weights, add_content)
+#         memory = memory + add_content_expanded
     
-        return memory, read_content, read_weights, write_weights
+#         return memory, read_content, read_weights, write_weights
 
-    def forward(self, x_emb, hidden=None, memory=None):
-        B, L, E = x_emb.size()
+#     def forward(self, x_emb, hidden=None, memory=None):
+#         B, L, E = x_emb.size()
 
-        # Initialize states if needed
-        if hidden is None:
-            h0 = x_emb.new_zeros(1, B, self.hidden_size)
-            c0 = x_emb.new_zeros(1, B, self.hidden_size)
-            hidden = (h0, c0)
+#         # Initialize states if needed
+#         if hidden is None:
+#             h0 = x_emb.new_zeros(1, B, self.hidden_size)
+#             c0 = x_emb.new_zeros(1, B, self.hidden_size)
+#             hidden = (h0, c0)
 
-        if memory is None:
-            memory = x_emb.new_zeros(B, self.memory_size, self.head_size)
+#         if memory is None:
+#             memory = x_emb.new_zeros(B, self.memory_size, self.head_size)
 
-        outputs = []
-        read_contents = x_emb.new_zeros(B, self.num_heads, self.head_size)
+#         outputs = []
+#         read_contents = x_emb.new_zeros(B, self.num_heads, self.head_size)
 
-        for t in range(L):
-            # LSTM controller
-            inp_t = torch.cat([x_emb[:, t, :], read_contents.view(B, -1)], dim=-1)
-            inp_t = self.input_norm(inp_t)
-            out_ctrl, hidden = self.controller(inp_t.unsqueeze(1), hidden)
-            h = self.controller_norm(out_ctrl.squeeze(1))
+#         for t in range(L):
+#             # LSTM controller
+#             inp_t = torch.cat([x_emb[:, t, :], read_contents.view(B, -1)], dim=-1)
+#             inp_t = self.input_norm(inp_t)
+#             out_ctrl, hidden = self.controller(inp_t.unsqueeze(1), hidden)
+#             h = self.controller_norm(out_ctrl.squeeze(1))
 
-            # Memory operations
-            read_keys = self.fc_read_keys(h).view(B, self.num_heads, self.head_size)
-            write_keys = self.fc_write_keys(h).view(B, self.num_heads, self.head_size)
-            write_strengths = torch.sigmoid(self.fc_write_strength(h)).view(B, self.num_heads)
-            erase_vectors = torch.sigmoid(self.fc_erase_vector(h)).view(B, self.num_heads, self.head_size)
+#             # Memory operations
+#             read_keys = self.fc_read_keys(h).view(B, self.num_heads, self.head_size)
+#             write_keys = self.fc_write_keys(h).view(B, self.num_heads, self.head_size)
+#             write_strengths = torch.sigmoid(self.fc_write_strength(h)).view(B, self.num_heads)
+#             erase_vectors = torch.sigmoid(self.fc_erase_vector(h)).view(B, self.num_heads, self.head_size)
 
-            memory, read_contents, _, _ = self._addressing(
-                memory, read_keys, write_keys, write_strengths, erase_vectors
-            )
+#             memory, read_contents, _, _ = self._addressing(
+#                 memory, read_keys, write_keys, write_strengths, erase_vectors
+#             )
 
-            # Output projection
-            output = torch.cat([h, read_contents.view(B, -1)], dim=-1)
-            output = self.pre_output_norm(output)
-            logits = self.fc_proj(output)
-            outputs.append(logits.unsqueeze(1))
+#             # Output projection
+#             output = torch.cat([h, read_contents.view(B, -1)], dim=-1)
+#             output = self.pre_output_norm(output)
+#             logits = self.fc_proj(output)
+#             outputs.append(logits.unsqueeze(1))
 
-        outputs = torch.cat(outputs, dim=1)
-        return outputs, memory, hidden
+#         outputs = torch.cat(outputs, dim=1)
+#         return outputs, memory, hidden
 
 
-class TransformerMemoryDNC(nn.Module):
-    def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed):
-        super().__init__()
-        self.input_size = input_size
-        self.output_size = output_size
-        self.hidden_size = hidden_size
-        self.memory_size = memory_size
-        self.head_size = head_size
-        self.num_reads = num_heads
-        self.embed = embed
+# class TransformerMemoryDNC(nn.Module):
+#     def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed):
+#         super().__init__()
+#         self.input_size = input_size
+#         self.output_size = output_size
+#         self.hidden_size = hidden_size
+#         self.memory_size = memory_size
+#         self.head_size = head_size
+#         self.num_reads = num_heads
+#         self.embed = embed
 
-        # Input normalization
-        controller_input_size = input_size + self.num_reads * head_size
-        self.input_norm = nn.LayerNorm(controller_input_size)
+#         # Input normalization
+#         controller_input_size = input_size + self.num_reads * head_size
+#         self.input_norm = nn.LayerNorm(controller_input_size)
 
-        # Keep LSTM controller
-        self.controller = nn.LSTM(controller_input_size, hidden_size, batch_first=True)
-        self.controller_norm = nn.LayerNorm(hidden_size)
+#         # Keep LSTM controller
+#         self.controller = nn.LSTM(controller_input_size, hidden_size, batch_first=True)
+#         self.controller_norm = nn.LayerNorm(hidden_size)
 
-        # Memory operation layers
-        self.fc_read_keys = nn.Linear(hidden_size, self.num_reads * head_size)
-        self.fc_write_keys = nn.Linear(hidden_size, head_size)
-        self.fc_write_strength = nn.Linear(hidden_size, 1)
-        self.fc_erase_vector = nn.Linear(hidden_size, head_size)
-        self.fc_add_vector = nn.Linear(hidden_size, head_size)
+#         # Memory operation layers
+#         self.fc_read_keys = nn.Linear(hidden_size, self.num_reads * head_size)
+#         self.fc_write_keys = nn.Linear(hidden_size, head_size)
+#         self.fc_write_strength = nn.Linear(hidden_size, 1)
+#         self.fc_erase_vector = nn.Linear(hidden_size, head_size)
+#         self.fc_add_vector = nn.Linear(hidden_size, head_size)
 
-        # Add transformers for memory processing
-        self.memory_transformer = TransformerBlock(head_size, nhead=4, dim_feedforward=2*head_size)
-        self.read_transformer = TransformerBlock(head_size, nhead=4, dim_feedforward=2*head_size)
+#         # Add transformers for memory processing
+#         self.memory_transformer = TransformerBlock(head_size, nhead=4, dim_feedforward=2*head_size)
+#         self.read_transformer = TransformerBlock(head_size, nhead=4, dim_feedforward=2*head_size)
         
-        # Normalization layers
-        self.read_keys_norm = nn.LayerNorm(head_size)
-        self.write_keys_norm = nn.LayerNorm(head_size)
-        self.memory_norm = nn.LayerNorm(head_size)
+#         # Normalization layers
+#         self.read_keys_norm = nn.LayerNorm(head_size)
+#         self.write_keys_norm = nn.LayerNorm(head_size)
+#         self.memory_norm = nn.LayerNorm(head_size)
 
-        # Output layers
-        total_output_size = hidden_size + self.num_reads * head_size
-        self.pre_output_norm = nn.LayerNorm(total_output_size)
-        self.fc_proj = nn.Linear(total_output_size, output_size)
+#         # Output layers
+#         total_output_size = hidden_size + self.num_reads * head_size
+#         self.pre_output_norm = nn.LayerNorm(total_output_size)
+#         self.fc_proj = nn.Linear(total_output_size, output_size)
 
-        self.reset_parameters()
-        self.temperature = 4.0
+#         self.reset_parameters()
+#         self.temperature = 4.0
 
-    def reset_parameters(self):
-        """Initialize parameters"""
-        # Initialize LSTM params
-        for name, p in self.controller.named_parameters():
-            if 'weight' in name:
-                nn.init.orthogonal_(p)
-            elif 'bias' in name:
-                nn.init.constant_(p, 0)
+#     def reset_parameters(self):
+#         """Initialize parameters"""
+#         # Initialize LSTM params
+#         for name, p in self.controller.named_parameters():
+#             if 'weight' in name:
+#                 nn.init.orthogonal_(p)
+#             elif 'bias' in name:
+#                 nn.init.constant_(p, 0)
 
-        # Initialize memory operation layers
-        for name, p in self.named_parameters():
-            if 'fc_' in name and 'weight' in name:
-                nn.init.uniform_(p, -0.1, 0.1)
-            elif 'fc_' in name and 'bias' in name:
-                nn.init.constant_(p, 0)
+#         # Initialize memory operation layers
+#         for name, p in self.named_parameters():
+#             if 'fc_' in name and 'weight' in name:
+#                 nn.init.uniform_(p, -0.1, 0.1)
+#             elif 'fc_' in name and 'bias' in name:
+#                 nn.init.constant_(p, 0)
 
-    def _read_memory(self, memory, read_keys):
-        """Enhanced memory reading with transformer processing"""
-        # Transform memory
-        memory = self.memory_transformer(memory)
+#     def _read_memory(self, memory, read_keys):
+#         """Enhanced memory reading with transformer processing"""
+#         # Transform memory
+#         memory = self.memory_transformer(memory)
         
-        # Process read keys with transformer
-        read_keys = self.read_transformer(read_keys.view(-1, self.head_size).unsqueeze(1)).squeeze(1)
+#         # Process read keys with transformer
+#         read_keys = self.read_transformer(read_keys.view(-1, self.head_size).unsqueeze(1)).squeeze(1)
         
-        # Normalize memory and keys
-        memory_normalized = self.memory_norm(memory)
-        read_keys = self.read_keys_norm(read_keys).view(-1, self.num_reads, self.head_size)
+#         # Normalize memory and keys
+#         memory_normalized = self.memory_norm(memory)
+#         read_keys = self.read_keys_norm(read_keys).view(-1, self.num_reads, self.head_size)
 
-        # Compute attention weights
-        read_weights = torch.softmax(
-            torch.einsum('bnh,bmh->bnm', read_keys, memory_normalized)/self.temperature,
-            dim=2
-        )
-        read_vectors = torch.einsum('bnm,bmh->bnh', read_weights, memory)
-        return read_vectors
+#         # Compute attention weights
+#         read_weights = torch.softmax(
+#             torch.einsum('bnh,bmh->bnm', read_keys, memory_normalized)/self.temperature,
+#             dim=2
+#         )
+#         read_vectors = torch.einsum('bnm,bmh->bnh', read_weights, memory)
+#         return read_vectors
 
-    def _write_memory(self, memory, write_keys, write_str, erase_vec, write_vec):
-        """Enhanced memory writing with transformer processing"""
-        # Transform memory
-        memory = self.memory_transformer(memory)
+#     def _write_memory(self, memory, write_keys, write_str, erase_vec, write_vec):
+#         """Enhanced memory writing with transformer processing"""
+#         # Transform memory
+#         memory = self.memory_transformer(memory)
         
-        # Normalize memory and keys
-        memory_normalized = self.memory_norm(memory)
-        write_keys = self.write_keys_norm(write_keys)
+#         # Normalize memory and keys
+#         memory_normalized = self.memory_norm(memory)
+#         write_keys = self.write_keys_norm(write_keys)
 
-        # Compute write weights
-        write_weights = torch.softmax(
-            torch.einsum('bh,bmh->bm', write_keys, memory_normalized)/self.temperature,
-            dim=1
-        ).unsqueeze(1)
+#         # Compute write weights
+#         write_weights = torch.softmax(
+#             torch.einsum('bh,bmh->bm', write_keys, memory_normalized)/self.temperature,
+#             dim=1
+#         ).unsqueeze(1)
 
-        # Scale by write strength
-        write_weights = write_weights * write_str.unsqueeze(1)
+#         # Scale by write strength
+#         write_weights = write_weights * write_str.unsqueeze(1)
 
-        # Update memory
-        erase = torch.einsum('bnm,bh->bmh', write_weights, erase_vec)
-        write = torch.einsum('bnm,bh->bmh', write_weights, write_vec)
-        memory = memory * (1 - erase) + write
+#         # Update memory
+#         erase = torch.einsum('bnm,bh->bmh', write_weights, erase_vec)
+#         write = torch.einsum('bnm,bh->bmh', write_weights, write_vec)
+#         memory = memory * (1 - erase) + write
         
-        return memory
+#         return memory
 
-    def forward(self, x_emb, hidden=None, memory=None):
-        B, L, E = x_emb.size()
-        device = x_emb.device
+#     def forward(self, x_emb, hidden=None, memory=None):
+#         B, L, E = x_emb.size()
+#         device = x_emb.device
 
-        # Initialize states if needed
-        if hidden is None:
-            h0 = x_emb.new_zeros(1, B, self.hidden_size)
-            c0 = x_emb.new_zeros(1, B, self.hidden_size)
-            hidden = (h0, c0)
+#         # Initialize states if needed
+#         if hidden is None:
+#             h0 = x_emb.new_zeros(1, B, self.hidden_size)
+#             c0 = x_emb.new_zeros(1, B, self.hidden_size)
+#             hidden = (h0, c0)
 
-        if memory is None:
-            memory = x_emb.new_zeros(B, self.memory_size, self.head_size)
+#         if memory is None:
+#             memory = x_emb.new_zeros(B, self.memory_size, self.head_size)
 
-        read_vec = x_emb.new_zeros(B, self.num_reads * self.head_size)
-        outputs = []
+#         read_vec = x_emb.new_zeros(B, self.num_reads * self.head_size)
+#         outputs = []
 
-        for t in range(L):
-            # LSTM controller
-            inp_t = torch.cat([x_emb[:, t, :], read_vec], dim=-1)
-            inp_t = self.input_norm(inp_t)
-            out_ctrl, hidden = self.controller(inp_t.unsqueeze(1), hidden)
-            h = self.controller_norm(out_ctrl.squeeze(1))
+#         for t in range(L):
+#             # LSTM controller
+#             inp_t = torch.cat([x_emb[:, t, :], read_vec], dim=-1)
+#             inp_t = self.input_norm(inp_t)
+#             out_ctrl, hidden = self.controller(inp_t.unsqueeze(1), hidden)
+#             h = self.controller_norm(out_ctrl.squeeze(1))
 
-            # Memory parameters
-            read_keys = self.fc_read_keys(h).view(B, self.num_reads, self.head_size)
-            write_keys = self.fc_write_keys(h)
-            write_str = torch.sigmoid(self.fc_write_strength(h))
-            erase_vec = torch.sigmoid(self.fc_erase_vector(h))
-            write_vec = torch.tanh(self.fc_add_vector(h))
+#             # Memory parameters
+#             read_keys = self.fc_read_keys(h).view(B, self.num_reads, self.head_size)
+#             write_keys = self.fc_write_keys(h)
+#             write_str = torch.sigmoid(self.fc_write_strength(h))
+#             erase_vec = torch.sigmoid(self.fc_erase_vector(h))
+#             write_vec = torch.tanh(self.fc_add_vector(h))
 
-            # Memory operations with transformer enhancement
-            memory = self._write_memory(memory, write_keys, write_str, erase_vec, write_vec)
-            read_vectors = self._read_memory(memory, read_keys)
-            read_vec = read_vectors.reshape(B, -1)
+#             # Memory operations with transformer enhancement
+#             memory = self._write_memory(memory, write_keys, write_str, erase_vec, write_vec)
+#             read_vectors = self._read_memory(memory, read_keys)
+#             read_vec = read_vectors.reshape(B, -1)
 
-            # Output projection
-            output = torch.cat([h, read_vec], dim=-1)
-            output = self.pre_output_norm(output)
-            logits = self.fc_proj(output)
-            outputs.append(logits.unsqueeze(1))
+#             # Output projection
+#             output = torch.cat([h, read_vec], dim=-1)
+#             output = self.pre_output_norm(output)
+#             logits = self.fc_proj(output)
+#             outputs.append(logits.unsqueeze(1))
 
-        outputs = torch.cat(outputs, dim=1)
-        return outputs, memory, hidden
-
-
+#         outputs = torch.cat(outputs, dim=1)
+#         return outputs, memory, hidden
 
 
 
-############
-# MAMBA
-#############
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+
+
+# ############
+# # MAMBA
+# #############
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
 
 class MambaMultiheadSelfAttention(nn.Module):
     """
@@ -1467,62 +1471,62 @@ class MambaEncoder(nn.Module):
         return x
 
 
-class Mamba(nn.Module):
-    """
-    A minimal Transformer encoder that uses Mamba-based multihead self-attn,
-    but automatically adjusts head_size if there's a mismatch.
-    """
-    def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed):
-        """
-        Args:
-            input_size  (int): model dimension (d_model).
-            output_size (int): final projection dimension (e.g. vocab size).
-            hidden_size (int): feedforward dimension in each encoder block.
-            memory_size (int): not used in the forward pass, included for interface only.
-            head_size   (int): user-desired dimension per head.
-            num_heads   (int): number of attention heads.
-            embed       (nn.Embedding): embedding layer.
-        """
-        super().__init__()
-        self.embed = embed
-        self.input_size = input_size
-        self.output_size = output_size
-        self.hidden_size = hidden_size
-        self.memory_size = memory_size
-        self.num_heads = num_heads
+# class Mamba(nn.Module):
+#     """
+#     A minimal Transformer encoder that uses Mamba-based multihead self-attn,
+#     but automatically adjusts head_size if there's a mismatch.
+#     """
+#     def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed):
+#         """
+#         Args:
+#             input_size  (int): model dimension (d_model).
+#             output_size (int): final projection dimension (e.g. vocab size).
+#             hidden_size (int): feedforward dimension in each encoder block.
+#             memory_size (int): not used in the forward pass, included for interface only.
+#             head_size   (int): user-desired dimension per head.
+#             num_heads   (int): number of attention heads.
+#             embed       (nn.Embedding): embedding layer.
+#         """
+#         super().__init__()
+#         self.embed = embed
+#         self.input_size = input_size
+#         self.output_size = output_size
+#         self.hidden_size = hidden_size
+#         self.memory_size = memory_size
+#         self.num_heads = num_heads
 
-        # If user gave a mismatch, override head_size so that head_size * num_heads == input_size
-        if head_size * num_heads != input_size:
-            # automatically fix if possible
-            new_head_size = input_size // num_heads
-            if input_size % num_heads != 0:
-                # fallback approach: pick num_heads=1 if we can't do an even split
-                # or raise an error, your choice:
-                raise ValueError(f"Cannot evenly distribute input_size={input_size} among num_heads={num_heads}.\n"
-                                 f"Either adjust input_size or num_heads so they match, or set head_size accordingly.")
-            print(f"[Mamba] Overriding head_size from {head_size} -> {new_head_size} so that {new_head_size} * {num_heads} = {input_size}")
-            head_size = new_head_size
+#         # If user gave a mismatch, override head_size so that head_size * num_heads == input_size
+#         if head_size * num_heads != input_size:
+#             # automatically fix if possible
+#             new_head_size = input_size // num_heads
+#             if input_size % num_heads != 0:
+#                 # fallback approach: pick num_heads=1 if we can't do an even split
+#                 # or raise an error, your choice:
+#                 raise ValueError(f"Cannot evenly distribute input_size={input_size} among num_heads={num_heads}.\n"
+#                                  f"Either adjust input_size or num_heads so they match, or set head_size accordingly.")
+#             print(f"[Mamba] Overriding head_size from {head_size} -> {new_head_size} so that {new_head_size} * {num_heads} = {input_size}")
+#             head_size = new_head_size
 
-        # Build the encoder
-        self.encoder = MambaEncoder(
-            d_model=input_size,
-            nhead=num_heads,
-            num_layers=2,                 # or parameterize further
-            dim_feedforward=hidden_size,
-            dropout=0.1
-        )
+#         # Build the encoder
+#         self.encoder = MambaEncoder(
+#             d_model=input_size,
+#             nhead=num_heads,
+#             num_layers=2,                 # or parameterize further
+#             dim_feedforward=hidden_size,
+#             dropout=0.1
+#         )
 
-        self.fc_out = nn.Linear(input_size, output_size)
+#         self.fc_out = nn.Linear(input_size, output_size)
 
-    def forward(self, x_emb, hidden=None, memory=None):
-        """
-        x_emb: [B, L, input_size]
-        hidden, memory: placeholders for interface parity
-        Returns: out: [B, L, output_size], None, (None, None)
-        """
-        enc_out = self.encoder(x_emb)
-        out = self.fc_out(enc_out)
-        return out, None, (None, None)
+#     def forward(self, x_emb, hidden=None, memory=None):
+#         """
+#         x_emb: [B, L, input_size]
+#         hidden, memory: placeholders for interface parity
+#         Returns: out: [B, L, output_size], None, (None, None)
+#         """
+#         enc_out = self.encoder(x_emb)
+#         out = self.fc_out(enc_out)
+#         return out, None, (None, None)
 
 
 
@@ -1668,45 +1672,257 @@ class DNC(nn.Module):
 
 
 
-class TransformerController(nn.Module):
-    def __init__(self, d_model=128, nhead=4, num_layers=2, dim_feedforward=256, dropout=0):
-        super(TransformerController, self).__init__()
-        encoder_layer= nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead,
-                                                  dim_feedforward=dim_feedforward,
-                                                  dropout=dropout, batch_first=True)
-        self.encoder= nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-    def forward(self, x):
-        return self.encoder(x)
 
+
+
+
+###### NEW MAMBA AND TRANFORMER CLASSES 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 class Transformer(nn.Module):
+    """
+    A single-layer (or minimal) Transformer for causal LM.
+    Feeds entire sequence, uses create_causal_mask, 
+    slices out the 'context_length' portion from the loss if asked.
+    """
     def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed):
-        super(Transformer, self).__init__()
+        super().__init__()
         self.embed = embed
+
+        # We'll define d_model as num_heads * head_size
+        # so it is divisible by num_heads
+        self.d_model = num_heads * head_size
         
-        # Project input to a dimension that's compatible with num_heads
-        # Make d_model a multiple of num_heads
-        self.d_model = num_heads * head_size  # This ensures d_model is divisible by num_heads
-        self.input_proj = nn.Linear(input_size, self.d_model)
+        # A small projection from input_size -> d_model
+        self.input_proj = nn.Linear(input_size, self.d_model, bias=False)
         
-        self.transformer = TransformerController(
-            d_model=self.d_model,  # Use the projected dimension
-            nhead=num_heads,
-            num_layers=1,
-            dim_feedforward=4 * self.d_model  # Scale with d_model instead of input_size
+        # Single MultiheadAttention w/ batch_first = True
+        self.attention = nn.MultiheadAttention(self.d_model, num_heads, 
+                                               dropout=0.1, 
+                                               batch_first=True)
+        self.layer_norm1 = nn.LayerNorm(self.d_model)
+        self.layer_norm2 = nn.LayerNorm(self.d_model)
+
+        # Simple feed-forward
+        self.ffn = nn.Sequential(
+            nn.Linear(self.d_model, 4 * self.d_model),
+            nn.GELU(),
+            nn.Linear(4 * self.d_model, self.d_model),
         )
+
+        # Final projection to vocab
+        self.fc_out = nn.Linear(self.d_model, output_size, bias=True)
+
+    def create_causal_mask(self, seq_len, device):
+        """
+        Build a float mask [seq_len, seq_len] with -inf above the diagonal
+        so that position i cannot attend to positions j > i.
+        0.0 on the diagonal and below => allowed, 
+        -inf above diagonal => blocked.
+        """
+        mask = torch.full((seq_len, seq_len), float('-inf'), device=device)
+        mask = torch.triu(mask, diagonal=1)  # fill upper triangle w/ -inf
+        return mask
+
+    def forward(
+        self,
+        x_emb,                 # [B, L] long, or [B, L, E] if you embed outside
+        hidden=None,            # to conform to other model APIs but ignored
+        memory=None,            # to conform to other model APIs but ignored
+        context_length=None     # optional int to indicate how many prompt tokens to ignore in the loss
+    ):
+        """
+        If you are embedding outside the model, pass shape [B,L,E]. 
+        Otherwise, pass tokens [B,L], we do self.embed inside.
+
+        We'll do a single pass with a causal mask.
+        `context_length` is not used inside forward to slice out tokens 
+        (some folks prefer to do that logic outside). 
+        It's here only if you want to do the slicing inside the model. 
+        """
+        
+        
+        B, L, E = x_emb.shape
+        device = x_emb.device
+
+        # Project input to Transformer dimension
+        x_proj = self.input_proj(x_emb)  # [B, L, d_model]
+
+        # Create causal mask
+        attn_mask = self.create_causal_mask(L, device=device)  # [L, L]
+
+        # Self-attention
+        attn_out, _ = self.attention(x_proj, x_proj, x_proj, 
+                                     attn_mask=attn_mask, 
+                                     need_weights=False)
+        # Residual + norm
+        x = self.layer_norm1(x_proj + attn_out)
+
+        # Feed-forward
+        ff_out = self.ffn(x)
+        x = self.layer_norm2(x + ff_out)
+
+        # Final projection to vocab
+        logits = self.fc_out(x)  # [B, L, vocab_size]
+
+        return logits, None, None
+
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt_ids,        # [B, prompt_len], e.g. token IDs of the prompt
+        max_new_tokens=50,
+        temperature=1.0,
+        stop_id=None
+    ):
+        """
+        Autoregressive generation. Each iteration:
+          - embed the entire sequence so far
+          - forward pass with causal mask
+          - pick the last token's distribution
+          - sample or argmax next token
+          - append to sequence
+        """
+        B = prompt_ids.size(0)
+        generated = prompt_ids.clone()  # copy
+        for _ in range(max_new_tokens):
+            # 1) forward on the entire sequence so far
+            logits, _, _ = self(generated)  # shape [B, seq_so_far, vocab]
+            next_logits = logits[:, -1, :] / temperature
+            # 2) greedy or sample
+            # let's do greedy for simplicity
+            next_token = torch.argmax(next_logits, dim=-1, keepdim=True)  # [B,1]
+            # 3) append
+            generated = torch.cat([generated, next_token], dim=1)
+            # 4) optional stop if the next_token == stop_id
+            if stop_id is not None:
+                if (next_token == stop_id).all():
+                    break
+        return generated  # shape [B, prompt_len + new_tokens]
+
+
+
+
+class Mamba(nn.Module):
+    """
+    A 2-layer "Mamba" encoder using a custom multi-head self-attention,
+    again with a full lower-triangular mask for causality.
+    """
+    def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed):
+        super().__init__()
+        self.embed = embed
+        self.d_model = num_heads * head_size
+        self.input_proj = nn.Linear(input_size, self.d_model, bias=False)
+
+        # We'll just do 2 MambaEncoderBlocks for demonstration
+        self.layers = nn.ModuleList([
+            MambaEncoderBlock(d_model=self.d_model,
+                              nhead=num_heads,
+                              dim_feedforward=hidden_size,
+                              dropout=0.1)
+            for _ in range(2)
+        ])
+
+        self.norm_final = nn.LayerNorm(self.d_model)
         self.fc_out = nn.Linear(self.d_model, output_size)
+
+    def create_causal_mask(self, seq_len, device):
+        mask = torch.full((seq_len, seq_len), float('-inf'), device=device)
+        mask = torch.triu(mask, diagonal=1)
+        return mask
+
+    def forward(self, 
+                x_emb, 
+                hidden=None,            # to conform to other model APIs but ignored
+                memory=None,            # to conform to other model APIs but ignored
+                context_length=None):
+        """
+        tokens: [B,L] or [B,L,E].
+        """
+
+        B, L, E = x_emb.shape
+        device = x_emb.device
+
+        x = self.input_proj(x_emb)
+
+        # Build causal mask
+        attn_mask = self.create_causal_mask(L, device=device)
+
+        # Pass through each MambaEncoderBlock
+        for layer in self.layers:
+            x = layer(x, mask=attn_mask)
+
+        x = self.norm_final(x)
+        logits = self.fc_out(x)  # [B, L, vocab_size]
+
+        return logits, None, None
+
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt_ids,
+        max_new_tokens=50,
+        temperature=1.0,
+        stop_id=None
+    ):
+        B = prompt_ids.size(0)
+        generated = prompt_ids.clone()
+        for _ in range(max_new_tokens):
+            logits, _, _ = self(generated)
+            next_logits = logits[:, -1, :] / temperature
+            next_token = torch.argmax(next_logits, dim=-1, keepdim=True)
+            generated = torch.cat([generated, next_token], dim=1)
+
+            if stop_id is not None:
+                if (next_token == stop_id).all():
+                    break
+        return generated
+
+
+
+
+
+# class TransformerController(nn.Module):
+#     def __init__(self, d_model=128, nhead=4, num_layers=2, dim_feedforward=256, dropout=0):
+#         super(TransformerController, self).__init__()
+#         encoder_layer= nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead,
+#                                                   dim_feedforward=dim_feedforward,
+#                                                   dropout=dropout, batch_first=True)
+#         self.encoder= nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+#     def forward(self, x):
+#         return self.encoder(x)
+
+
+# class Transformer(nn.Module):
+#     def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed):
+#         super(Transformer, self).__init__()
+#         self.embed = embed
         
-    def forward(self, x_emb, hidden=None, memory=None):
-        # Project input to transformer dimension
-        x_proj = self.input_proj(x_emb)
+#         # Project input to a dimension that's compatible with num_heads
+#         # Make d_model a multiple of num_heads
+#         self.d_model = num_heads * head_size  # This ensures d_model is divisible by num_heads
+#         self.input_proj = nn.Linear(input_size, self.d_model)
         
-        # Pass through transformer
-        trans_out = self.transformer(x_proj)
+#         self.transformer = TransformerController(
+#             d_model=self.d_model,  # Use the projected dimension
+#             nhead=num_heads,
+#             num_layers=1,
+#             dim_feedforward=4 * self.d_model  # Scale with d_model instead of input_size
+#         )
+#         self.fc_out = nn.Linear(self.d_model, output_size)
         
-        # Project to output size
-        out = self.fc_out(trans_out)
-        return out, None, (None, None)
+#     def forward(self, x_emb, hidden=None, memory=None):
+#         # Project input to transformer dimension
+#         x_proj = self.input_proj(x_emb)
+        
+#         # Pass through transformer
+#         trans_out = self.transformer(x_proj)
+        
+#         # Project to output size
+#         out = self.fc_out(trans_out)
+#         return out, None, (None, None)
 
 ##############################################################################
 # Grouping parameters by top-level "layer" for faster "layerwise" mezo
@@ -1943,132 +2159,180 @@ def group_params_by_layer(named_params):
 #     avg_loss = total_loss / total_predicted_tokens
 #     return avg_loss
 
-def teacher_forcing_loss_emb(model, x_emb, y_ids_unpadded, criterion, chunk_size=32, backward=False):
-    B, Lx, E = x_emb.shape
-    Ly = y_ids_unpadded.shape[1]
+def teacher_forcing_loss_emb(model, x_ids, y_ids_unpadded, criterion, chunk_size=32, x_emb=None):
 
-    hidden = None
-    memory = None
-    total_loss = 0.0
-    total_predicted_tokens = 0
+    try:
+        
+        if x_emb == None:
+            x_emb = model.embed(x_ids)
+            
+        B, Lx, E = x_emb.shape
+        Ly = y_ids_unpadded.shape[1]
+        
     
-    # Process input sequence first
-    pos = 0
-    while pos < Lx:
-        chunk_end = min(pos + chunk_size, Lx)
-        input_chunk = x_emb[:, pos:chunk_end, :]
-        
-        out_chunk, mem_new, hidden_new = model(input_chunk, hidden=hidden, memory=memory)
-        hidden = hidden_new
-        memory = mem_new
-        pos = chunk_end
-
-    # Now process target sequence chunk by chunk
-    pos = 0
-    while pos < Ly - 1:  # -1 because we don't embed the last target token
-        chunk_end = min(pos + chunk_size, Ly - 1)
-        # Only embed the current chunk of target sequence
-        y_chunk = y_ids_unpadded[:, pos:chunk_end]
-        y_emb_chunk = model.embed(y_chunk)
-        
-        out_chunk, mem_new, hidden_new = model(y_emb_chunk, hidden=hidden, memory=memory)
-        
-        # Update states
-        hidden = hidden_new
-        memory = mem_new
-
-        # Compute loss for this chunk
-        out_chunk = out_chunk.reshape(-1, out_chunk.size(-1))
-        targets = y_ids_unpadded[:, pos+1:chunk_end+1].reshape(-1)  # shift by 1 for next-token prediction
-        
-        if targets.size(0) > 0:  # ensure we have targets
-            chunk_loss = criterion(out_chunk, targets)
-            # if backward:
-            #     chunk_loss.backward()
-            total_loss += chunk_loss * targets.size(0)
-            total_predicted_tokens += targets.size(0)
-        
-        pos = chunk_end
-
-    if total_predicted_tokens == 0:
-        pdb.set_trace()
-        return 0.0
-
-    avg_loss = total_loss / total_predicted_tokens
-    return avg_loss
-
-
-
-
-def teacher_forcing_loss_emb_detatch_version(model, x_emb, y_ids_unpadded, criterion, chunk_size=256, backward=False):
-    B, Lx, E = x_emb.shape
-    Ly = y_ids_unpadded.shape[1]
-    total_loss = 0.0
-    total_predicted_tokens = 0
-    
-    # Initialize states
-    hidden = None
-    memory = None
-    
-    # Process input sequence first
-    pos = 0
-    while pos < Lx:
-        chunk_end = min(pos + chunk_size, Lx)
-        # Process input chunk
-        input_chunk = x_emb[:, pos:chunk_end, :]
-        out_chunk, mem_new, hidden_new = model(input_chunk, hidden=hidden, memory=memory)
-        
-        # Update states with detached versions
-        if isinstance(hidden_new, tuple):
-            hidden = tuple(h for h in hidden_new)
+        if isinstance(model, (Transformer, Mamba)):
+            # Build partial target embedding (same as before)
+            y_emb_input = model.embed(y_ids_unpadded)
+            full_input_emb = torch.cat([x_emb, y_emb_input], dim=1)[:, :-1]
+            full_input_ids = torch.cat([x_ids, y_ids_unpadded], dim=1)[:, 1:] #do fully autoregressive
+            
+            # Get outputs
+            outputs, _, _ = model(full_input_emb)
+            
+            # Get logits starting from context
+            # logits = outputs[:, (Lx-1):, :]
+            logits = outputs
+            
+            # Flatten predictions
+            logits_2d = logits.reshape(-1, logits.size(-1))
+            
+            # CHANGE: Use shifted targets to match RNN branch
+            # gold = y_ids_unpadded[:, 1:].reshape(-1)  # Start from index 1
+            gold = full_input_ids.reshape(-1)  # Start from index 0
+            
+            # Handle size mismatches (same as before)
+            if gold.size(0) != logits_2d.size(0):
+                pdb.set_trace()
+                min_size = min(gold.size(0), logits_2d.size(0))
+                gold = gold[:min_size]
+                logits_2d = logits_2d[:min_size, :]
+            # print(f"logits_2d size : {logits_2d.shape} gold size : {gold.shape}")
+            # Calculate loss (similar to RNN branch)
+            avg_loss = criterion(logits_2d, gold)
+            
+            return avg_loss  
         else:
-            hidden = hidden_new if hidden_new is not None else None
-        memory = mem_new if mem_new is not None else None
+            
+            hidden = None
+            memory = None
+            total_loss = 0.0
+            total_predicted_tokens = 0
+            
+            # Process input sequence first
+            pos = 0
+            # 1) If it's a Transformer or Mamba => single-pass causal approach
+            while pos < Lx:
+                chunk_end = min(pos + chunk_size, Lx)
+                input_chunk = x_emb[:, pos:chunk_end, :]
+                
+                out_chunk, mem_new, hidden_new = model(input_chunk, hidden=hidden, memory=memory)
+                hidden = hidden_new
+                memory = mem_new
+                pos = chunk_end
         
-        del out_chunk, mem_new, hidden_new
-        torch.cuda.empty_cache()
-        pos = chunk_end
-
-    # Now process target sequence
-    pos = 0
-    while pos < Ly - 1:  # -1 because we predict next token
-        chunk_end = min(pos + chunk_size, Ly - 1)
+            # Now process target sequence chunk by chunk
+            pos = 0
+            while pos < Ly - 1:  # -1 because we don't embed the last target token
+                chunk_end = min(pos + chunk_size, Ly - 1)
+                # Only embed the current chunk of target sequence
+                y_chunk = y_ids_unpadded[:, pos:chunk_end]
+                y_emb_chunk = model.embed(y_chunk)
+                
+                out_chunk, mem_new, hidden_new = model(y_emb_chunk, hidden=hidden, memory=memory)
+                
+                # Update states
+                hidden = hidden_new
+                memory = mem_new
         
-        # Get target chunk
-        y_chunk = y_ids_unpadded[:, pos:chunk_end]
-        y_emb_chunk = model.embed(y_chunk)
-        
-        # Forward pass
-        out_chunk, mem_new, hidden_new = model(y_emb_chunk, hidden=hidden, memory=memory)
-        
-        # Compute loss for this chunk
-        out_chunk_flat = out_chunk.reshape(-1, out_chunk.size(-1))
-        targets = y_ids_unpadded[:, pos+1:chunk_end+1].reshape(-1)  # shift by 1 for next-token prediction
-        
-        if targets.size(0) > 0:  # ensure we have targets
-            if backward:
-                chunk_loss = criterion(out_chunk_flat, targets)
-                chunk_loss.backward()
-                total_loss += chunk_loss * targets.size(0)
-            else:
-                with torch.no_grad():
-                    chunk_loss = criterion(out_chunk_flat, targets)
+                # Compute loss for this chunk
+                out_chunk = out_chunk.reshape(-1, out_chunk.size(-1))
+                targets = y_ids_unpadded[:, pos+1:chunk_end+1].reshape(-1)  # shift by 1 for next-token prediction
+                
+                if targets.size(0) > 0:  # ensure we have targets
+                    chunk_loss = criterion(out_chunk, targets)
                     total_loss += chunk_loss * targets.size(0)
-            total_predicted_tokens += targets.size(0)
+                    total_predicted_tokens += targets.size(0)
+                
+                pos = chunk_end
         
-        # Update states with detached versions
-        if isinstance(hidden_new, tuple):
-            hidden = tuple(h.detach() for h in hidden_new)
-        else:
-            hidden = hidden_new.detach() if hidden_new is not None else None
-        memory = mem_new.detach() if mem_new is not None else None
+            if total_predicted_tokens == 0:
+                pdb.set_trace()
+                return 0.0
         
-        # Clean up
-        del out_chunk, out_chunk_flat, mem_new, hidden_new, y_emb_chunk, y_chunk
-        torch.cuda.empty_cache()
-        pos = chunk_end
+            avg_loss = total_loss / total_predicted_tokens # you have to do the average of averages
+            return avg_loss
 
-    return total_loss / total_predicted_tokens if total_predicted_tokens > 0 else 0.0
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"OOM in teacher_forcing_loss_emb: {str(e)}")
+        torch.cuda.empty_cache()
+        raise  # Re-raise to be caught by train_micro_batch
+
+    except Exception as e:
+        print(f"Error in teacher_forcing_loss_emb: {str(e)}")
+        torch.cuda.empty_cache()
+        raise  # Re-raise to be caught by train_micro_batch
+
+
+
+# def teacher_forcing_loss_emb_detatch_version(model, x_emb, y_ids_unpadded, criterion, chunk_size=256, backward=False):
+#     B, Lx, E = x_emb.shape
+#     Ly = y_ids_unpadded.shape[1]
+#     total_loss = 0.0
+#     total_predicted_tokens = 0
+    
+#     # Initialize states
+#     hidden = None
+#     memory = None
+    
+#     # Process input sequence first
+#     pos = 0
+#     while pos < Lx:
+#         chunk_end = min(pos + chunk_size, Lx)
+#         # Process input chunk
+#         input_chunk = x_emb[:, pos:chunk_end, :]
+#         out_chunk, mem_new, hidden_new = model(input_chunk, hidden=hidden, memory=memory)
+        
+#         # Update states with detached versions
+#         if isinstance(hidden_new, tuple):
+#             hidden = tuple(h for h in hidden_new)
+#         else:
+#             hidden = hidden_new if hidden_new is not None else None
+#         memory = mem_new if mem_new is not None else None
+        
+#         del out_chunk, mem_new, hidden_new
+#         torch.cuda.empty_cache()
+#         pos = chunk_end
+
+#     # Now process target sequence
+#     pos = 0
+#     while pos < Ly - 1:  # -1 because we predict next token
+#         chunk_end = min(pos + chunk_size, Ly - 1)
+        
+#         # Get target chunk
+#         y_chunk = y_ids_unpadded[:, pos:chunk_end]
+#         y_emb_chunk = model.embed(y_chunk)
+        
+#         # Forward pass
+#         out_chunk, mem_new, hidden_new = model(y_emb_chunk, hidden=hidden, memory=memory)
+        
+#         # Compute loss for this chunk
+#         out_chunk_flat = out_chunk.reshape(-1, out_chunk.size(-1))
+#         targets = y_ids_unpadded[:, pos+1:chunk_end+1].reshape(-1)  # shift by 1 for next-token prediction
+        
+#         if targets.size(0) > 0:  # ensure we have targets
+#             if backward:
+#                 chunk_loss = criterion(out_chunk_flat, targets)
+#                 chunk_loss.backward()
+#                 total_loss += chunk_loss * targets.size(0)
+#             else:
+#                 with torch.no_grad():
+#                     chunk_loss = criterion(out_chunk_flat, targets)
+#                     total_loss += chunk_loss * targets.size(0)
+#             total_predicted_tokens += targets.size(0)
+        
+#         # Update states with detached versions
+#         if isinstance(hidden_new, tuple):
+#             hidden = tuple(h.detach() for h in hidden_new)
+#         else:
+#             hidden = hidden_new.detach() if hidden_new is not None else None
+#         memory = mem_new.detach() if mem_new is not None else None
+        
+#         # Clean up
+#         del out_chunk, out_chunk_flat, mem_new, hidden_new, y_emb_chunk, y_chunk
+#         torch.cuda.empty_cache()
+#         pos = chunk_end
+
+#     return total_loss / total_predicted_tokens if total_predicted_tokens > 0 else 0.0
 
 
 
@@ -2338,149 +2602,518 @@ def mezo_char_layerwise(model, x_emb, y, criterion, epsilon=1e-3):
 ##############################################################################
 # Activity-based Node Perturbation (ANP) : NOT TESTED! TODO 
 ##############################################################################
-def anp_single(model, x_emb, y, criterion, epsilon=1e-3, decorrelation_matrix=None, verbose=False):
+# def anp_single(model, x_ids, y, criterion, epsilon=1e-3, decorrelation_matrix=None, verbose=False):
+#     """
+#     Implements Activity-based Node Perturbation (ANP) for gradient-free training with decorrelation.
+
+#     Args:
+#         model (torch.nn.Module): The neural network model to train.
+#         x_ids
+#         y (torch.Tensor): Ground truth labels.
+#         criterion (callable): Loss function.
+#         epsilon (float): Perturbation magnitude.
+#         decorrelation_matrix (torch.Tensor): Decorrelation matrix to be updated and persisted across time steps.
+#         verbose (bool): If True, prints detailed debug information.
+
+#     Returns:
+#         float: Average loss across the perturbed passes.
+#         torch.Tensor: Updated decorrelation matrix.
+#     """
+#     with torch.no_grad():
+#         x_embeddings = model.embed(x_ids)
+
+#         if verbose:
+#             print("\n=== ANP SINGLE DEBUG ===")  # Debug output header
+#             print(f"Input shape: {x_embeddings.shape}")  # Print input tensor shape
+#             print(f"Target shape: {y.shape}")  # Print target tensor shape
+    
+#         # Initialize a random seed for reproducibility of perturbations
+#         local_seed = torch.randint(0, 2**32, (1,)).item()  # Generate random seed
+#         all_params = list(model.parameters())  # Get all model parameters
+    
+#         # Ensure no gradients persist
+#         for p in all_params:
+#             if p.grad is not None:
+#                 p.grad.zero_()  # Zero out gradients
+    
+#         if verbose:
+#             print(f"\nRandom seed: {local_seed}")  # Print random seed
+#             print("Parameter shapes:")  # Print parameter shapes for debugging
+#             for i, p in enumerate(all_params):
+#                 if p.requires_grad:
+#                     print(f"Param {i}: {p.shape}")  # Print each parameter shape
+    
+#         # === Decorrelation Mechanism ===
+#         if decorrelation_matrix is None:
+#             decorrelation_matrix = torch.eye(x_embeddings.shape[-1], device=x_embeddings.device)  # Initialize decorrelation matrix if not provided
+    
+#         def decorrelate(inputs, decorrelation_matrix):
+#             # Apply decorrelation: x* = D * x
+#             return torch.matmul(inputs, decorrelation_matrix)
+    
+#         decorrelated_inputs = decorrelate(x_embeddings, decorrelation_matrix)  # Apply decorrelation to inputs
+    
+#         def update_decorrelation_matrix(decorrelation_matrix, decorrelated_inputs):
+#             # Update decorrelation matrix: ΔD = (x* x*^T - diag(x* x*)) D
+#             batch_size, seq_len, feature_dim = decorrelated_inputs.shape
+#             decorrelated_inputs_flat = decorrelated_inputs.reshape(batch_size * seq_len, feature_dim)
+#             covariance = torch.matmul(decorrelated_inputs_flat.T, decorrelated_inputs_flat) / (batch_size * seq_len)
+#             diagonal = torch.diag(torch.diag(covariance))
+#             update = torch.matmul(covariance - diagonal, decorrelation_matrix)
+#             return decorrelation_matrix - epsilon * update
+    
+#         decorrelation_matrix = update_decorrelation_matrix(decorrelation_matrix, decorrelated_inputs)
+    
+#         if verbose:
+#             print("\nDecorrelated inputs computed and decorrelation matrix updated.")  # Debug output for decorrelation
+    
+#         # === Clean Pass ===
+#         if verbose:
+#             print("\n=== Clean Pass ===")  # Debug output for clean pass
+    
+#         outputs_clean = model(decorrelated_inputs)  # Forward pass without perturbation
+#         pdb.set_trace()
+#         if isinstance(outputs_clean, tuple):  # Ensure output is a tensor
+#             outputs_clean = outputs_clean[0]
+#         outputs_clean = outputs_clean.view(-1, outputs_clean.size(-1))  # Flatten output
+#         y_flat = y.view(-1)  # Flatten target
+        
+#         loss_clean = criterion(outputs_clean, y_flat)  # Compute clean loss
+    
+#         # Capture pre-activations during the clean pass
+#         pre_activations_clean = {}
+#         for name, module in model.named_modules():
+#             if hasattr(module, 'weight') and module.weight.requires_grad:
+#                 pre_activations_clean[name] = module.weight.data.clone()
+    
+#         if verbose:
+#             print(f"Clean pass loss: {loss_clean.item()}")
+    
+#         # === Noisy Pass ===
+#         if verbose:
+#             print("\n=== Noisy Pass ===")  # Debug output for noisy pass
+    
+#         torch.manual_seed(local_seed)  # Reset the seed for reproducibility
+    
+#         pre_activation_differences = {}
+#         for i, (name, module) in enumerate(model.named_modules()):
+#             if hasattr(module, 'weight') and module.weight.requires_grad:
+#                 torch.manual_seed(local_seed + i)  # Reset seed for unique perturbations
+#                 perturbation = torch.randn_like(module.weight) * epsilon  # Generate random perturbation
+#                 module.weight.data.add_(perturbation)  # Apply perturbation to weights
+    
+#                 # Compute pre-activation difference
+#                 pre_activation_differences[name] = module.weight.data.clone() - pre_activations_clean[name]
+    
+#         outputs_noisy = model(decorrelated_inputs)  # Forward pass with perturbed weights
+#         if isinstance(outputs_noisy, tuple):
+#             outputs_noisy = outputs_noisy[0]  # Use the logits tensor
+#         outputs_noisy = outputs_noisy.view(-1, outputs_noisy.size(-1))  # Flatten output
+#         loss_noisy = criterion(outputs_noisy, y_flat)  # Compute noisy loss
+    
+#         if verbose:
+#             print(f"Noisy pass loss: {loss_noisy.item()}")
+    
+#         # Revert the weights to original state
+#         for i, (name, module) in enumerate(model.named_modules()):
+#             if hasattr(module, 'weight') and module.weight.requires_grad:
+#                 torch.manual_seed(local_seed + i)  # Reset the seed
+#                 perturbation = torch.randn_like(module.weight) * epsilon  # Generate identical perturbation
+#                 module.weight.data.sub_(perturbation)  # Revert to original weights
+    
+#         # === Compute Gradients ===
+#         grad_estimate = (loss_noisy - loss_clean) / (2.0 * epsilon)  # Estimate gradient
+    
+#         for name, module in model.named_modules():
+#             if hasattr(module, 'weight') and module.weight.requires_grad:
+#                 if name in pre_activation_differences:
+#                     pre_diff = pre_activation_differences[name]
+#                     normalized_pre_diff = pre_diff / (torch.norm(pre_diff) + 1e-8)  # Avoid division by zero
+#                     if module.weight.grad is None:
+#                         module.weight.grad = grad_estimate * normalized_pre_diff  # Initialize gradient
+#                     else:
+#                         module.weight.grad.add_(grad_estimate * normalized_pre_diff)  # Accumulate gradient
+    
+#         # === Average Loss ===
+#         avg_loss = 0.5 * (loss_clean.item() + loss_noisy.item())  # Compute average loss
+    
+#         if verbose:
+#             print(f"\nFinal average loss: {avg_loss}")  # Print average loss
+#             print("=== ANP Single Complete ===\n")  # Debug output footer
+
+#     return avg_loss, decorrelation_matrix  # Return average loss and updated decorrelation matrix
+
+
+
+# def anp_single(model, x_ids, y, criterion, epsilon=1e-3, decorrelation_matrix=None, verbose=True):
+#     with torch.no_grad():
+#         x_emb = model.embed(x_ids)
+#         B, Lx, E = x_emb.shape
+        
+#         if verbose:
+#             print("=== Model Parameter Shapes ===")
+#             for name, param in model.named_parameters():
+#                 print(f"{name}: {param.shape}")
+#             print("\n=== Input Shapes ===")
+#             print(f"x_emb shape: {x_emb.shape}")
+#             print(f"model.d_model: {model.d_model}")
+
+#         if isinstance(model, (Transformer, Mamba)):
+#             # Setup phase
+#             Ly = y.size(1)
+#             full_input_ids = torch.cat([x_ids, y], dim=1)
+#             max_seq_len = max(full_input_ids.size(1), 15)
+#             full_input_ids = full_input_ids[:, :max_seq_len]
+#             full_input_emb = model.embed(full_input_ids)
+
+#             # Initialize decorrelation matrix if needed
+#             if decorrelation_matrix is None:
+#                 decorrelation_matrix = torch.eye(full_input_emb.size(-1), device=x_emb.device)
+            
+#             # Store parameter-specific noises
+#             param_noises = {}
+            
+#             # Clean forward pass
+#             decorrelated_inputs = torch.matmul(full_input_emb, decorrelation_matrix)
+#             outputs_clean, _, _ = model(decorrelated_inputs)
+#             logits_clean = outputs_clean.reshape(-1, outputs_clean.size(-1))
+#             targets = full_input_ids.reshape(-1)
+#             min_size = min(logits_clean.size(0), targets.size(0))
+#             logits_clean = logits_clean[:min_size, :]
+#             targets = targets[:min_size]
+#             loss_clean = criterion(logits_clean, targets)
+
+#             # Noisy forward pass with careful parameter handling
+#             torch.manual_seed(torch.randint(0, 2**32, (1,)).item())
+            
+#             # First, generate and store all noises
+#             for name, param in model.named_parameters():
+#                 if param.requires_grad:
+#                     noise = torch.randn_like(param) * epsilon
+#                     param_noises[name] = noise
+#                     if verbose:
+#                         print(f"Adding noise to {name}: param shape {param.shape}, noise shape {noise.shape}")
+#                     param.data.add_(noise)
+
+#             # Forward pass with noise
+#             outputs_noisy, _, _ = model(decorrelated_inputs)
+#             logits_noisy = outputs_noisy.reshape(-1, outputs_noisy.size(-1))
+#             logits_noisy = logits_noisy[:min_size, :]
+#             loss_noisy = criterion(logits_noisy, targets)
+
+#             # Remove noise using stored values
+#             for name, param in model.named_parameters():
+#                 if param.requires_grad:
+#                     if verbose:
+#                         print(f"Removing noise from {name}: param shape {param.shape}, noise shape {param_noises[name].shape}")
+#                     param.data.sub_(param_noises[name])
+
+#             # Compute gradient estimate
+#             grad_estimate = (loss_noisy - loss_clean) / (2.0 * epsilon)
+            
+#             # Apply gradient estimate
+#             for param in model.parameters():
+#                 if param.requires_grad and param.grad is not None:
+#                     param.grad.add_(grad_estimate)
+
+#             avg_loss = 0.5 * (loss_clean.item() + loss_noisy.item())
+            
+#         else:
+#             if verbose:
+#                 print("\n=== ANP SINGLE DEBUG ===")  # Debug output header
+#                 print(f"Input shape: {x_emb.shape}")  # Print input tensor shape
+#                 print(f"Target shape: {y.shape}")  # Print target tensor shape
+        
+#             # Initialize a random seed for reproducibility of perturbations
+#             local_seed = torch.randint(0, 2**32, (1,)).item()  # Generate random seed
+#             all_params = list(model.parameters())  # Get all model parameters
+        
+#             # Ensure no gradients persist
+#             for p in all_params:
+#                 if p.grad is not None:
+#                     p.grad.zero_()  # Zero out gradients
+        
+#             if verbose:
+#                 print(f"\nRandom seed: {local_seed}")  # Print random seed
+#                 print("Parameter shapes:")  # Print parameter shapes for debugging
+#                 for i, p in enumerate(all_params):
+#                     if p.requires_grad:
+#                         print(f"Param {i}: {p.shape}")  # Print each parameter shape
+        
+#             # === Decorrelation Mechanism ===
+#             if decorrelation_matrix is None:
+#                 decorrelation_matrix = torch.eye(x_emb.shape[-1], device=x_emb.device)  # Initialize decorrelation matrix if not provided
+        
+#             def decorrelate(inputs, decorrelation_matrix):
+#                 # Apply decorrelation: x* = D * x
+#                 return torch.matmul(inputs, decorrelation_matrix)
+        
+#             decorrelated_inputs = decorrelate(x_emb, decorrelation_matrix)  # Apply decorrelation to inputs
+        
+#             def update_decorrelation_matrix(decorrelation_matrix, decorrelated_inputs):
+#                 # Update decorrelation matrix: ΔD = (x* x*^T - diag(x* x*)) D
+#                 batch_size, seq_len, feature_dim = decorrelated_inputs.shape
+#                 decorrelated_inputs_flat = decorrelated_inputs.reshape(batch_size * seq_len, feature_dim)
+#                 covariance = torch.matmul(decorrelated_inputs_flat.T, decorrelated_inputs_flat) / (batch_size * seq_len)
+#                 diagonal = torch.diag(torch.diag(covariance))
+#                 update = torch.matmul(covariance - diagonal, decorrelation_matrix)
+#                 return decorrelation_matrix - epsilon * update
+        
+#             decorrelation_matrix = update_decorrelation_matrix(decorrelation_matrix, decorrelated_inputs)
+        
+#             if verbose:
+#                 print("\nDecorrelated inputs computed and decorrelation matrix updated.")  # Debug output for decorrelation
+        
+#             # === Clean Pass ===
+#             if verbose:
+#                 print("\n=== Clean Pass ===")  # Debug output for clean pass
+        
+#             outputs_clean = model(decorrelated_inputs)  # Forward pass without perturbation
+#             pdb.set_trace()
+#             if isinstance(outputs_clean, tuple):  # Ensure output is a tensor
+#                 outputs_clean = outputs_clean[0]
+#             outputs_clean = outputs_clean.view(-1, outputs_clean.size(-1))  # Flatten output
+#             y_flat = y.view(-1)  # Flatten target
+            
+#             loss_clean = criterion(outputs_clean, y_flat)  # Compute clean loss
+        
+#             # Capture pre-activations during the clean pass
+#             pre_activations_clean = {}
+#             for name, module in model.named_modules():
+#                 if hasattr(module, 'weight') and module.weight.requires_grad:
+#                     pre_activations_clean[name] = module.weight.data.clone()
+        
+#             if verbose:
+#                 print(f"Clean pass loss: {loss_clean.item()}")
+        
+#             # === Noisy Pass ===
+#             if verbose:
+#                 print("\n=== Noisy Pass ===")  # Debug output for noisy pass
+        
+#             torch.manual_seed(local_seed)  # Reset the seed for reproducibility
+        
+#             pre_activation_differences = {}
+#             for i, (name, module) in enumerate(model.named_modules()):
+#                 if hasattr(module, 'weight') and module.weight.requires_grad:
+#                     torch.manual_seed(local_seed + i)  # Reset seed for unique perturbations
+#                     perturbation = torch.randn_like(module.weight) * epsilon  # Generate random perturbation
+#                     module.weight.data.add_(perturbation)  # Apply perturbation to weights
+        
+#                     # Compute pre-activation difference
+#                     pre_activation_differences[name] = module.weight.data.clone() - pre_activations_clean[name]
+        
+#             outputs_noisy = model(decorrelated_inputs)  # Forward pass with perturbed weights
+#             if isinstance(outputs_noisy, tuple):
+#                 outputs_noisy = outputs_noisy[0]  # Use the logits tensor
+#             outputs_noisy = outputs_noisy.view(-1, outputs_noisy.size(-1))  # Flatten output
+#             loss_noisy = criterion(outputs_noisy, y_flat)  # Compute noisy loss
+        
+#             if verbose:
+#                 print(f"Noisy pass loss: {loss_noisy.item()}")
+        
+#             # Revert the weights to original state
+#             for i, (name, module) in enumerate(model.named_modules()):
+#                 if hasattr(module, 'weight') and module.weight.requires_grad:
+#                     torch.manual_seed(local_seed + i)  # Reset the seed
+#                     perturbation = torch.randn_like(module.weight) * epsilon  # Generate identical perturbation
+#                     module.weight.data.sub_(perturbation)  # Revert to original weights
+        
+#             # === Compute Gradients ===
+#             grad_estimate = (loss_noisy - loss_clean) / (2.0 * epsilon)  # Estimate gradient
+        
+#             for name, module in model.named_modules():
+#                 if hasattr(module, 'weight') and module.weight.requires_grad:
+#                     if name in pre_activation_differences:
+#                         pre_diff = pre_activation_differences[name]
+#                         normalized_pre_diff = pre_diff / (torch.norm(pre_diff) + 1e-8)  # Avoid division by zero
+#                         if module.weight.grad is None:
+#                             module.weight.grad = grad_estimate * normalized_pre_diff  # Initialize gradient
+#                         else:
+#                             module.weight.grad.add_(grad_estimate * normalized_pre_diff)  # Accumulate gradient
+    
+#             # === Average Loss ===
+#             avg_loss = 0.5 * (loss_clean.item() + loss_noisy.item())  # Compute average loss
+#     return avg_loss, decorrelation_matrix
+
+def anp_single(model, x_ids, y, criterion, epsilon=1e-3, decorrelation_matrix=None, verbose=False):
     """
-    Implements Activity-based Node Perturbation (ANP) for gradient-free training with decorrelation.
+    Implements Activity-based Node Perturbation (ANP) for gradient-free training with decorrelation,
+    but uses teacher_forcing_loss_emb(...) to compute the forward loss for both 
+    Transformer/Mamba and legacy RNN/NTM/DNC models.
 
     Args:
         model (torch.nn.Module): The neural network model to train.
-        x_emb (torch.Tensor): Input embeddings (sequence data or feature vectors).
-        y (torch.Tensor): Ground truth labels.
-        criterion (callable): Loss function.
-        epsilon (float): Perturbation magnitude.
-        decorrelation_matrix (torch.Tensor): Decorrelation matrix to be updated and persisted across time steps.
-        verbose (bool): If True, prints detailed debug information.
+        x_ids (torch.LongTensor): [B, L], input token IDs.
+        y (torch.LongTensor): [B, L], ground truth token IDs.
+        criterion (callable): Loss function (e.g. CrossEntropy).
+        epsilon (float): Perturbation magnitude for the ANP steps.
+        decorrelation_matrix (torch.Tensor): Matrix used to decorrelate the input embeddings.
+        verbose (bool): If True, prints debug info about shapes, seeds, etc.
 
     Returns:
-        float: Average loss across the perturbed passes.
-        torch.Tensor: Updated decorrelation matrix.
+        avg_loss (float): 0.5 * (loss_clean + loss_noisy)
+        decorrelation_matrix (torch.Tensor): Updated matrix after this step.
     """
-    with torch.no_grad():
+    with torch.no_grad(): # DONT USE INFERENCE_MODE BC ANP NEEDS THE ACTIVATIONS! 
+        # ---------------------------------------------------------------
+        # 1) Get raw embeddings from x_ids
+        # ---------------------------------------------------------------
+        x_embeddings = model.embed(x_ids)
+
         if verbose:
-            print("\n=== ANP SINGLE DEBUG ===")  # Debug output header
-            print(f"Input shape: {x_emb.shape}")  # Print input tensor shape
-            print(f"Target shape: {y.shape}")  # Print target tensor shape
-    
-        # Initialize a random seed for reproducibility of perturbations
-        local_seed = torch.randint(0, 2**32, (1,)).item()  # Generate random seed
-        all_params = list(model.parameters())  # Get all model parameters
-    
-        # Ensure no gradients persist
+            print("\n=== ANP SINGLE DEBUG ===")
+            print(f" x_ids shape         : {x_ids.shape}")
+            print(f" x_embeddings shape  : {x_embeddings.shape}")
+            print(f" y shape             : {y.shape}")
+
+        # ---------------------------------------------------------------
+        # 2) Initialize random seed & zero old grads
+        # ---------------------------------------------------------------
+        local_seed = torch.randint(0, 2**32, (1,)).item()
+        all_params = list(model.parameters())
+
+        # Zero out old gradients
         for p in all_params:
             if p.grad is not None:
-                p.grad.zero_()  # Zero out gradients
-    
+                p.grad.zero_()
+
         if verbose:
-            print(f"\nRandom seed: {local_seed}")  # Print random seed
-            print("Parameter shapes:")  # Print parameter shapes for debugging
+            print(f"\nRandom seed: {local_seed}")
+            print("Parameter shapes:")
             for i, p in enumerate(all_params):
                 if p.requires_grad:
-                    print(f"Param {i}: {p.shape}")  # Print each parameter shape
-    
-        # === Decorrelation Mechanism ===
+                    print(f"  Param {i} -> shape {p.shape}")
+
+        # ---------------------------------------------------------------
+        # 3) Decorrelation
+        # ---------------------------------------------------------------
         if decorrelation_matrix is None:
-            decorrelation_matrix = torch.eye(x_emb.shape[-1], device=x_emb.device)  # Initialize decorrelation matrix if not provided
-    
-        def decorrelate(inputs, decorrelation_matrix):
-            # Apply decorrelation: x* = D * x
-            return torch.matmul(inputs, decorrelation_matrix)
-    
-        decorrelated_inputs = decorrelate(x_emb, decorrelation_matrix)  # Apply decorrelation to inputs
-    
-        def update_decorrelation_matrix(decorrelation_matrix, decorrelated_inputs):
-            # Update decorrelation matrix: ΔD = (x* x*^T - diag(x* x*)) D
-            batch_size, seq_len, feature_dim = decorrelated_inputs.shape
-            decorrelated_inputs_flat = decorrelated_inputs.reshape(batch_size * seq_len, feature_dim)
-            covariance = torch.matmul(decorrelated_inputs_flat.T, decorrelated_inputs_flat) / (batch_size * seq_len)
+            # shape: [embed_dim, embed_dim]
+            decorrelation_matrix = torch.eye(x_embeddings.shape[-1], device=x_embeddings.device)
+
+        def decorrelate(inputs, D):
+            # inputs: [B, L, E], D: [E, E]
+            return torch.matmul(inputs, D)
+
+        decorrelated_inputs = decorrelate(x_embeddings, decorrelation_matrix)
+        B, seq_len, emb_dim = decorrelated_inputs.shape
+
+        if verbose:
+            print(f"Decorrelated input shape: {decorrelated_inputs.shape} (B,L,E={emb_dim})")
+
+        def update_decorrelation_matrix(D, dec_inp):
+            # dec_inp: [B, L, E]
+            batch_size, seq_len, feature_dim = dec_inp.shape
+            flat = dec_inp.reshape(batch_size * seq_len, feature_dim)
+            # covariance [E, E]
+            covariance = torch.matmul(flat.T, flat) / (batch_size * seq_len)
             diagonal = torch.diag(torch.diag(covariance))
-            update = torch.matmul(covariance - diagonal, decorrelation_matrix)
-            return decorrelation_matrix - epsilon * update
-    
+            update_ = torch.matmul(covariance - diagonal, D)
+            return D - epsilon * update_
+
+        # Update decorrelation matrix
         decorrelation_matrix = update_decorrelation_matrix(decorrelation_matrix, decorrelated_inputs)
-    
+
         if verbose:
-            print("\nDecorrelated inputs computed and decorrelation matrix updated.")  # Debug output for decorrelation
-    
-        # === Clean Pass ===
+            print(f"Updated decorrelation matrix shape: {decorrelation_matrix.shape}")
+
+        # ---------------------------------------------------------------
+        # 4) Clean Pass => no perturbation
+        # ---------------------------------------------------------------
         if verbose:
-            print("\n=== Clean Pass ===")  # Debug output for clean pass
-    
-        outputs_clean = model(decorrelated_inputs)  # Forward pass without perturbation
-        if isinstance(outputs_clean, tuple):  # Ensure output is a tensor
-            outputs_clean = outputs_clean[0]
-        outputs_clean = outputs_clean.view(-1, outputs_clean.size(-1))  # Flatten output
-        y = y.view(-1)  # Flatten target
-        loss_clean = criterion(outputs_clean, y)  # Compute clean loss
-    
-        # Capture pre-activations during the clean pass
+            print("\n=== Clean Pass ===")
+
+        # Use teacher_forcing_loss_emb w/ x_emb = decorrelated_inputs
+        # The function does the forward pass internally (for RNN or Transformer).
+        loss_clean = teacher_forcing_loss_emb(
+            model,
+            x_ids,               # This is going to be ignored via the embeddings
+            y,                   
+            criterion=criterion,
+            x_emb=decorrelated_inputs  # ... override embeddings
+        )
+
+        if verbose:
+            print(f"Clean pass loss: {loss_clean.item():.6f}")
+
+        # Grab a snapshot of each weight for the "pre-activation difference" logic
         pre_activations_clean = {}
         for name, module in model.named_modules():
             if hasattr(module, 'weight') and module.weight.requires_grad:
                 pre_activations_clean[name] = module.weight.data.clone()
-    
+
+        # ---------------------------------------------------------------
+        # 5) Noisy Pass => random perturbation of the model weights
+        # ---------------------------------------------------------------
         if verbose:
-            print(f"Clean pass loss: {loss_clean.item()}")
-    
-        # === Noisy Pass ===
-        if verbose:
-            print("\n=== Noisy Pass ===")  # Debug output for noisy pass
-    
-        torch.manual_seed(local_seed)  # Reset the seed for reproducibility
-    
+            print("\n=== Noisy Pass ===")
+
+        torch.manual_seed(local_seed)  # same seed => same noise directions
         pre_activation_differences = {}
+
         for i, (name, module) in enumerate(model.named_modules()):
             if hasattr(module, 'weight') and module.weight.requires_grad:
-                torch.manual_seed(local_seed + i)  # Reset seed for unique perturbations
-                perturbation = torch.randn_like(module.weight) * epsilon  # Generate random perturbation
-                module.weight.data.add_(perturbation)  # Apply perturbation to weights
-    
-                # Compute pre-activation difference
-                pre_activation_differences[name] = module.weight.data.clone() - pre_activations_clean[name]
-    
-        outputs_noisy = model(decorrelated_inputs)  # Forward pass with perturbed weights
-        if isinstance(outputs_noisy, tuple):
-            outputs_noisy = outputs_noisy[0]  # Use the logits tensor
-        outputs_noisy = outputs_noisy.view(-1, outputs_noisy.size(-1))  # Flatten output
-        loss_noisy = criterion(outputs_noisy, y)  # Compute noisy loss
-    
+                # reset the seed for each param
+                torch.manual_seed(local_seed + i)
+                # random perturbation
+                perturbation = torch.randn_like(module.weight) * epsilon
+                module.weight.data.add_(perturbation)
+
+                # store difference
+                pre_activation_differences[name] = (
+                    module.weight.data.clone() - pre_activations_clean[name]
+                )
+
+        # Now measure the "noisy" forward pass
+        loss_noisy = teacher_forcing_loss_emb(
+            model,
+            x_ids,
+            y,
+            criterion=criterion,
+            chunk_size=32,
+            x_emb=decorrelated_inputs
+        )
+
         if verbose:
-            print(f"Noisy pass loss: {loss_noisy.item()}")
-    
-        # Revert the weights to original state
+            print(f"Noisy pass loss: {loss_noisy.item():.6f}")
+
+        # ---------------------------------------------------------------
+        # 6) Revert the model weights
+        # ---------------------------------------------------------------
+        torch.manual_seed(local_seed)
         for i, (name, module) in enumerate(model.named_modules()):
             if hasattr(module, 'weight') and module.weight.requires_grad:
-                torch.manual_seed(local_seed + i)  # Reset the seed
-                perturbation = torch.randn_like(module.weight) * epsilon  # Generate identical perturbation
-                module.weight.data.sub_(perturbation)  # Revert to original weights
-    
-        # === Compute Gradients ===
-        grad_estimate = (loss_noisy - loss_clean) / (2.0 * epsilon)  # Estimate gradient
-    
+                torch.manual_seed(local_seed + i)
+                revert_perturb = torch.randn_like(module.weight) * epsilon
+                module.weight.data.sub_(revert_perturb)
+
+        # ---------------------------------------------------------------
+        # 7) Compute gradient & apply to module.weight.grad
+        # ---------------------------------------------------------------
+        grad_estimate = (loss_noisy - loss_clean) / (2.0 * epsilon)
+        if verbose:
+            print(f"\nEstimated gradient: {grad_estimate.item():.6f}")
+
         for name, module in model.named_modules():
             if hasattr(module, 'weight') and module.weight.requires_grad:
                 if name in pre_activation_differences:
-                    pre_diff = pre_activation_differences[name]
-                    normalized_pre_diff = pre_diff / (torch.norm(pre_diff) + 1e-8)  # Avoid division by zero
+                    diff_ = pre_activation_differences[name]
+                    norm_ = torch.norm(diff_) + 1e-8
+                    normalized_pre_diff = diff_ / norm_
                     if module.weight.grad is None:
-                        module.weight.grad = grad_estimate * normalized_pre_diff  # Initialize gradient
+                        module.weight.grad = grad_estimate * normalized_pre_diff
                     else:
-                        module.weight.grad.add_(grad_estimate * normalized_pre_diff)  # Accumulate gradient
-    
-        # === Average Loss ===
-        avg_loss = 0.5 * (loss_clean.item() + loss_noisy.item())  # Compute average loss
-    
+                        module.weight.grad.add_(grad_estimate * normalized_pre_diff)
+
+        # ---------------------------------------------------------------
+        # 8) Final average loss
+        # ---------------------------------------------------------------
+        avg_loss = 0.5 * (loss_clean.item() + loss_noisy.item())
         if verbose:
-            print(f"\nFinal average loss: {avg_loss}")  # Print average loss
-            print("=== ANP Single Complete ===\n")  # Debug output footer
+            print(f"\nFinal average loss: {avg_loss:.6f}")
+            print("=== ANP Single Complete ===\n")
 
-    return avg_loss, decorrelation_matrix  # Return average loss and updated decorrelation matrix
-
-
-
-
-
-
-
+    return avg_loss, decorrelation_matrix
 
 
 
@@ -2740,6 +3373,225 @@ def flatten_adam_ratio_data(model, optimizer):
     return ratio_data
 
 
+
+# def mezo_adaptive_sampling_parallel(
+#     model,
+#     x_emb,
+#     y,
+#     criterion,
+#     optimizer,
+#     epsilon=1e-3,
+#     verbose=False,
+#     adaptive=True,
+#     fixed_size_perturbation=False
+# ):
+#     """
+#     Parallelized MeZO using model replication to run plus/minus passes simultaneously.
+#     Uses torch.jit.fork() for parallel execution while maintaining separate model states.
+#     """
+#     # First create two separate model instances for parallel execution
+#     # We use deepcopy to ensure completely separate models with their own buffers
+#     model_plus = copy.deepcopy(model)
+#     model_minus = copy.deepcopy(model)
+    
+#     # Move the copied models to the same device as the original
+#     device = next(model.parameters()).device
+#     model_plus.to(device)
+#     model_minus.to(device)
+
+#     # Flatten parameters just once at the start
+#     orig_param_data, meta = flatten_params(model)
+#     param_data_orig = orig_param_data.clone()
+#     ratio_data = flatten_adam_ratio_data(model, optimizer)
+
+#     # Zero existing gradients
+#     for p in model.parameters():
+#         if p.grad is not None:
+#             p.grad.zero_()
+
+#     # Sample the perturbation direction
+#     local_seed = torch.randint(0, 2**32, (1,)).item()
+#     torch.manual_seed(local_seed)
+#     z_data = torch.randn_like(ratio_data, device=device)
+    
+#     if adaptive:
+#         d_data = ratio_data + z_data
+#     else:
+#         d_data = z_data
+        
+#     if fixed_size_perturbation:
+#         norm = torch.norm(d_data, p=2)
+#         d_data = (d_data / norm)
+
+#     # Create parameter versions for both directions
+#     param_data_plus = param_data_orig + epsilon * d_data
+#     param_data_minus = param_data_orig - epsilon * d_data
+
+#     # Apply perturbations to the respective models
+#     unflatten_into_params(param_data_plus, model_plus, meta)
+#     unflatten_into_params(param_data_minus, model_minus, meta)
+
+#     # Define forward computation functions
+#     def compute_plus():
+#         with torch.inference_mode():
+#             return teacher_forcing_loss_emb(model_plus, x_emb, y, criterion)
+
+#     def compute_minus():
+#         with torch.inference_mode():
+#             return teacher_forcing_loss_emb(model_minus, x_emb, y, criterion)
+
+#     # Execute forward passes in parallel using torch.jit
+#     future_plus = torch.jit.fork(compute_plus)
+#     future_minus = torch.jit.fork(compute_minus)
+    
+#     # Wait for both computations to complete
+#     loss_plus = torch.jit.wait(future_plus)
+#     loss_minus = torch.jit.wait(future_minus)
+
+#     if verbose:
+#         print(f"Plus pass loss: {loss_plus.item():.6f}")
+#         print(f"Minus pass loss: {loss_minus.item():.6f}")
+
+#     # Revert original model to its initial state
+#     unflatten_into_params(param_data_orig, model, meta)
+
+#     # Compute gradient estimate
+#     grad_est = (loss_plus - loss_minus) / (2.0 * epsilon)
+#     grad_data = grad_est * d_data
+    
+#     # Unflatten gradients into original model
+#     offset = 0
+#     for p, (shape, numel, dev) in zip(model.parameters(), meta):
+#         slice_ = grad_data[offset : offset + numel]
+#         offset += numel
+#         if p.grad is None:
+#             p.grad = slice_.view(shape).to(dev)
+#         else:
+#             p.grad.add_(slice_.view(shape).to(dev))
+    
+#     # Clean up
+#     del grad_data, d_data
+#     del model_plus, model_minus  # Explicitly delete copied models
+#     torch.cuda.empty_cache()     # Free up GPU memory
+    
+#     avg_loss = 0.5 * (loss_plus.item() + loss_minus.item())
+#     return avg_loss
+
+
+import torch
+import copy
+from torch import nn
+import torch.cuda
+
+
+
+# def mezo_adaptive_sampling_parallel(
+#     model,
+#     x_emb,
+#     y,
+#     criterion,
+#     optimizer,
+#     epsilon=1e-3,
+#     verbose=False,
+#     adaptive=True,
+#     fixed_size_perturbation=False
+# ):
+#     """
+#     Parallelized MeZO using model replication to run plus/minus passes simultaneously.
+#     Uses torch.jit.fork() for parallel execution while maintaining separate model states.
+#     """
+#     # First create two separate model instances for parallel execution
+#     # We use deepcopy to ensure completely separate models with their own buffers
+#     model_plus = copy.deepcopy(model)
+#     model_minus = copy.deepcopy(model)
+    
+#     # Move the copied models to the same device as the original
+#     device = next(model.parameters()).device
+#     model_plus.to(device)
+#     model_minus.to(device)
+
+#     # Flatten parameters just once at the start
+#     orig_param_data, meta = flatten_params(model)
+#     param_data_orig = orig_param_data.clone()
+#     ratio_data = flatten_adam_ratio_data(model, optimizer)
+
+#     # Zero existing gradients
+#     for p in model.parameters():
+#         if p.grad is not None:
+#             p.grad.zero_()
+
+#     # Sample the perturbation direction
+#     local_seed = torch.randint(0, 2**32, (1,)).item()
+#     torch.manual_seed(local_seed)
+#     z_data = torch.randn_like(ratio_data, device=device)
+    
+#     if adaptive:
+#         d_data = ratio_data + z_data
+#     else:
+#         d_data = z_data
+        
+#     if fixed_size_perturbation:
+#         norm = torch.norm(d_data, p=2)
+#         d_data = (d_data / norm)
+
+#     # Create parameter versions for both directions
+#     param_data_plus = param_data_orig + epsilon * d_data
+#     param_data_minus = param_data_orig - epsilon * d_data
+
+#     # Apply perturbations to the respective models
+#     unflatten_into_params(param_data_plus, model_plus, meta)
+#     unflatten_into_params(param_data_minus, model_minus, meta)
+
+#     # Define forward computation functions
+#     def compute_plus():
+#         with torch.inference_mode():
+#             return teacher_forcing_loss_emb(model_plus, x_emb, y, criterion)
+
+#     def compute_minus():
+#         with torch.inference_mode():
+#             return teacher_forcing_loss_emb(model_minus, x_emb, y, criterion)
+
+#     # Execute forward passes in parallel using torch.jit
+#     future_plus = torch.jit.fork(compute_plus)
+#     future_minus = torch.jit.fork(compute_minus)
+    
+#     # Wait for both computations to complete
+#     loss_plus = torch.jit.wait(future_plus)
+#     loss_minus = torch.jit.wait(future_minus)
+
+#     if verbose:
+#         print(f"Plus pass loss: {loss_plus.item():.6f}")
+#         print(f"Minus pass loss: {loss_minus.item():.6f}")
+
+#     # Revert original model to its initial state
+#     unflatten_into_params(param_data_orig, model, meta)
+
+#     # Compute gradient estimate
+#     grad_est = (loss_plus - loss_minus) / (2.0 * epsilon)
+#     grad_data = grad_est * d_data
+    
+#     # Unflatten gradients into original model
+#     offset = 0
+#     for p, (shape, numel, dev) in zip(model.parameters(), meta):
+#         slice_ = grad_data[offset : offset + numel]
+#         offset += numel
+#         if p.grad is None:
+#             p.grad = slice_.view(shape).to(dev)
+#         else:
+#             p.grad.add_(slice_.view(shape).to(dev))
+    
+#     # Clean up
+#     del grad_data, d_data
+#     del model_plus, model_minus  # Explicitly delete copied models
+#     torch.cuda.empty_cache()     # Free up GPU memory
+    
+#     avg_loss = 0.5 * (loss_plus.item() + loss_minus.item())
+#     return avg_loss
+
+
+
+
+
 def mezo_adaptive_sampling_fast(
     model,
     x_emb,
@@ -2748,7 +3600,8 @@ def mezo_adaptive_sampling_fast(
     optimizer,            # Adam or similar
     epsilon=1e-3,
     verbose=False,
-    adaptive=True
+    adaptive=True,
+    fixed_size_perturbation=False
 ):
     """
     A fast version of MeZO that:
@@ -2762,89 +3615,97 @@ def mezo_adaptive_sampling_fast(
     Returns:
         float: 0.5*(loss_plus + loss_minus)
     """
-    if verbose:
-        print("\n=== MEZO SINGLE ADAM FAST v2 DEBUG ===")
-        print(f"Input shape: {x_emb.shape}, target shape: {y.shape}")
-
-    # 1) Flatten parameters
-    orig_param_data, meta = flatten_params(model)
-    # We'll keep a copy of the original so we can revert easily
-    param_data_orig = orig_param_data.clone()
-
-    # 2) Flatten the ratio_data = exp_avg / sqrt(exp_avg_sq + 1e-8)
-    ratio_data = flatten_adam_ratio_data(model, optimizer)
-    device = orig_param_data.device
-
-    # Zero existing grads
-    for p in model.parameters():
-        if p.grad is not None:
-            p.grad.zero_()
-
-    # 3) local_seed for reproducibility
-    local_seed = torch.randint(0, 2**32, (1,)).item()
-    if verbose:
-        print(f"\nRandom seed: {local_seed}")
-        print(f"Flattened param_data shape: {orig_param_data.shape}, ratio_data shape: {ratio_data.shape}")
-
-    # We'll define a small forward helper
-    def forward_loss():
-        with torch.inference_mode():
-            loss = teacher_forcing_loss_emb(model, x_emb, y, criterion)
-            #torch.cuda.empty_cache()
-            return loss
-
-    # 4) Sample d_data ~ Normal(ratio_data, std=1.0)
-    torch.manual_seed(local_seed)
-    z_data = torch.randn_like(ratio_data, device=device)  # standard normal
-    if adaptive:
-        d_data = ratio_data + z_data  # => Normal(mean=ratio_data, std=1.0)
-    else:
-        d_data = z_data
-
-    #  --- PLUS PASS ---
-    param_data_plus = param_data_orig + epsilon * d_data
-    unflatten_into_params(param_data_plus, model, meta)
-    loss_plus = forward_loss()
-    if verbose:
-        print(f"Plus pass loss: {loss_plus.item():.6f}")
-
-    #  --- MINUS PASS ---
-    param_data_minus = param_data_orig - epsilon * d_data
-    unflatten_into_params(param_data_minus, model, meta)
-    loss_minus = forward_loss()
-    if verbose:
-        print(f"Minus pass loss: {loss_minus.item():.6f}")
-
-    #  --- REVERT ---
-    # We revert to original (for subsequent steps in training)
-    unflatten_into_params(param_data_orig, model, meta)
-
-    # 5) Compute grad_est = (loss_plus - loss_minus) / (2*epsilon)
-    grad_est = (loss_plus - loss_minus) / (2.0 * epsilon)
-    if verbose:
-        print(f"\nEstimated gradient: {grad_est.item():.6f}")
-
-    # Construct a single grad_data = grad_est * d_data
-    grad_data = grad_est * d_data
+    with torch.inference_mode():
+        if verbose:
+            print("\n=== MEZO SINGLE ADAM FAST v2 DEBUG ===")
+            print(f"Input shape: {x_emb.shape}, target shape: {y.shape}")
     
-    # Unflatten grad_data into p.grad
-    offset = 0
-    for p, (shape, numel, dev) in zip(model.parameters(), meta):
-        slice_ = grad_data[offset : offset + numel]
-        offset += numel
-        if p.grad is None:
-            p.grad = slice_.view(shape).to(dev)
+        # 1) Flatten parameters
+        orig_param_data, meta = flatten_params(model)
+        # We'll keep a copy of the original so we can revert easily
+        param_data_orig = orig_param_data.clone()
+    
+        # 2) Flatten the ratio_data = exp_avg / sqrt(exp_avg_sq + 1e-8)
+        ratio_data = flatten_adam_ratio_data(model, optimizer)
+        device = orig_param_data.device
+    
+        # Zero existing grads
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.zero_()
+    
+        # 3) local_seed for reproducibility
+        local_seed = torch.randint(0, 2**32, (1,)).item()
+        if verbose:
+            print(f"\nRandom seed: {local_seed}")
+            print(f"Flattened param_data shape: {orig_param_data.shape}, ratio_data shape: {ratio_data.shape}")
+    
+        # We'll define a small forward helper
+        def forward_loss():
+            with torch.inference_mode():
+                loss = teacher_forcing_loss_emb(model, x_emb, y, criterion)
+                #torch.cuda.empty_cache()
+                return loss
+    
+        # 4) Sample d_data ~ Normal(ratio_data, std=1.0)
+        torch.manual_seed(local_seed)
+        z_data = torch.randn_like(ratio_data, device=device)  # standard normal
+    
+        if adaptive:
+            d_data = ratio_data + z_data  # => Normal(mean=ratio_data, std=1.0)
         else:
-            p.grad.add_(slice_.view(shape).to(dev))
-
-    del grad_data,d_data
-    #torch.cuda.empty_cache()
-    avg_loss = 0.5 * (loss_plus.item() + loss_minus.item())
-    if verbose:
-        print(f"\nFinal average loss: {avg_loss:.6f}")
-        print("=== MEZO SINGLE ADAM FAST v2 COMPLETE ===\n")
-
-    return avg_loss
+            d_data = z_data
+    
+        if fixed_size_perturbation:
+            norm = torch.norm(d_data, p=2)           # Compute the L2 norm
+            if verbose:
+                print(f"fixed_size_perturbation={fixed_size_perturbation} norm {norm}")
+            d_data = (d_data / norm)  # Normalize 
+        
+        #  --- PLUS PASS ---
+        param_data_plus = param_data_orig + epsilon * d_data
+        unflatten_into_params(param_data_plus, model, meta)
+        loss_plus = forward_loss()
+        if verbose:
+            print(f"Plus pass loss: {loss_plus.item():.6f}")
+    
+        #  --- MINUS PASS ---
+        param_data_minus = param_data_orig - epsilon * d_data
+        unflatten_into_params(param_data_minus, model, meta)
+        loss_minus = forward_loss()
+        if verbose:
+            print(f"Minus pass loss: {loss_minus.item():.6f}")
+    
+        #  --- REVERT ---
+        # We revert to original (for subsequent steps in training)
+        unflatten_into_params(param_data_orig, model, meta)
+    
+        # 5) Compute grad_est = (loss_plus - loss_minus) / (2*epsilon)
+        grad_est = (loss_plus - loss_minus) / (2.0 * epsilon)
+        if verbose:
+            print(f"\nEstimated gradient: {grad_est.item():.6f}")
+    
+        # Construct a single grad_data = grad_est * d_data
+        grad_data = grad_est * d_data
+        
+        # Unflatten grad_data into p.grad
+        offset = 0
+        for p, (shape, numel, dev) in zip(model.parameters(), meta):
+            slice_ = grad_data[offset : offset + numel]
+            offset += numel
+            if p.grad is None:
+                p.grad = slice_.view(shape).to(dev)
+            else:
+                p.grad.add_(slice_.view(shape).to(dev))
+    
+        del grad_data,d_data
+        #torch.cuda.empty_cache()
+        avg_loss = 0.5 * (loss_plus.item() + loss_minus.item())
+        if verbose:
+            print(f"\nFinal average loss: {avg_loss:.6f}")
+            print("=== MEZO SINGLE ADAM FAST v2 COMPLETE ===\n")
+    
+        return avg_loss
 
 
     
@@ -3118,31 +3979,162 @@ def mezo_char_single(model, x_emb, y, criterion, epsilon=1e-3, verbose=False):
     return avg_loss
 
 
-def generate_sequence_batched(model, x_ids, embed, char_to_id, id_to_char, max_seq_len=20, device='cuda', 
-                               criterion=None, y_ids=None, bos_token='<bos>', eos_token='<eos>', 
-                               pad_token='<PAD>', teacher_force=False, verbose=False):
-    """
-    Generate sequences step-by-step using a sequence model with autoregressive or teacher-forced generation.
-    The input x_ids already contains the <bos> token followed by the prompt.
+
+#########
+# Generation functions for your models
+#########
+
+
+# def generate_sequence_batched(model, x_ids, embed, char_to_id, id_to_char, max_seq_len=20, device='cuda', 
+#                                criterion=None, y_ids=None, bos_token='<bos>', eos_token='<eos>', 
+#                                pad_token='<PAD>', teacher_force=False, verbose=False):
+#     """
+#     Generate sequences step-by-step using a sequence model with autoregressive or teacher-forced generation.
+#     The input x_ids already contains the <bos> token followed by the prompt.
     
-    Args:
-        model: The sequence model
-        x_ids: Input token IDs including <bos> [batch_size, input_seq_len]
-        embed: Embedding layer
-        char_to_id: Dictionary mapping characters to token IDs
-        id_to_char: Dictionary mapping token IDs to characters
-        max_seq_len: Maximum length of generated sequence
-        device: Device to run the model on
-        criterion: Loss function (optional)
-        y_ids: Target token IDs for teacher forcing and loss calculation [batch_size, target_seq_len]
-        bos_token: Beginning of sequence token
-        eos_token: End of sequence token
-        pad_token: Padding token
-        teacher_force: Whether to use teacher forcing
-        verbose: Whether to print generation progress
-    Returns:
-        Tuple containing generated strings, full sequences, token IDs, probabilities and metrics
-    """
+#     Args:
+#         model: The sequence model
+#         x_ids: Input token IDs including <bos> [batch_size, input_seq_len]
+#         embed: Embedding layer
+#         char_to_id: Dictionary mapping characters to token IDs
+#         id_to_char: Dictionary mapping token IDs to characters
+#         max_seq_len: Maximum length of generated sequence
+#         device: Device to run the model on
+#         criterion: Loss function (optional)
+#         y_ids: Target token IDs for teacher forcing and loss calculation [batch_size, target_seq_len]
+#         bos_token: Beginning of sequence token
+#         eos_token: End of sequence token
+#         pad_token: Padding token
+#         teacher_force: Whether to use teacher forcing
+#         verbose: Whether to print generation progress
+#     Returns:
+#         Tuple containing generated strings, full sequences, token IDs, probabilities and metrics
+#     """
+#     B, Lx = x_ids.size()
+#     device = x_ids.device
+    
+#     # Special token IDs
+#     bos_id = char_to_id[bos_token]
+#     eos_id = char_to_id[eos_token]
+#     pad_id = char_to_id[pad_token]
+    
+#     # Embed the input sequence which already includes <bos>
+#     x_emb = embed(x_ids)  # [B, Lx, E]
+    
+#     # Initialize states and outputs
+#     memory = None
+#     hidden = None
+#     generated_ids = [[] for _ in range(B)]
+#     probs_batch = [[] for _ in range(B)]
+#     all_logits = []
+#     all_targets = []
+    
+#     # Get initial prediction from the input sequence
+    
+#     logits, memory, hidden = model(x_emb, hidden=hidden, memory=memory)
+#     last_logits = logits[:, -1, :]  # Get predictions for next token after input
+    
+#     # Track which sequences have finished generating
+#     finished = torch.zeros(B, dtype=torch.bool, device=device)
+    
+#     # Generation loop
+#     for step in range(max_seq_len):
+#         # Calculate probabilities for current step
+#         probs = torch.softmax(last_logits, dim=-1)
+        
+#         # Store logits for loss calculation if targets provided
+#         if y_ids is not None and step < y_ids.size(1):
+#             all_logits.append(last_logits)
+#             all_targets.append(y_ids[:, step])
+        
+#         # Select next token based on teacher forcing or model prediction
+#         if teacher_force and y_ids is not None and step < y_ids.size(1):
+#             next_token = y_ids[:, step]
+#             next_emb = embed(next_token.unsqueeze(1))  # [B, 1, E]
+#         else:
+#             next_token = torch.argmax(last_logits, dim=-1)  # [B]
+#             next_emb = embed(next_token.unsqueeze(1))  # [B, 1, E]
+        
+#         # Store generated tokens and probabilities
+#         for b in range(B):
+#             if not finished[b]:
+#                 token_id = next_token[b].item()
+#                 generated_ids[b].append(token_id)
+#                 probs_batch[b].append(probs[b, token_id].item())
+                
+#                 # Check if sequence is finished
+#                 if token_id == eos_id:
+#                     finished[b] = True
+        
+#         # Break if all sequences have finished
+#         if finished.all():
+#             break
+            
+#         # Get next prediction using the selected token
+#         logits, memory, hidden = model(next_emb, hidden=hidden, memory=memory)
+#         last_logits = logits[:, -1, :]  # [B, vocab_size]
+    
+#     # Calculate metrics if targets provided
+#     avg_loss = 0.0
+#     avg_token_level_accuracy = 0.0
+#     avg_sample_level_accuracy = 0.0
+    
+#     if y_ids is not None and criterion is not None:
+#         # Stack logits and targets
+#         stacked_logits = torch.stack(all_logits, dim=1)  # [B, seq_len, vocab_size]
+#         stacked_targets = torch.stack(all_targets, dim=1)  # [B, seq_len]
+        
+#         # Calculate loss
+#         loss = criterion(stacked_logits.view(-1, stacked_logits.size(-1)), 
+#                         stacked_targets.view(-1))
+#         avg_loss = loss.item()
+        
+#         # Calculate accuracies
+#         predictions = torch.argmax(stacked_logits, dim=-1)  # [B, seq_len]
+#         mask = (stacked_targets != bos_id) & (stacked_targets != eos_id) & (stacked_targets != pad_id)
+
+#         # Calculate token-level accuracy, ignoring special tokens
+#         token_correct = (predictions == stacked_targets) & mask
+#         # token_correct = (predictions == stacked_targets).float()
+#         avg_token_level_accuracy = token_correct.sum().item() / mask.sum().item() if mask.sum().item() > 0 else 0.0
+
+#         # avg_token_level_accuracy = token_correct.mean().item()
+        
+#         # Sample-level accuracy (all tokens correct)
+#         sample_correct = token_correct.all(dim=1).float()
+#         avg_sample_level_accuracy = sample_correct.mean().item()
+    
+#     # Convert generated IDs to strings
+#     generated_strs = []
+#     generated_strs_with_all_special_tokens = []
+    
+#     for seq_ids in generated_ids:
+#         # Remove EOS token and everything after it
+#         if eos_id in seq_ids:
+#             seq_ids = seq_ids[:seq_ids.index(eos_id)]
+            
+#         # Convert to string without special tokens
+#         clean_str = tensor_to_string(torch.tensor(seq_ids), id_to_char)
+#         generated_strs.append(clean_str)
+        
+#         # Convert to string with special tokens
+#         full_str = tensor_to_string(torch.tensor([bos_id] + seq_ids + [eos_id]), id_to_char)
+#         generated_strs_with_all_special_tokens.append(full_str)
+    
+#     return (
+#         generated_strs,
+#         generated_strs_with_all_special_tokens,
+#         generated_ids,
+#         probs_batch,
+#         avg_loss,
+#         avg_token_level_accuracy,
+#         avg_sample_level_accuracy,
+#     )
+
+def generate_sequence_batched(model, x_ids, embed, char_to_id, id_to_char, max_seq_len=20, device='cuda', 
+                            criterion=None, y_ids=None, bos_token='<bos>', eos_token='<eos>', 
+                            pad_token='<PAD>', teacher_force=False, verbose=False):
+    """Same docstring as before"""
     B, Lx = x_ids.size()
     device = x_ids.device
     
@@ -3151,107 +4143,175 @@ def generate_sequence_batched(model, x_ids, embed, char_to_id, id_to_char, max_s
     eos_id = char_to_id[eos_token]
     pad_id = char_to_id[pad_token]
     
-    # Embed the input sequence which already includes <bos>
     x_emb = embed(x_ids)  # [B, Lx, E]
     
-    # Initialize states and outputs
-    memory = None
-    hidden = None
-    generated_ids = [[] for _ in range(B)]
-    probs_batch = [[] for _ in range(B)]
-    all_logits = []
-    all_targets = []
-    
-    # Get initial prediction from the input sequence
-    
-    logits, memory, hidden = model(x_emb, hidden=hidden, memory=memory)
-    last_logits = logits[:, -1, :]  # Get predictions for next token after input
-    
-    # Track which sequences have finished generating
-    finished = torch.zeros(B, dtype=torch.bool, device=device)
-    
-    # Generation loop
-    for step in range(max_seq_len):
-        # Calculate probabilities for current step
-        probs = torch.softmax(last_logits, dim=-1)
+    if isinstance(model, (Transformer, Mamba)):
+    #     # LLM-style generation
+    #     generated_ids = [[] for _ in range(B)]
+    #     probs_batch = [[] for _ in range(B)]
+    #     all_logits = []
+    #     all_targets = []
+    #     finished = torch.zeros(B, dtype=torch.bool, device=device)
         
-        # Store logits for loss calculation if targets provided
-        if y_ids is not None and step < y_ids.size(1):
-            all_logits.append(last_logits)
-            all_targets.append(y_ids[:, step])
+    #     # Initial state (kv_cache for transformer, hidden for mamba)
+    #     state = None
+    #     curr_input = x_emb
         
-        # Select next token based on teacher forcing or model prediction
-        if teacher_force and y_ids is not None and step < y_ids.size(1):
-            next_token = y_ids[:, step]
-            next_emb = embed(next_token.unsqueeze(1))  # [B, 1, E]
-        else:
-            next_token = torch.argmax(last_logits, dim=-1)  # [B]
-            next_emb = embed(next_token.unsqueeze(1))  # [B, 1, E]
-        
-        # Store generated tokens and probabilities
-        for b in range(B):
-            if not finished[b]:
-                token_id = next_token[b].item()
-                generated_ids[b].append(token_id)
-                probs_batch[b].append(probs[b, token_id].item())
-                
-                # Check if sequence is finished
-                if token_id == eos_id:
-                    finished[b] = True
-        
-        # Break if all sequences have finished
-        if finished.all():
-            break
+    #     for step in range(max_seq_len):
+    #         # Forward pass with state
+    #         logits, state, _ = model(curr_input, hidden=state)
+    #         last_logits = logits[:, -1, :]
             
-        # Get next prediction using the selected token
-        logits, memory, hidden = model(next_emb, hidden=hidden, memory=memory)
-        last_logits = logits[:, -1, :]  # [B, vocab_size]
+    #         # Calculate probabilities
+    #         probs = torch.softmax(last_logits, dim=-1)
+            
+    #         # Store logits if we have targets
+    #         if y_ids is not None and step < y_ids.size(1):
+    #             all_logits.append(last_logits)
+    #             all_targets.append(y_ids[:, step])
+            
+    #         # Select next token
+    #         if teacher_force and y_ids is not None and step < y_ids.size(1):
+    #             next_token = y_ids[:, step]
+    #         else:
+    #             next_token = torch.argmax(last_logits, dim=-1)
+            
+    #         # Store generated tokens and probabilities
+    #         for b in range(B):
+    #             if not finished[b]:
+    #                 token_id = next_token[b].item()
+    #                 generated_ids[b].append(token_id)
+    #                 probs_batch[b].append(probs[b, token_id].item())
+    #                 if token_id == eos_id:
+    #                     finished[b] = True
+            
+    #         if finished.all():
+    #             break
+                
+    #         # Prepare next input (just the new token for LLMs)
+    #         next_emb = embed(next_token.unsqueeze(1))
+    #         curr_input = next_emb
+        # LLM-style generation
+        generated_ids = x_ids.tolist()  # Initialize with input tokens
+        probs_batch = [[] for _ in range(B)]
+        all_logits = []
+        all_targets = []
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
+        
+        for step in range(max_seq_len):
+            try:
+                # Convert current sequence to embeddings
+                curr_ids = torch.tensor(generated_ids, device=device)
+                curr_emb = embed(curr_ids)  # [B, L_so_far, E]
+                
+                # Forward pass
+                logits, _, _ = model(curr_emb)
+                last_logits = logits[:, -1, :]  # Get logits for the last token
+                
+                # Calculate probabilities
+                probs = torch.softmax(last_logits, dim=-1)
+                
+                # Store logits and targets if teacher-forcing
+                if y_ids is not None and step < y_ids.size(1):
+                    all_logits.append(last_logits)
+                    all_targets.append(y_ids[:, step])
+                
+                # Select next token
+                if teacher_force and y_ids is not None and step < y_ids.size(1):
+                    next_token = y_ids[:, step]
+                else:
+                    next_token = torch.argmax(last_logits, dim=-1)  # Greedy decoding
+                
+                # Update generated sequences
+                for b in range(B):
+                    if not finished[b]:
+                        token_id = next_token[b].item()
+                        generated_ids[b].append(token_id)
+                        probs_batch[b].append(probs[b, token_id].item())
+                        if token_id == eos_id:
+                            finished[b] = True
+                
+                if finished.all():
+                    break
+            except Exception as e:
+                print(e)
+
+            
+    else:
+        # Original RNN-style generation (keep existing code)
+        memory = None
+        hidden = None
+        generated_ids = [[] for _ in range(B)]
+        probs_batch = [[] for _ in range(B)]
+        all_logits = []
+        all_targets = []
+        
+        logits, memory, hidden = model(x_emb, hidden=hidden, memory=memory)
+        last_logits = logits[:, -1, :]
+        
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
+        
+        for step in range(max_seq_len):
+            probs = torch.softmax(last_logits, dim=-1)
+            
+            if y_ids is not None and step < y_ids.size(1):
+                all_logits.append(last_logits)
+                all_targets.append(y_ids[:, step])
+            
+            if teacher_force and y_ids is not None and step < y_ids.size(1):
+                next_token = y_ids[:, step]
+                next_emb = embed(next_token.unsqueeze(1))
+            else:
+                next_token = torch.argmax(last_logits, dim=-1)
+                next_emb = embed(next_token.unsqueeze(1))
+            
+            for b in range(B):
+                if not finished[b]:
+                    token_id = next_token[b].item()
+                    generated_ids[b].append(token_id)
+                    probs_batch[b].append(probs[b, token_id].item())
+                    if token_id == eos_id:
+                        finished[b] = True
+            
+            if finished.all():
+                break
+                
+            logits, memory, hidden = model(next_emb, hidden=hidden, memory=memory)
+            last_logits = logits[:, -1, :]
     
-    # Calculate metrics if targets provided
+    # Rest of function (metrics calculation and string conversion) stays exactly the same
     avg_loss = 0.0
     avg_token_level_accuracy = 0.0
     avg_sample_level_accuracy = 0.0
     
     if y_ids is not None and criterion is not None:
-        # Stack logits and targets
-        stacked_logits = torch.stack(all_logits, dim=1)  # [B, seq_len, vocab_size]
-        stacked_targets = torch.stack(all_targets, dim=1)  # [B, seq_len]
+        stacked_logits = torch.stack(all_logits, dim=1)
+        stacked_targets = torch.stack(all_targets, dim=1)
         
-        # Calculate loss
         loss = criterion(stacked_logits.view(-1, stacked_logits.size(-1)), 
                         stacked_targets.view(-1))
         avg_loss = loss.item()
         
-        # Calculate accuracies
-        predictions = torch.argmax(stacked_logits, dim=-1)  # [B, seq_len]
+        predictions = torch.argmax(stacked_logits, dim=-1)
         mask = (stacked_targets != bos_id) & (stacked_targets != eos_id) & (stacked_targets != pad_id)
-
-        # Calculate token-level accuracy, ignoring special tokens
         token_correct = (predictions == stacked_targets) & mask
-        # token_correct = (predictions == stacked_targets).float()
         avg_token_level_accuracy = token_correct.sum().item() / mask.sum().item() if mask.sum().item() > 0 else 0.0
-
-        # avg_token_level_accuracy = token_correct.mean().item()
         
-        # Sample-level accuracy (all tokens correct)
         sample_correct = token_correct.all(dim=1).float()
         avg_sample_level_accuracy = sample_correct.mean().item()
     
-    # Convert generated IDs to strings
+    # Convert to strings
     generated_strs = []
     generated_strs_with_all_special_tokens = []
     
     for seq_ids in generated_ids:
-        # Remove EOS token and everything after it
         if eos_id in seq_ids:
             seq_ids = seq_ids[:seq_ids.index(eos_id)]
             
-        # Convert to string without special tokens
         clean_str = tensor_to_string(torch.tensor(seq_ids), id_to_char)
         generated_strs.append(clean_str)
         
-        # Convert to string with special tokens
-        full_str = tensor_to_string(torch.tensor([bos_id] + seq_ids + [eos_id]), id_to_char)
+        full_str = tensor_to_string(torch.tensor(seq_ids + [eos_id]), id_to_char)
         generated_strs_with_all_special_tokens.append(full_str)
     
     return (
@@ -3296,7 +4356,7 @@ class WarmupScheduler:
 
 
 
-def generate_task_data(num_samples, task, context_len, maxn, train=True):
+def generate_task_data(num_samples, task, context_len, maxn, train=True, ds=None):
     if task=="copy":
         return generate_copy_task_str(num_samples, context_len, train=train)
     elif task=="repeat_copy":
@@ -3315,7 +4375,7 @@ def generate_task_data(num_samples, task, context_len, maxn, train=True):
     elif task=="factorial":
         return generate_factorial_task_str(num_samples, context_len, max_n=maxn, train=train)
     elif task=="owt":
-        return generate_openwebtext_task_str(num_samples, context_len, max_n=maxn, train=train, min_total_seq_len=2*context_len)
+        return generate_openwebtext_task_str(num_samples, context_len, ds, max_n=maxn, train=train, min_total_seq_len=2*context_len) # I will sample x_id as 0:context_len and then eval on context_len:2*context_len.. TODO this is hacky and I hate it.. but ICML deadline! :(
     else:
         raise ValueError(f"Unknown task {task}")
 
@@ -3331,7 +4391,7 @@ def generate_task_data(num_samples, task, context_len, maxn, train=True):
 # if add => start with max_num=5 if user param is bigger
 def maybe_update_curriculum(train_acc, current_context, current_maxnum, consecutive_succ):
     # nonlocal consecutive_succ
-    threshold= 0.95
+    threshold= 0.25
     if train_acc> threshold:
         consecutive_succ+=1
     else:
@@ -3348,56 +4408,67 @@ def maybe_update_curriculum(train_acc, current_context, current_maxnum, consecut
         return new_ct, new_mn, 0
     return current_context, current_maxnum, consecutive_succ
 
-def train_micro_batch(model, x_emb, y_ids, criterion, optimizer, mezo_flavor, args, mezo_state=None, decorrelation_matrix=None, best_seed=None):
-        """
-        x_emb => [micro_batch_size, max_seq_len, embed_dim]
-        y_ids => [micro_batch_size, max_seq_len]
-        returns => float loss
-        """
-        # if optimizer == "mezo":
-        if args.tie_epsilon_to_lr_ratio>-1:
-                args.epsilon = args.tie_epsilon_to_lr_ratio * optimizer.param_groups[0]['lr']
-        if mezo_flavor == "mezo_layerwise":
-            loss_val= mezo_char_layerwise(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
-        elif mezo_flavor == "warm_single_mezo": 
-            loss_val, best_seed = mezo_char_single_with_warm_start(
-                                    model, 
-                                    x_emb, 
-                                    y_ids, 
-                                    criterion, 
-                                    epsilon=args.epsilon, 
-                                    max_perturbations=1,
-                                    min_acceptable_loss_percent_diff=0.001,
-                                    init_seed=best_seed,
-                                    verbose=False,
-                                )
-        elif mezo_flavor == "rolling_mezo": 
-            loss_val = mezo_char_single_rolling(model, x_emb, y_ids, criterion, mezo_state) # NOT TESTED! TODO
+# def train_micro_batch(model, x_emb, y_ids, criterion, optimizer, mezo_flavor, args, mezo_state=None, decorrelation_matrix=None, best_seed=None):
+    
+#     """
+#     x_emb => [micro_batch_size, max_seq_len, embed_dim]
+#     y_ids => [micro_batch_size, max_seq_len]
+#     returns => float loss
+#     """
+#     try:
+#         # if optimizer == "mezo":
+#         if args.tie_epsilon_to_lr_ratio>-1:
+#             args.epsilon = args.tie_epsilon_to_lr_ratio * optimizer.param_groups[0]['lr']
+#             model.eval()
+#         if mezo_flavor == "mezo_layerwise":
+#             loss_val= mezo_char_layerwise(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
+#         elif mezo_flavor == "warm_single_mezo": 
+#             loss_val, best_seed = mezo_char_single_with_warm_start(
+#                                     model, 
+#                                     x_emb, 
+#                                     y_ids, 
+#                                     criterion, 
+#                                     epsilon=args.epsilon, 
+#                                     max_perturbations=1,
+#                                     min_acceptable_loss_percent_diff=0.001,
+#                                     init_seed=best_seed,
+#                                     verbose=False,
+#                                 )
+#         elif mezo_flavor == "rolling_mezo": 
+#             loss_val = mezo_char_single_rolling(model, x_emb, y_ids, criterion, mezo_state) # NOT TESTED! TODO
 
-        elif mezo_flavor == "anp":
+#         elif mezo_flavor == "anp":
 
-            loss_val, decorrelation_matrix = anp_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon, decorrelation_matrix=decorrelation_matrix, verbose=False)
+#             loss_val, decorrelation_matrix = anp_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon, decorrelation_matrix=decorrelation_matrix, verbose=False)
             
-        elif mezo_flavor == "mezo_single":
-            loss_val= mezo_char_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
-        elif mezo_flavor == "mezo_adaptive_sampling":
-            loss_val= mezo_adaptive_sampling(model, x_emb, y_ids, criterion, optimizer, epsilon=args.epsilon)
+#         elif mezo_flavor == "mezo_single":
+#             loss_val= mezo_char_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
+#         elif mezo_flavor == "mezo_adaptive_sampling":
+#             loss_val= mezo_adaptive_sampling(model, x_emb, y_ids, criterion, optimizer, epsilon=args.epsilon)
             
-        # else:
-        #     raise Exception("No flavor")
+#         # else:
+#         #     raise Exception("No flavor")
             
     
-        else:
-            model.train()
-            optimizer.zero_grad()
-            # out, _, _= model(x_emb)
-            # B,L,V= out.size()
-            # loss= criterion(out.view(B*L, V), y_ids.view(B*L))
-            loss = teacher_forcing_loss_emb(model, x_emb, y_ids, criterion, backward=True)
-            # loss.backward()
-            loss_val= loss.item()
-        return loss_val, decorrelation_matrix, best_seed
+#         else:
+#             model.train()
+#             optimizer.zero_grad()
+#             # out, _, _= model(x_emb)
+#             # B,L,V= out.size()
+#             # loss= criterion(out.view(B*L, V), y_ids.view(B*L))
+#             loss = teacher_forcing_loss_emb(model, x_emb, y_ids, criterion, backward=True)
+#             loss.backward()
+#             loss_val= loss.item()
+#         return loss_val, decorrelation_matrix, best_seed
+#     except torch.cuda.OutOfMemoryError as e:
+#         print(f"CUDA OOM: {str(e)}")
+#         torch.cuda.empty_cache()
+#         return float('nan'), decorrelation_matrix, best_seed  # WandB will ignore NaN values in plots
 
+#     except Exception as e:
+#         print(f"Unexpected error in train_micro_batch: {str(e)}")
+#         torch.cuda.empty_cache()
+#         return float('nan'), decorrelation_matrix, best_seed  
 
 
 def prepare_model_for_fast_inference(model, dummy_data, optim="sgd"):
@@ -3464,9 +4535,10 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1e-5)
     parser.add_argument("--tie_epsilon_to_lr_ratio", type=float, default=-1)
     parser.add_argument("--epsilon", type=float, default=1e-2, help="MeZO eps.")
-    parser.add_argument("--mezo", action="store_true")
 
-    parser.add_argument("--mezo_flavor", type=str, default="None", choices=["mezo_single","mezo_layerwise", "mezo_rolling", "anp", "warm_single_mezo", "mezo_adaptive_sampling", "mezo_adaptive_sampling_fast", "mezo_single_fast", "None"])
+    parser.add_argument("--mezo_flavor", type=str, default="None", choices=["mezo_single","mezo_layerwise", "mezo_rolling", "anp", "warm_single_mezo", "mezo_adaptive_sampling", "mezo_adaptive_sampling_fast", "mezo_single_fast", "None", "mezo_adaptive_sampling_parallel"])
+
+    parser.add_argument("--fixed_size_perturbation", action="store_true")
     
     parser.add_argument("--cosine_lr", action="store_true")
     parser.add_argument("--warmup_steps", type=int, default=100)
@@ -3483,12 +4555,14 @@ def main():
     
     args= parser.parse_args()
 
+
     verbose = False 
 
     total_samples_per_iter = args.micro_batch_size * args.macro_batch_size
 
     # pick device
     if torch.cuda.is_available():
+        torch.cuda.init()
         gpu_index= pick_gpu_with_most_free_mem()
         device= torch.device(f"cuda:{gpu_index}")
         print(f"[INFO] Using GPU: {gpu_index}")
@@ -3520,7 +4594,6 @@ def main():
     )
     total_estimated_vram_gb = vram_stats["total_estimated_gb"]
 
-    
     # wandb
     if args.wandb_proj is not None:
         msg = vars(args)
@@ -3556,6 +4629,7 @@ def main():
         print(f"w/ config:{msg}")
 
     # embed
+    torch.cuda.reset_peak_memory_stats(device)
     # embed= nn.Embedding(vocab_size, args.input_size, padding_idx=0).to(device)
     embed= nn.Embedding(vocab_size, args.input_size).to(device)
     nn.init.orthogonal_(embed.weight)
@@ -3579,39 +4653,6 @@ def main():
     else: # "tra"
         model = Transformer(args.input_size, vocab_size, args.hidden_size, args.memory_size, args.head_size, args.num_heads, embed).to(device) 
         
-    # def train_micro_batch(x_emb, y_ids, mezo_state=None):
-    #     """
-    #     x_emb => [micro_batch_size, max_seq_len, embed_dim]
-    #     y_ids => [micro_batch_size, max_seq_len]
-    #     returns => float loss
-    #     """
-    #     if args.optimizer == "mezo":
-            
-    #         if args.tie_epsilon_to_lr_ratio>-1:
-    #             # if we have this bigger than default we will override epsilon by the weight tying amount. My suspicion is that its a ratio that matters. Like 1, 2 or 10.  
-    #             args.epsilon = args.tie_epsilon_to_lr_ratio * optimizer.param_groups[0]['lr']
-    #         if args.mezo_flavor == "mezo_layerwise":
-    #             loss_val= mezo_char_layerwise(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
-    #         elif args.mezo_flavor == "mezo_rolling": 
-    #             loss_val = mezo_char_single_rolling(model, x_emb, y_ids, criterion, mezo_state)
-    
-    #         elif args.mezo_flavor == "mezo_single":
-    #             loss_val= mezo_char_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
-    #         else:
-    #             raise Exception("No flavor")
-            
-    
-    #     else:
-    #         model.train()
-    #         optimizer.zero_grad()
-    #         # out, _, _= model(x_emb)
-    #         # B,L,V= out.size()
-    #         # loss= criterion(out.view(B*L, V), y_ids.view(B*L))
-    #         loss = teacher_forcing_loss_emb(model, x_emb, y_ids, criterion)
-    #         loss.backward()
-    #         loss_val= loss.item()
-    #     return loss_val
-    
     # build optimizer
     params= list(model.parameters())+ list(embed.parameters())
     if args.optimizer=="sgd": 
@@ -3678,7 +4719,7 @@ def main():
         device=device
     )
 
-    torch.cuda.reset_peak_memory_stats(device)
+    
     # verbose = True
     if args.optimizer=="sgd":
         # optimize the model
@@ -3699,8 +4740,32 @@ def main():
     ####################################
     #for iteration in range(1, args.max_iters+1):
     iteration = -1
+
+    ds = None
+    if args.task == "owt":
+        iterr = 0
+        while True:
+            try:
+                ds = load_dataset(
+                    "haritzpuerto/the_pile_00_OpenWebText2",
+                    split="train",
+                    # cache_dir="/hf_cache/",
+                    # use_auth_token=False,  # Disable authentication to avoid API calls
+                    download_mode="reuse_dataset_if_exists"  # Reuse the cached dataset
+                )
+                break
+            except Exception as e:
+                print("Hugging face issue...")
+                print(e)
+                time.sleep(5)
+                iterr+=1
+                if iterr>100:
+                    raise Exception("HUGGING FACE ISSUES AGAIN!")
+        print("Got the OWT dataset!")
+                
+
     while True:
-        torch.cuda.reset_peak_memory_stats(device)        
+        #torch.cuda.reset_peak_memory_stats(device)        
         
         iteration+=1
         iter_start_time= time.time()
@@ -3716,116 +4781,159 @@ def main():
         x_strs, y_strs= generate_task_data(total_samples_per_iter, args.task,
                                            this_sample_context_length,
                                            this_sample_max_num,
-                                           train=True)
+                                           train=True,
+                                            ds = ds
+                                          )
         
-
         model.zero_grad()
         embed.zero_grad()
 
         micro_loss_sum= 0.0
 
-
         # micro/macro approach
         for micro_i in range(args.macro_batch_size):
-            start_idx= micro_i* args.micro_batch_size
-            end_idx= start_idx+ args.micro_batch_size
-            cur_x= x_strs[start_idx:end_idx]
-            cur_y= y_strs[start_idx:end_idx]
-            
-            # take all the excess padding out just in case
-            # x_ids= str_to_tensor(cur_x, char_to_id, args.input_sample_length+1).to(device)
-            # x_ids_trimmed = [x[x != 0] for x in x_ids]
-            # x_ids = pad_sequence(x_ids_trimmed, batch_first=True, padding_value=0)
+            # try:
+                start_idx= micro_i* args.micro_batch_size
+                end_idx= start_idx+ args.micro_batch_size
+                cur_x= x_strs[start_idx:end_idx]
+                cur_y= y_strs[start_idx:end_idx]
+                
+                # take all the excess padding out just in case
+                # x_ids= str_to_tensor(cur_x, char_to_id, args.input_sample_length+1).to(device)
+                # x_ids_trimmed = [x[x != 0] for x in x_ids]
+                # x_ids = pad_sequence(x_ids_trimmed, batch_first=True, padding_value=0)
+    
+                # y_ids= str_to_tensor(cur_y, char_to_id, args.input_sample_length+1).to(device)
+                # y_ids_trimmed = [y[y != 0] for y in y_ids]
+                # y_ids = pad_sequence(y_ids_trimmed, batch_first=True, padding_value=0)
+                
+                
+                x_ids= str_to_tensor(cur_x, char_to_id).to(device)
+                y_ids= str_to_tensor(cur_y, char_to_id).to(device)
 
-            # y_ids= str_to_tensor(cur_y, char_to_id, args.input_sample_length+1).to(device)
-            # y_ids_trimmed = [y[y != 0] for y in y_ids]
-            # y_ids = pad_sequence(y_ids_trimmed, batch_first=True, padding_value=0)
-            
-            
-            x_ids= str_to_tensor(cur_x, char_to_id).to(device)
-            y_ids= str_to_tensor(cur_y, char_to_id).to(device)
-            x_emb= embed(x_ids)
-            
-            # loss_val, decorrelation_matrix, best_seed = train_micro_batch(model, x_emb, y_ids, criterion, optimizer, mezo_flavor, args, mezo_state, decorrelation_matrix, best_seed)
-            
-            if args.tie_epsilon_to_lr_ratio>-1:
-                args.epsilon = args.tie_epsilon_to_lr_ratio * optimizer.param_groups[0]['lr']
-
-            if args.optimizer=="mezo":
-                with torch.inference_mode():
-                    # x_emb = x_emb.half()
-                    if mezo_flavor == "mezo_layerwise":
-                        loss_val= mezo_char_layerwise(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
-                    elif mezo_flavor == "warm_single_mezo": 
-                        loss_val, best_seed = mezo_char_single_with_warm_start(
-                                                model, 
-                                                x_emb, 
-                                                y_ids, 
-                                                criterion, 
-                                                epsilon=args.epsilon, 
-                                                max_perturbations=1,
-                                                min_acceptable_loss_percent_diff=0.001,
-                                                init_seed=best_seed,
-                                                verbose=False,
-                                            )
-                    elif mezo_flavor == "rolling_mezo": 
-                        loss_val = mezo_char_single_rolling(model, x_emb, y_ids, criterion, mezo_state) # NOT TESTED! TODO
-            
-                    elif mezo_flavor == "anp":
-            
-                        loss_val, decorrelation_matrix = anp_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon, decorrelation_matrix=decorrelation_matrix, verbose=False)
-                        
-                    elif mezo_flavor == "mezo_single":
-                        loss_val= mezo_char_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
-        
-                    
-                    elif mezo_flavor == "mezo_single_fast":
-                        loss_val= mezo_adaptive_sampling_fast(model, x_emb, y_ids, criterion, optimizer, epsilon=args.epsilon,adaptive=False)
-                    elif mezo_flavor == "mezo_adaptive_sampling":
-                        if iteration<=args.warmup_steps:
+                # x_emb= embed(x_ids)
+                x_emb =  x_ids # REALLY HACKKY! NEED TO FIX BUT JUST DOING THIS TO MAKE TEACHER FORCING WORK FOR TRANSFORMERS
+                
+                # loss_val, decorrelation_matrix, best_seed = train_micro_batch(model, x_emb, y_ids, criterion, optimizer, mezo_flavor, args, mezo_state, decorrelation_matrix, best_seed)
+                
+                if args.tie_epsilon_to_lr_ratio>-1:
+                    args.epsilon = args.tie_epsilon_to_lr_ratio * optimizer.param_groups[0]['lr']
+    
+                if args.optimizer=="mezo":
+                    with torch.inference_mode():
+                        # x_emb = x_emb.half()
+                        model.eval()
+                        if mezo_flavor == "mezo_layerwise":
+                            loss_val= mezo_char_layerwise(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
+                        elif mezo_flavor == "warm_single_mezo": 
+                            loss_val, best_seed = mezo_char_single_with_warm_start(
+                                                    model, 
+                                                    x_emb, 
+                                                    y_ids, 
+                                                    criterion, 
+                                                    epsilon=args.epsilon, 
+                                                    max_perturbations=1,
+                                                    min_acceptable_loss_percent_diff=0.001,
+                                                    init_seed=best_seed,
+                                                    verbose=False,
+                                                )
+                        elif mezo_flavor == "rolling_mezo": 
+                            loss_val = mezo_char_single_rolling(model, x_emb, y_ids, criterion, mezo_state) # NOT TESTED! TODO
+                
+                        elif mezo_flavor == "anp":
+                
+                            loss_val, decorrelation_matrix = anp_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon, decorrelation_matrix=decorrelation_matrix, verbose=False)
+                            
+                        elif mezo_flavor == "mezo_single":
                             loss_val= mezo_char_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon)
-                        
-                        else:
-                            loss_val= mezo_adaptive_sampling(model, x_emb, y_ids, criterion, optimizer, epsilon=args.epsilon)
-                            
-                    elif mezo_flavor == "mezo_adaptive_sampling_fast":
-                        if iteration<=args.warmup_steps:
-                            loss_val= mezo_adaptive_sampling_fast(model, x_emb, y_ids, criterion, optimizer, epsilon=args.epsilon, adaptive=False)
-                            
-                        else:
-                            loss_val= mezo_adaptive_sampling_fast(model, x_emb, y_ids, criterion, optimizer, epsilon=args.epsilon, adaptive=True)
-                            
-                
-                    else:
-                        raise Exception("No flavor")
-                        
             
-            else:
-                model.train()
-                optimizer.zero_grad()
-                # out, _, _= model(x_emb)
-                # B,L,V= out.size()
-                # loss= criterion(out.view(B*L, V), y_ids.view(B*L))
-                loss = teacher_forcing_loss_emb(model, x_emb, y_ids, criterion)
-                loss.backward()
-                loss_val= loss.item()
+                        
+                        elif mezo_flavor == "mezo_single_fast":
+                            loss_val= mezo_adaptive_sampling_fast(model, x_emb, y_ids, criterion, optimizer, epsilon=args.epsilon,adaptive=False, fixed_size_perturbation=args.fixed_size_perturbation)
+                        elif mezo_flavor == "mezo_adaptive_sampling":
+                            if iteration<=args.warmup_steps:
+                                loss_val= mezo_char_single(model, x_emb, y_ids, criterion, epsilon=args.epsilon,fixed_size_perturbation=False)
+                            
+                            else:
+                                loss_val= mezo_adaptive_sampling(model, x_emb, y_ids, criterion, optimizer, epsilon=args.epsilon,fixed_size_perturbation=args.fixed_size_perturbation)
+                                
+                        elif mezo_flavor == "mezo_adaptive_sampling_fast":
+                            if iteration<=args.warmup_steps:
+                                loss_val= mezo_adaptive_sampling_fast(model, x_emb, y_ids, criterion, optimizer, epsilon=args.epsilon, adaptive=False)
+                                
+                            else:
+                                loss_val= mezo_adaptive_sampling_fast(model, x_emb, y_ids, criterion, optimizer, epsilon=args.epsilon, adaptive=True, fixed_size_perturbation=False)
+                        # elif mezo_flavor == "mezo_adaptive_sampling_parallel":
+                        # JUST A BIT FASTER BUT NOT CONVERGING AS WELL SO JUST LEAVE IT ALONE..    
+                        #     if iteration<=args.warmup_steps:
+                        #         loss_val = mezo_adaptive_sampling_parallel(
+                        #             model,
+                        #             x_emb,
+                        #             y_ids,
+                        #             criterion,
+                        #             optimizer,
+                        #             epsilon=args.epsilon,
+                        #             adaptive=False,
+                        #             fixed_size_perturbation=True
+                        #         )
+                                
+                        #     else:
+                        #         loss_val = mezo_adaptive_sampling_parallel(
+                        #             model,
+                        #             x_emb,
+                        #             y_ids,
+                        #             criterion,
+                        #             optimizer,
+                        #             epsilon=args.epsilon,
+                        #             adaptive=True,
+                        #             fixed_size_perturbation=True
+                        #         )
+                                
 
-            micro_loss_sum+= loss_val
-            #torch.cuda.empty_cache()
+                        
+                    
+                        else:
+                            raise Exception("No flavor")
+                            
                 
-
-            if verbose:
-                print(f"start_idx: {start_idx}")
-                print(f"end_idx: {end_idx}")
-                print(f"cur_x: {cur_x}")
-                print(f"cur_y: {cur_y}")
-                print(f"x_ids: {x_ids}")
-                print(f"y_ids: {y_ids}")
-                print(f"x_emb: {x_emb}")
-                print(f"loss_val: {loss_val}")
-                print(f"micro_loss_sum: {micro_loss_sum}")
+                else:
+                    model.train()
+                    optimizer.zero_grad()
+                    # out, _, _= model(x_emb)
+                    # B,L,V= out.size()
+                    # loss= criterion(out.view(B*L, V), y_ids.view(B*L))
+                    loss = teacher_forcing_loss_emb(model, x_emb, y_ids, criterion)
+                    
+                    loss.backward()
+                    
+                    loss_val= loss.item()
+    
+                micro_loss_sum+= loss_val
+                #torch.cuda.empty_cache()
+    
+    
+                if verbose:
+                    print(f"start_idx: {start_idx}")
+                    print(f"end_idx: {end_idx}")
+                    print(f"cur_x: {cur_x}")
+                    print(f"cur_y: {cur_y}")
+                    print(f"x_ids: {x_ids}")
+                    print(f"y_ids: {y_ids}")
+                    print(f"x_emb: {x_emb}")
+                    print(f"loss_val: {loss_val}")
+                    print(f"micro_loss_sum: {micro_loss_sum}")
+                    
+                    pdb.set_trace()
+            # except torch.cuda.OutOfMemoryError as e:
+            #     print(f"CUDA OOM: {str(e)}")
+            #     torch.cuda.empty_cache()
+            #     return float('nan'), decorrelation_matrix, best_seed  # WandB will ignore NaN values in plots
+        
+            # except Exception as e:
+            #     print(f"Unexpected error: {str(e)}")
+            #     torch.cuda.empty_cache()
+            #     return float('nan'), decorrelation_matrix, best_seed  
                 
-                pdb.set_trace()
 
         # do momentum-based step
         if args.optimizer == "mezo" and args.macro_batch_size>1:
@@ -3915,6 +5023,9 @@ def main():
                     y_ids = str_to_tensor(cur_y, char_to_id).to(device)  # [B, Ly]
     
                     # iterate on the train just to show accuracy as mezo makes it difficult to get a good gauge on accuracy as the model is not ever truly represented
+
+                    
+                    # fallback to your old code for RNN
                     generated_strs, generated_strs_with_padding, gen_ids_batch, probs_batch, train_loss, train_acc, train_acc_sample  = generate_sequence_batched(
                         model=model,
                         x_ids=x_ids,
@@ -3926,7 +5037,7 @@ def main():
                         criterion=criterion,
                         y_ids=y_ids
                     )
-        
+
                     counter=0
                     for b in range(len(generated_strs)):
                         print("="*30)
@@ -3946,17 +5057,29 @@ def main():
                     print("="*30)
     
                     # Generate Val Samples that are hold out numbers and seq length
-                    this_sample_context_length_for_val = 1+np.random.randint(args.input_sample_length, args.input_sample_length+5)
+                
         
-                    this_sample_max_num_for_val = 1+np.random.randint(0,max(args.max_num,args.max_num+5)) # always at least generate 1.
+                    this_sample_context_length_for_val = 1 + np.random.randint( 
+                                            minimum_starting_point_context_length, 
+                                            max(1,current_context_len+1)
+                        ) # always at least generate 1.
+        
+                    ### TURN THIS BACK ON IF YOU WANT TO SAMPLE FULL LENGTH.. BUT ITS SLOW..
+                    # this_sample_context_length_for_val = 1+np.random.randint(args.input_sample_length, args.input_sample_length)
+        
+                    this_sample_max_num_for_val = 1+np.random.randint(0,max(args.max_num,args.max_num)) # always at least generate 1.
                     
                     # TODO, maybe this should be different? can update later if we want
-                    val_samples = total_samples_per_iter 
+                    val_samples = 5 # total_samples_per_iter 
                     
                     # Generate a validation batch (vx, vy)
-                    vx, vy= generate_task_data(val_samples, args.task,
-                                                   this_sample_context_length_for_val, this_sample_max_num_for_val,
-                                                   train=False)
+                    vx, vy= generate_task_data(val_samples, 
+                                                   args.task,
+                                                   this_sample_context_length_for_val, 
+                                                   this_sample_max_num_for_val,
+                                                   train=False,
+                                                   ds = ds
+                                              )
                     
             
                     # Convert to tensors
@@ -3969,7 +5092,9 @@ def main():
                     # 1) Optionally, do a teacher-forced pass to measure "val_loss"
                     # --------------------------------------------------------------------
 
-                    vx_emb = embed(vx_ids)
+                    # vx_emb = embed(vx_ids)
+                    vx_emb = vx_ids # VERY HACKKY TODO SAME REASON AS ABOVE
+                
                     #             vy_emb = embed(vy_ids)[:, :-1, :]  # Exclude last token from input since we'll predict it
                     #             v_full = torch.cat([vx_emb, vy_emb], dim=1)  # Concatenate along sequence length dimension
                                 
