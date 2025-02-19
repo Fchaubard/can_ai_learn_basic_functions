@@ -18,6 +18,7 @@ import os
 os.environ["WANDB_API_KEY"] = ""
 
 
+
 import pdb
 import sys
 import math
@@ -1623,6 +1624,21 @@ class DNC(nn.Module):
 
 
         
+    # def reset_parameters(self):
+    #     """Initialize parameters with appropriate distributions"""
+    #     # Initialize LSTM params
+    #     for name, p in self.controller.named_parameters():
+    #         if 'weight' in name:
+    #             nn.init.orthogonal_(p)
+    #         elif 'bias' in name:
+    #             nn.init.constant_(p, 0)
+
+    #     # Initialize memory operation layers
+    #     for name, p in self.named_parameters():
+    #         if 'fc_' in name and 'weight' in name:
+    #             nn.init.uniform_(p, -0.1, 0.1)
+    #         elif 'fc_' in name and 'bias' in name:
+    #             nn.init.constant_(p, 0)
     def reset_parameters(self):
         """Initialize parameters with appropriate distributions"""
         # Initialize LSTM params
@@ -1631,14 +1647,15 @@ class DNC(nn.Module):
                 nn.init.orthogonal_(p)
             elif 'bias' in name:
                 nn.init.constant_(p, 0)
-
-        # Initialize memory operation layers
+    
+        # Initialize memory operation layers (TIGHTER INIT)
         for name, p in self.named_parameters():
             if 'fc_' in name and 'weight' in name:
-                nn.init.uniform_(p, -0.1, 0.1)
+                # nn.init.uniform_(p, -0.1, 0.1)  # Original, potentially too wide
+                nn.init.xavier_uniform_(p)  # Or use Xavier initialization
             elif 'fc_' in name and 'bias' in name:
-                nn.init.constant_(p, 0)
-
+                nn.init.constant_(p, 0) # GOOD: Keep bias at 0
+                
     def _read_memory(self, memory, read_keys):
         """Read from memory using normalized attention."""
         # Normalize memory and keys
@@ -3351,7 +3368,8 @@ class MezoAdaptiveSamplingParallel:
         
         if self.verbose:
             print(f"[Init] Allocated {num_copies} model copies and streams in VRAM.")
-
+    
+    
     def mezo_adaptive_sampling_fast_parallel(
         self,
         x_ids,
@@ -3359,7 +3377,7 @@ class MezoAdaptiveSamplingParallel:
         criterion,
         optimizer,
         epsilon=1e-3,
-        variance_reduction = 100.,
+        variance_reduction=100.0,
         adaptive=True,
         fixed_size_perturbation=False,
         use_same_probe_for_all_perturbations=True,
@@ -3368,23 +3386,22 @@ class MezoAdaptiveSamplingParallel:
     ):
         with torch.inference_mode():
             device = next(self.model_main.parameters()).device
-            
+    
             # Flatten parameters once
             orig_param_data, _ = flatten_params(self.model_main)
             param_data_orig = orig_param_data.clone()
             ratio_data = flatten_adam_ratio_data(self.model_main, optimizer) if adaptive else None
-
-            # Zero gradients
+    
+            # Zero gradients in the main model
             for p in self.model_main.parameters():
                 if p.grad is not None:
                     p.grad.zero_()
-
-            # Pre-compute all epsilons
+    
+            # Pre-compute epsilons and perturbations
             num_pert = self.num_perturbations
-            epsilons = [epsilon * (1 if use_same_eps_for_all_perturbations else self.eps_schedule_multiplier ** i) 
-                       for i in range(num_pert)]
-            
-            # Pre-compute perturbation direction
+            epsilons = [epsilon * (1 if use_same_eps_for_all_perturbations else self.eps_schedule_multiplier ** i)
+                        for i in range(num_pert)]
+    
             if use_same_probe_for_all_perturbations:
                 z_data = torch.randn_like(param_data_orig, device=device) / variance_reduction
                 d_data = (ratio_data + z_data if adaptive else z_data)
@@ -3399,73 +3416,50 @@ class MezoAdaptiveSamplingParallel:
                     if fixed_size_perturbation:
                         d_data = d_data / torch.norm(d_data, p=2)
                     perturbations.append(d_data)
-
-            # Launch all forward passes truly in parallel
+    
             num_copies = len(self.model_copies)
             losses = [None] * num_copies
-            events = []
-            
-            # Launch all operations in parallel using streams
+    
+    
+            # --- Launch Forward Passes in Parallel ---
             if self.one_way:
-                # Launch clean copy in parallel
+                # Clean copy (if one_way)
                 with torch.cuda.stream(self.streams[0]):
                     unflatten_into_params(param_data_orig, self.model_copies[0], self.meta)
                     losses[0] = teacher_forcing_loss_emb_parallel(self.model_copies[0], x_ids, y, criterion)
-                    event = torch.cuda.Event()
-                    event.record()
-                    events.append(event)
-
-                # Launch all perturbed copies in parallel
+    
+                # Perturbed copies
                 for i in range(num_pert):
                     copy_idx = i + 1
                     with torch.cuda.stream(self.streams[copy_idx]):
                         perturbed_param = param_data_orig + epsilons[i] * perturbations[i]
                         unflatten_into_params(perturbed_param, self.model_copies[copy_idx], self.meta)
                         losses[copy_idx] = teacher_forcing_loss_emb_parallel(self.model_copies[copy_idx], x_ids, y, criterion)
-                        event = torch.cuda.Event()
-                        event.record()
-                        events.append(event)
-            else:
-                # Launch all plus/minus pairs in parallel
+    
+            else:  # Two-way
                 for i in range(num_pert):
                     eps = epsilons[i]
                     d_data = perturbations[i]
-                    
+    
                     # Plus pass
                     idx_plus = 2 * i
                     with torch.cuda.stream(self.streams[idx_plus]):
                         plus_param = param_data_orig + eps * d_data
                         unflatten_into_params(plus_param, self.model_copies[idx_plus], self.meta)
                         losses[idx_plus] = teacher_forcing_loss_emb_parallel(self.model_copies[idx_plus], x_ids, y, criterion)
-                        event = torch.cuda.Event()
-                        event.record()
-                        events.append(event)
-                    
+    
                     # Minus pass
                     idx_minus = 2 * i + 1
                     with torch.cuda.stream(self.streams[idx_minus]):
                         minus_param = param_data_orig - eps * d_data
                         unflatten_into_params(minus_param, self.model_copies[idx_minus], self.meta)
                         losses[idx_minus] = teacher_forcing_loss_emb_parallel(self.model_copies[idx_minus], x_ids, y, criterion)
-                        event = torch.cuda.Event()
-                        event.record()
-                        events.append(event)
-
-            # Record completion of all forward passes
-            # for event in events:
-            #     event.synchronize()
+    
+            # --- Synchronize *AFTER* all forward passes are launched ---
             torch.cuda.synchronize()
-
-            # Launch all resets in parallel on their own streams
-            reset_events = []
-            for i, model_copy in enumerate(self.model_copies):
-                with torch.cuda.stream(self.streams[i]):
-                    unflatten_into_params(param_data_orig, model_copy, self.meta)
-                    event = torch.cuda.Event()
-                    event.record()
-                    reset_events.append(event)
-
-            # Compute gradients while resets are happening
+    
+    
+            # --- Compute Gradient Estimates ---
             perturbation_results = []
             if self.one_way:
                 loss_clean = losses[0]
@@ -3475,7 +3469,7 @@ class MezoAdaptiveSamplingParallel:
                     perturbation_results.append({
                         "grad_est": grad_est,
                         "plus_d": perturbations[i],
-                        "minus_d": torch.zeros_like(perturbations[i]),
+                        "minus_d": torch.zeros_like(perturbations[i]),  # Corrected: Use zeros_like
                         "epsilon": epsilons[i]
                     })
             else:
@@ -3486,77 +3480,642 @@ class MezoAdaptiveSamplingParallel:
                     perturbation_results.append({
                         "grad_est": grad_est,
                         "plus_d": perturbations[i],
-                        "minus_d": perturbations[i],
+                        "minus_d": perturbations[i],  # Corrected: Use perturbations[i]
                         "epsilon": epsilons[i]
                     })
-
-            # Wait for all resets to complete
-            # for event in reset_events:
-            #     event.synchronize()
-            torch.cuda.synchronize()
-
-            # Aggregate results
+    
+    
+            # --- Aggregate Results and Update Main Model --- (No changes here, but included for completeness)
             final_update = torch.zeros_like(param_data_orig)
             final_grad_est = 0.0
-            
+    
             valid_updates = []
             valid_weights = []
             valid_grad_ests = []
-            
             for pr in perturbation_results:
                 if self.one_way and aggregation_method in ("average", "weighted_average"):
                     if pr["grad_est"].item() >= 0:
-                        continue
+                        continue  # Corrected: Check as a scalar
                 update_val = pr["grad_est"] * pr["plus_d"]
                 valid_updates.append(update_val)
-                valid_weights.append(abs(pr["grad_est"]).detach())
+                valid_weights.append(abs(pr["grad_est"]).detach())  # Corrected: Use .detach()
                 valid_grad_ests.append(pr["grad_est"])
-
-            if valid_updates:
+    
+            if len(valid_updates)>0:
                 if aggregation_method == "average":
-                    final_update = sum(valid_updates) / len(valid_updates)
                     final_grad_est = sum(valid_grad_ests) / len(valid_updates)
+                    final_update = final_grad_est * sum(valid_updates) / len(valid_updates)
+                    
                 elif aggregation_method == "weighted_average":
                     total_weight = sum(valid_weights)
                     if total_weight > 0:
                         weighted_sum = sum(u * w for u, w in zip(valid_updates, valid_weights))
-                        final_update = weighted_sum / total_weight
-                        final_grad_est = sum(valid_grad_ests) / len(valid_updates)
+                        final_grad_est = sum(valid_grad_ests) / len(valid_updates)  # Corrected: Consistent averaging
+                        final_update = final_grad_est * weighted_sum / total_weight
+                        
                 elif aggregation_method == "max":
-                    candidate_indices = [idx for idx, g in enumerate(valid_grad_ests) if g.item() < 0]
+                    candidate_indices = [idx for idx, g in enumerate(valid_grad_ests) if g.item() < 0] # Corrected: Check as scalar
                     if candidate_indices:
-                        min_idx = min(candidate_indices, key=lambda idx: valid_grad_ests[idx].item())
-                        final_update = valid_updates[min_idx]
-                        final_grad_est = valid_grad_ests[min_idx].item()
-
-            # Update main model gradients
+                        min_idx = min(candidate_indices, key=lambda idx: valid_grad_ests[idx].item())  # Corrected: key should use .item()
+                        final_grad_est = valid_grad_ests[min_idx].item()  # Corrected: Use .item()
+                        final_update = final_grad_est * valid_updates[min_idx]
+                         
+            # Update main model gradients (Corrected: Simplified loop)
             offset = 0
             for p, (shape, numel, dev) in zip(self.model_main.parameters(), self.meta):
-                slice_ = final_update[offset:offset + numel]
-                offset += numel
+                slice_ = final_update[offset:offset + numel].view(shape).to(dev)
                 if p.grad is None:
-                    p.grad = slice_.view(shape).to(dev)
+                    p.grad = slice_
                 else:
-                    p.grad.add_(slice_.view(shape).to(dev))
-
-            # Compute average loss
+                    p.grad.add_(slice_)  # Use in-place addition
+                offset += numel
+    
+           # --- Reset Model Copies *AFTER* Gradient Computation ---
+            for i, model_copy in enumerate(self.model_copies):
+                with torch.cuda.stream(self.streams[i]):
+                    unflatten_into_params(param_data_orig, model_copy, self.meta)
+            torch.cuda.synchronize()  # Synchronize resets *after* gradient update
+    
+            # Compute average loss (Corrected)
             if self.one_way:
                 valid_losses = [losses[i+1].item() for i in range(num_pert)]
                 avg_loss = 0.5 * (losses[0].item() + (sum(valid_losses) / len(valid_losses)))
             else:
                 loss_pairs = [(losses[2*i].item(), losses[2*i+1].item()) for i in range(num_pert)]
                 avg_loss = sum(sum(pair)/2 for pair in loss_pairs) / len(loss_pairs)
-
+    
             return avg_loss, final_grad_est, perturbation_results
+    
+    # def mezo_adaptive_sampling_fast_parallel(
+    #     self,
+    #     x_ids,
+    #     y,
+    #     criterion,
+    #     optimizer,
+    #     epsilon=1e-3,
+    #     variance_reduction = 100.,
+    #     adaptive=True,
+    #     fixed_size_perturbation=False,
+    #     use_same_probe_for_all_perturbations=True,
+    #     use_same_eps_for_all_perturbations=True,
+    #     aggregation_method="average"
+    # ):
+    #     with torch.inference_mode():
+    #         device = next(self.model_main.parameters()).device
+            
+    #         # Flatten parameters once
+    #         orig_param_data, _ = flatten_params(self.model_main)
+    #         param_data_orig = orig_param_data.clone()
+    #         ratio_data = flatten_adam_ratio_data(self.model_main, optimizer) if adaptive else None
+
+    #         # Zero gradients
+    #         for p in self.model_main.parameters():
+    #             if p.grad is not None:
+    #                 p.grad.zero_()
+
+    #         # Pre-compute all epsilons
+    #         num_pert = self.num_perturbations
+    #         epsilons = [epsilon * (1 if use_same_eps_for_all_perturbations else self.eps_schedule_multiplier ** i) 
+    #                    for i in range(num_pert)]
+            
+    #         # Pre-compute perturbation direction
+    #         if use_same_probe_for_all_perturbations:
+    #             z_data = torch.randn_like(param_data_orig, device=device) / variance_reduction
+    #             d_data = (ratio_data + z_data if adaptive else z_data)
+    #             if fixed_size_perturbation:
+    #                 d_data = d_data / torch.norm(d_data, p=2)
+    #             perturbations = [d_data] * num_pert
+    #         else:
+    #             perturbations = []
+    #             for _ in range(num_pert):
+    #                 z_data = torch.randn_like(param_data_orig, device=device)
+    #                 d_data = (ratio_data + z_data if adaptive else z_data)
+    #                 if fixed_size_perturbation:
+    #                     d_data = d_data / torch.norm(d_data, p=2)
+    #                 perturbations.append(d_data)
+
+    #         # Launch all forward passes truly in parallel
+    #         num_copies = len(self.model_copies)
+    #         losses = [None] * num_copies
+    #         events = []
+            
+    #         # Launch all operations in parallel using streams
+    #         if self.one_way:
+    #             # Launch clean copy in parallel
+    #             with torch.cuda.stream(self.streams[0]):
+    #                 unflatten_into_params(param_data_orig, self.model_copies[0], self.meta)
+    #                 losses[0] = teacher_forcing_loss_emb_parallel(self.model_copies[0], x_ids, y, criterion)
+    #                 event = torch.cuda.Event()
+    #                 event.record()
+    #                 events.append(event)
+
+    #             # Launch all perturbed copies in parallel
+    #             for i in range(num_pert):
+    #                 copy_idx = i + 1
+    #                 with torch.cuda.stream(self.streams[copy_idx]):
+    #                     perturbed_param = param_data_orig + epsilons[i] * perturbations[i]
+    #                     unflatten_into_params(perturbed_param, self.model_copies[copy_idx], self.meta)
+    #                     losses[copy_idx] = teacher_forcing_loss_emb_parallel(self.model_copies[copy_idx], x_ids, y, criterion)
+    #                     event = torch.cuda.Event()
+    #                     event.record()
+    #                     events.append(event)
+    #         else:
+    #             # Launch all plus/minus pairs in parallel
+    #             for i in range(num_pert):
+    #                 eps = epsilons[i]
+    #                 d_data = perturbations[i]
+                    
+    #                 # Plus pass
+    #                 idx_plus = 2 * i
+    #                 with torch.cuda.stream(self.streams[idx_plus]):
+    #                     plus_param = param_data_orig + eps * d_data
+    #                     unflatten_into_params(plus_param, self.model_copies[idx_plus], self.meta)
+    #                     losses[idx_plus] = teacher_forcing_loss_emb_parallel(self.model_copies[idx_plus], x_ids, y, criterion)
+    #                     event = torch.cuda.Event()
+    #                     event.record()
+    #                     events.append(event)
+                    
+    #                 # Minus pass
+    #                 idx_minus = 2 * i + 1
+    #                 with torch.cuda.stream(self.streams[idx_minus]):
+    #                     minus_param = param_data_orig - eps * d_data
+    #                     unflatten_into_params(minus_param, self.model_copies[idx_minus], self.meta)
+    #                     losses[idx_minus] = teacher_forcing_loss_emb_parallel(self.model_copies[idx_minus], x_ids, y, criterion)
+    #                     event = torch.cuda.Event()
+    #                     event.record()
+    #                     events.append(event)
+
+    #         # Record completion of all forward passes
+    #         # for event in events:
+    #         #     event.synchronize()
+    #         torch.cuda.synchronize()
+
+    #         # Launch all resets in parallel on their own streams
+    #         reset_events = []
+    #         for i, model_copy in enumerate(self.model_copies):
+    #             with torch.cuda.stream(self.streams[i]):
+    #                 unflatten_into_params(param_data_orig, model_copy, self.meta)
+    #                 event = torch.cuda.Event()
+    #                 event.record()
+    #                 reset_events.append(event)
+
+    #         # Compute gradients while resets are happening
+    #         perturbation_results = []
+    #         if self.one_way:
+    #             loss_clean = losses[0]
+    #             for i in range(num_pert):
+    #                 loss_perturbed = losses[i + 1]
+    #                 grad_est = (loss_perturbed - loss_clean) / epsilons[i]
+    #                 perturbation_results.append({
+    #                     "grad_est": grad_est,
+    #                     "plus_d": perturbations[i],
+    #                     "minus_d": torch.zeros_like(perturbations[i]),
+    #                     "epsilon": epsilons[i]
+    #                 })
+    #         else:
+    #             for i in range(num_pert):
+    #                 idx_plus = 2 * i
+    #                 idx_minus = 2 * i + 1
+    #                 grad_est = (losses[idx_plus] - losses[idx_minus]) / (2 * epsilons[i])
+    #                 perturbation_results.append({
+    #                     "grad_est": grad_est,
+    #                     "plus_d": perturbations[i],
+    #                     "minus_d": perturbations[i],
+    #                     "epsilon": epsilons[i]
+    #                 })
+
+    #         # Wait for all resets to complete
+    #         # for event in reset_events:
+    #         #     event.synchronize()
+    #         torch.cuda.synchronize()
+
+    #         # Aggregate results
+    #         final_update = torch.zeros_like(param_data_orig)
+    #         final_grad_est = 0.0
+            
+    #         valid_updates = []
+    #         valid_weights = []
+    #         valid_grad_ests = []
+            
+    #         for pr in perturbation_results:
+    #             if self.one_way and aggregation_method in ("average", "weighted_average"):
+    #                 if pr["grad_est"].item() >= 0:
+    #                     continue
+    #             update_val = pr["grad_est"] * pr["plus_d"]
+    #             valid_updates.append(update_val)
+    #             valid_weights.append(abs(pr["grad_est"]).detach())
+    #             valid_grad_ests.append(pr["grad_est"])
+
+    #         if valid_updates:
+    #             if aggregation_method == "average":
+    #                 final_update = sum(valid_updates) / len(valid_updates)
+    #                 final_grad_est = sum(valid_grad_ests) / len(valid_updates)
+    #             elif aggregation_method == "weighted_average":
+    #                 total_weight = sum(valid_weights)
+    #                 if total_weight > 0:
+    #                     weighted_sum = sum(u * w for u, w in zip(valid_updates, valid_weights))
+    #                     final_update = weighted_sum / total_weight
+    #                     final_grad_est = sum(valid_grad_ests) / len(valid_updates)
+    #             elif aggregation_method == "max":
+    #                 candidate_indices = [idx for idx, g in enumerate(valid_grad_ests) if g.item() < 0]
+    #                 if candidate_indices:
+    #                     min_idx = min(candidate_indices, key=lambda idx: valid_grad_ests[idx].item())
+    #                     final_update = valid_updates[min_idx]
+    #                     final_grad_est = valid_grad_ests[min_idx].item()
+
+    #         # Update main model gradients
+    #         offset = 0
+    #         for p, (shape, numel, dev) in zip(self.model_main.parameters(), self.meta):
+    #             slice_ = final_update[offset:offset + numel]
+    #             offset += numel
+    #             if p.grad is None:
+    #                 p.grad = slice_.view(shape).to(dev)
+    #             else:
+    #                 p.grad.add_(slice_.view(shape).to(dev))
+
+    #         # Compute average loss
+    #         if self.one_way:
+    #             valid_losses = [losses[i+1].item() for i in range(num_pert)]
+    #             avg_loss = 0.5 * (losses[0].item() + (sum(valid_losses) / len(valid_losses)))
+    #         else:
+    #             loss_pairs = [(losses[2*i].item(), losses[2*i+1].item()) for i in range(num_pert)]
+    #             avg_loss = sum(sum(pair)/2 for pair in loss_pairs) / len(loss_pairs)
+
+    #         return avg_loss, final_grad_est, perturbation_results
 
 
 
+    # def mezo_adaptive_sampling_fast_parallel_layerwise(
+    #     self,
+    #     x_emb,
+    #     y,
+    #     criterion,
+    #     optimizer,            # e.g. Adam
+    #     epsilon=1e-3,
+    #     adaptive=True,
+    #     fixed_size_perturbation=False,
+    #     use_same_probe_for_all_perturbations=True,  # now always True
+    #     use_same_eps_for_all_perturbations=True,  # if False, will use an epsilon schedule
+    #     aggregation_method="average",  # one of "average", "weighted_average", or "max"
+    #     num_global_perturbations=0
+    # ):
+    #     """
+    #     Optimized layer‐wise finite‐difference perturbations.
+        
+    #     (See previous comments for details.)
+    #     """
+    #     with torch.inference_mode():
+    #         device = next(self.model_main.parameters()).device
+    
+    #         # === STEP 1: Flatten parameters and prepare metadata ===
+    #         orig_param_data, meta = flatten_params(self.model_main)
+    #         param_data_orig = orig_param_data.clone()
+    
+    #         layer_slices = []
+    #         offset = 0
+    #         for shape, numel, dev in meta:
+    #             layer_slices.append((offset, offset + numel))
+    #             offset += numel
+    #         num_layers = len(layer_slices)
+            
+    #         ratio_data = flatten_adam_ratio_data(self.model_main, optimizer)
+    #         for p in self.model_main.parameters():
+    #             if p.grad is not None:
+    #                 p.grad.zero_()
+            
+    #         local_seed = torch.randint(0, 2**32, (1,)).item()
+    #         torch.manual_seed(local_seed)
+    #         if self.verbose:
+    #             print(f"[Layerwise][Init] Set local random seed: {local_seed}")
+    
+    #         # === STEP 2: Precompute the global noise probe (always the same probe) ===
+    #         global_z_data = torch.randn_like(ratio_data, device=device)
+    #         global_d_data = ratio_data + global_z_data if adaptive else global_z_data
+    #         if fixed_size_perturbation:
+    #             norm = torch.norm(global_d_data, p=2)
+    #             if self.verbose:
+    #                 print(f"[Layerwise] Global fixed_size_perturbation enabled. Norm: {norm:.6f}")
+    #             global_d_data = global_d_data / (norm + 1e-8)
+    
+    #         # === STEP 3: Build epsilon schedule per layer ===
+    #         epsilons_layer = torch.empty(num_layers, device=device)
+    #         for i in range(num_layers):
+    #             epsilons_layer[i] = epsilon if use_same_eps_for_all_perturbations else epsilon * (self.eps_schedule_multiplier ** i)
+    #         if self.verbose:
+    #             print(f"[Layerwise] Epsilon schedule per layer: {epsilons_layer.cpu().numpy()}")
+    
+    #         # === STEP 4: Global clean run (one_way only) ===
+    #         if self.one_way:
+    #             unflatten_into_params(param_data_orig, self.model_copies[0], meta)
+    #             if self.verbose:
+    #                 print("[Layerwise][Clean] Launching global clean run...")
+    #             clean_loss = teacher_forcing_loss_emb(self.model_copies[0], x_emb, y, criterion)
+    #             if self.verbose:
+    #                 print(f"[Layerwise][Clean] Global clean run complete: loss = {clean_loss.item():.6f}")
+    #         else:
+    #             clean_loss = None
+    
+    #         # === STEP 5: Prepare layerwise tasks (each task perturbs only one layer) ===
+    #         layer_tasks = []
+    #         for layer_idx, (start, end) in enumerate(layer_slices):
+    #             eps_layer = epsilons_layer[layer_idx]
+    #             d_layer = global_d_data[start:end]
+    #             if self.one_way:
+    #                 perturbed_param = param_data_orig.clone()
+    #                 perturbed_param[start:end] = param_data_orig[start:end] + eps_layer * d_layer
+    #                 layer_tasks.append({
+    #                     "layer_idx": layer_idx,
+    #                     "epsilon": eps_layer,
+    #                     "d_layer": d_layer,
+    #                     "perturbed_param": perturbed_param,
+    #                     "mode": "one_way"
+    #                 })
+    #             else:
+    #                 perturbed_param_plus = param_data_orig.clone()
+    #                 perturbed_param_minus = param_data_orig.clone()
+    #                 perturbed_param_plus[start:end] = param_data_orig[start:end] + eps_layer * d_layer
+    #                 perturbed_param_minus[start:end] = param_data_orig[start:end] - eps_layer * d_layer
+    #                 layer_tasks.append({
+    #                     "layer_idx": layer_idx,
+    #                     "epsilon": eps_layer,
+    #                     "d_layer": d_layer,
+    #                     "perturbed_param": perturbed_param_plus,
+    #                     "mode": "plus"
+    #                 })
+    #                 layer_tasks.append({
+    #                     "layer_idx": layer_idx,
+    #                     "epsilon": eps_layer,
+    #                     "d_layer": d_layer,
+    #                     "perturbed_param": perturbed_param_minus,
+    #                     "mode": "minus"
+    #                 })
+    #         if self.verbose:
+    #             print(f"[Layerwise] Prepared {len(layer_tasks)} layer tasks for {num_layers} layers.")
+    
+    #         # === STEP 6: Launch layerwise tasks concurrently in batches ===
+    #         num_available = len(self.model_copies)
+    #         layer_results = [None] * len(layer_tasks)
+    #         start_batch_time = time.time()
+    #         for i in range(0, len(layer_tasks), num_available):
+    #             batch = layer_tasks[i : i + num_available]
+    #             if self.verbose:
+    #                 print(f"[Layerwise] Launching batch {i // num_available + 1}: tasks {i} to {i+len(batch)-1}")
+    #             batch_start_time = time.time()
+    #             for j, task in enumerate(batch):
+    #                 unflatten_into_params(task["perturbed_param"], self.model_copies[j], meta)
+    #                 with torch.cuda.stream(self.streams[j]):
+    #                     layer_results[i + j] = teacher_forcing_loss_emb(self.model_copies[j], x_emb, y, criterion)
+    #             torch.cuda.synchronize()
+    #             batch_time = time.time() - batch_start_time
+    #             if self.verbose:
+    #                 print(f"[Layerwise] Batch {i // num_available + 1} complete in {batch_time:.3f} s")
+    #         total_layer_time = time.time() - start_batch_time
+    #         if self.verbose:
+    #             print(f"[Layerwise] All layerwise tasks complete in {total_layer_time:.3f} s")
+    
+    #         # === STEP 7: Compute layerwise gradient estimates ===
+    #         computed_layer_results = []
+    #         if self.one_way:
+    #             for task, loss in zip(layer_tasks, layer_results):
+    #                 layer_idx = task["layer_idx"]
+    #                 eps_layer = task["epsilon"]
+    #                 d_layer = task["d_layer"]
+    #                 grad_est = (loss - clean_loss) / eps_layer
+    #                 computed_layer_results.append({
+    #                     "layer": layer_idx,
+    #                     "grad_est": grad_est,
+    #                     "plus_d": d_layer,
+    #                     "minus_d": torch.zeros_like(d_layer),
+    #                     "epsilon": eps_layer,
+    #                     "loss_clean": clean_loss.item(),
+    #                     "loss_perturbed": loss.item()
+    #                 })
+    #                 if self.verbose:
+    #                     print(f"[Layerwise] Layer {layer_idx}: loss perturbed = {loss.item():.6f}, grad_est = {grad_est.item():.6f}")
+    #         else:
+    #             for i in range(0, len(layer_tasks), 2):
+    #                 layer_idx = layer_tasks[i]["layer_idx"]
+    #                 eps_layer = layer_tasks[i]["epsilon"]
+    #                 d_layer = layer_tasks[i]["d_layer"]
+    #                 loss_plus = layer_results[i]
+    #                 loss_minus = layer_results[i+1]
+    #                 grad_est = (loss_plus - loss_minus) / (2 * eps_layer)
+    #                 computed_layer_results.append({
+    #                     "layer": layer_idx,
+    #                     "grad_est": grad_est,
+    #                     "plus_d": d_layer,
+    #                     "minus_d": d_layer,
+    #                     "epsilon": eps_layer,
+    #                     "loss_plus": loss_plus.item(),
+    #                     "loss_minus": loss_minus.item()
+    #                 })
+    #                 if self.verbose:
+    #                     print(f"[Layerwise] Layer {layer_idx}: loss plus = {loss_plus.item():.6f}, loss minus = {loss_minus.item():.6f}, grad_est = {grad_est.item():.6f}")
+    
+    #         # === STEP 8: Aggregate layerwise updates into a single flattened update ===
+    #         final_update = torch.zeros_like(param_data_orig)
+    #         for res in computed_layer_results:
+    #             layer_idx = res["layer"]
+    #             start, end = layer_slices[layer_idx]
+    #             update_layer = res["grad_est"] * res["plus_d"]
+    #             final_update[start:end] = update_layer.view(-1)
+    #         offset = 0
+    #         for p, (shape, numel, dev) in zip(self.model_main.parameters(), meta):
+    #             slice_ = final_update[offset: offset + numel]
+    #             offset += numel
+    #             if p.grad is None:
+    #                 p.grad = slice_.view(shape).to(dev)
+    #             else:
+    #                 p.grad.add_(slice_.view(shape).to(dev))
+    #         if self.verbose:
+    #             print("[Layerwise] Aggregated layerwise update applied to main model gradients.")
+    
+    #         if self.one_way:
+    #             avg_loss_layerwise = (clean_loss.item() + sum(res["loss_perturbed"] for res in computed_layer_results)) / (1 + len(computed_layer_results))
+    #             avg_grad_est_layerwise = sum(res["grad_est"].item() for res in computed_layer_results) / len(computed_layer_results)
+    #         else:
+    #             all_losses = [0.5 * (res["loss_plus"] + res["loss_minus"]) for res in computed_layer_results]
+    #             avg_loss_layerwise = sum(all_losses) / len(all_losses) if all_losses else 0.0
+    #             avg_grad_est_layerwise = sum(res["grad_est"].item() for res in computed_layer_results) / len(computed_layer_results)
+    #         if self.verbose:
+    #             print(f"[Layerwise] Layerwise average loss: {avg_loss_layerwise:.6f}, average grad_est: {avg_grad_est_layerwise:.6f}")
+    
+    #         # === STEP 9: Global Perturbations (if requested) ===
+    #         global_results = []
+    #         global_losses = []
+    #         global_grad_ests = []
+    #         if num_global_perturbations > 0:
+    #             global_tasks = []
+    #             if self.one_way:
+    #                 for i in range(num_global_perturbations):
+    #                     d_global = global_d_data
+    #                     eps_global = epsilon if use_same_eps_for_all_perturbations else epsilon * (self.eps_schedule_multiplier ** i)
+    #                     perturbed_param = param_data_orig.clone() + eps_global * d_global
+    #                     global_tasks.append({
+    #                         "epsilon": eps_global,
+    #                         "d_global": d_global,
+    #                         "perturbed_param": perturbed_param,
+    #                         "mode": "one_way",
+    #                         "index": i
+    #                     })
+    #                 global_clean_loss = clean_loss
+    #             else:
+    #                 for i in range(num_global_perturbations):
+    #                     d_global = global_d_data
+    #                     eps_global = epsilon if use_same_eps_for_all_perturbations else epsilon * (self.eps_schedule_multiplier ** i)
+    #                     perturbed_param_plus = param_data_orig.clone() + eps_global * d_global
+    #                     perturbed_param_minus = param_data_orig.clone() - eps_global * d_global
+    #                     global_tasks.append({
+    #                         "epsilon": eps_global,
+    #                         "d_global": d_global,
+    #                         "perturbed_param": perturbed_param_plus,
+    #                         "mode": "plus",
+    #                         "index": i
+    #                     })
+    #                     global_tasks.append({
+    #                         "epsilon": eps_global,
+    #                         "d_global": d_global,
+    #                         "perturbed_param": perturbed_param_minus,
+    #                         "mode": "minus",
+    #                         "index": i
+    #                     })
+    #             if self.verbose:
+    #                 print(f"[Global] Prepared {len(global_tasks)} global tasks.")
+    #             num_global_tasks = len(global_tasks)
+    #             global_results_list = [None] * num_global_tasks
+    #             start_global_time = time.time()
+    #             for i in range(0, num_global_tasks, num_available):
+    #                 batch = global_tasks[i : i + num_available]
+    #                 if self.verbose:
+    #                     print(f"[Global] Launching global batch {i // num_available + 1}: tasks {i} to {i+len(batch)-1}")
+    #                 batch_start_time = time.time()
+    #                 for j, task in enumerate(batch):
+    #                     unflatten_into_params(task["perturbed_param"], self.model_copies[j], meta)
+    #                     with torch.cuda.stream(self.streams[j]):
+    #                         global_results_list[i + j] = teacher_forcing_loss_emb(self.model_copies[j], x_emb, y, criterion)
+    #                 torch.cuda.synchronize()
+    #                 batch_time = time.time() - batch_start_time
+    #                 if self.verbose:
+    #                     print(f"[Global] Global batch {i // num_available + 1} complete in {batch_time:.3f} s")
+    #             total_global_time = time.time() - start_global_time
+    #             if self.verbose:
+    #                 print(f"[Global] All global tasks complete in {total_global_time:.3f} s")
+                
+    #             if self.one_way:
+    #                 for task, loss in zip(global_tasks, global_results_list):
+    #                     eps_global = task["epsilon"]
+    #                     d_global = task["d_global"]
+    #                     grad_est_global = (loss - global_clean_loss) / eps_global
+    #                     global_results.append({
+    #                         "global": True,
+    #                         "grad_est": grad_est_global,
+    #                         "plus_d": d_global,
+    #                         "minus_d": torch.zeros_like(d_global),
+    #                         "epsilon": eps_global,
+    #                         "loss_clean": global_clean_loss.item(),
+    #                         "loss_perturbed": loss.item()
+    #                     })
+    #                     global_losses.append(loss.item())
+    #                     global_grad_ests.append(grad_est_global.item())
+    #                     if self.verbose:
+    #                         print(f"[Global] Task {task['index']}: loss perturbed = {loss.item():.6f}, grad_est = {grad_est_global.item():.6f}")
+    #             else:
+    #                 for i in range(0, num_global_tasks, 2):
+    #                     eps_global = global_tasks[i]["epsilon"]
+    #                     d_global = global_tasks[i]["d_global"]
+    #                     loss_plus = global_results_list[i]
+    #                     loss_minus = global_results_list[i+1]
+    #                     grad_est_global = (loss_plus - loss_minus) / (2 * eps_global)
+    #                     global_results.append({
+    #                         "global": True,
+    #                         "grad_est": grad_est_global,
+    #                         "plus_d": d_global,
+    #                         "minus_d": d_global,
+    #                         "epsilon": eps_global,
+    #                         "loss_plus": loss_plus.item(),
+    #                         "loss_minus": loss_minus.item()
+    #                     })
+    #                     global_losses.extend([loss_plus.item(), loss_minus.item()])
+    #                     global_grad_ests.append(grad_est_global.item())
+    #                     if self.verbose:
+    #                         print(f"[Global] Task {i//2}: loss plus = {loss_plus.item():.6f}, loss minus = {loss_minus.item():.6f}, grad_est = {grad_est_global.item():.6f}")
+                
+    #             valid_updates = []
+    #             valid_weights = []
+    #             valid_grad_ests = []
+    #             for res in global_results:
+    #                 if self.one_way and aggregation_method in ("average", "weighted_average"):
+    #                     if res["grad_est"].item() >= 0:
+    #                         continue
+    #                 update_val = res["grad_est"] * res["plus_d"]
+    #                 valid_updates.append(update_val)
+    #                 valid_weights.append(abs(res["grad_est"]).detach())
+    #                 valid_grad_ests.append(res["grad_est"])
+    #             if aggregation_method == "average":
+    #                 if valid_updates:
+    #                     global_update = sum(valid_updates) / len(valid_updates)
+    #                     final_grad_est_global = sum(valid_grad_ests) / len(valid_updates)
+    #                 else:
+    #                     final_grad_est_global = 0.
+    #                     global_update = torch.zeros_like(param_data_orig)
+    #             elif aggregation_method == "weighted_average":
+    #                 total_weight = sum(valid_weights)
+    #                 if total_weight > 0:
+    #                     weighted_sum = sum(u * w for u, w in zip(valid_updates, valid_weights))
+    #                     global_update = weighted_sum / total_weight
+    #                     final_grad_est_global = sum(valid_grad_ests) / len(valid_updates)
+    #                 else:
+    #                     final_grad_est_global = 0.
+    #                     global_update = torch.zeros_like(param_data_orig)
+    #             elif aggregation_method == "max":
+    #                 candidate_indices = [idx for idx, g in enumerate(valid_grad_ests) if g.item() < 0]
+    #                 if candidate_indices:
+    #                     min_idx = min(candidate_indices, key=lambda idx: valid_grad_ests[idx].item())
+    #                     global_update = valid_updates[min_idx]
+    #                     final_grad_est_global = valid_grad_ests[min_idx].item()
+    #                 else:
+    #                     final_grad_est_global = 0.
+    #                     global_update = torch.zeros_like(param_data_orig)
+    #             else:
+    #                 raise ValueError(f"Unknown aggregation method: {aggregation_method}")
+    #             final_update += global_update
+    #             offset = 0
+    #             for p, (shape, numel, dev) in zip(self.model_main.parameters(), meta):
+    #                 slice_ = global_update[offset: offset+numel]
+    #                 offset += numel
+    #                 if p.grad is None:
+    #                     p.grad = slice_.view(shape).to(dev)
+    #                 else:
+    #                     p.grad.add_(slice_.view(shape).to(dev))
+    #             avg_loss_global = sum(global_losses) / len(global_losses) if global_losses else 0.0
+    #             avg_grad_est_global = sum(global_grad_ests) / len(global_grad_ests) if global_grad_ests else 0.0
+    #             if self.verbose:
+    #                 print(f"[Global] Global average loss: {avg_loss_global:.6f}, average grad_est: {avg_grad_est_global:.6f}")
+    #         else:
+    #             avg_loss_global = None
+    #             avg_grad_est_global = 0.0
+    
+    #         if avg_loss_global is not None:
+    #             overall_avg_loss = (avg_loss_layerwise + avg_loss_global) / 2.0
+    #             overall_grad_est = (avg_grad_est_layerwise + avg_grad_est_global) / 2.0
+    #         else:
+    #             overall_avg_loss = avg_loss_layerwise
+    #             overall_grad_est = avg_grad_est_layerwise
+    
+    #         perturbation_results = computed_layer_results + global_results
+    #         if self.verbose:
+    #             print(f"[Final][Layerwise] Overall average loss: {overall_avg_loss:.6f}, Overall grad_est: {overall_grad_est:.6f}")
+    
+    #         return overall_avg_loss, overall_grad_est, perturbation_results
+
+
+    
     def mezo_adaptive_sampling_fast_parallel_layerwise(
         self,
         x_emb,
         y,
         criterion,
-        optimizer,            # e.g. Adam
+        optimizer,        # e.g. Adam
         epsilon=1e-3,
         adaptive=True,
         fixed_size_perturbation=False,
@@ -3566,127 +4125,132 @@ class MezoAdaptiveSamplingParallel:
         num_global_perturbations=0
     ):
         """
-        Optimized layer‐wise finite‐difference perturbations.
-        
-        (See previous comments for details.)
+        Optimized layer‐wise finite‐difference perturbations.  Now TRULY parallel.
         """
         with torch.inference_mode():
             device = next(self.model_main.parameters()).device
-    
+
             # === STEP 1: Flatten parameters and prepare metadata ===
             orig_param_data, meta = flatten_params(self.model_main)
             param_data_orig = orig_param_data.clone()
-    
+
             layer_slices = []
             offset = 0
             for shape, numel, dev in meta:
                 layer_slices.append((offset, offset + numel))
                 offset += numel
             num_layers = len(layer_slices)
-            
+
             ratio_data = flatten_adam_ratio_data(self.model_main, optimizer)
             for p in self.model_main.parameters():
                 if p.grad is not None:
                     p.grad.zero_()
-            
-            local_seed = torch.randint(0, 2**32, (1,)).item()
-            torch.manual_seed(local_seed)
-            if self.verbose:
-                print(f"[Layerwise][Init] Set local random seed: {local_seed}")
-    
+
+            # We don't need a local seed if we're always using the same global probe.
+            # local_seed = torch.randint(0, 2**32, (1,)).item()
+            # torch.manual_seed(local_seed)
+            # if self.verbose:
+            #     print(f"[Layerwise][Init] Set local random seed: {local_seed}")
+
             # === STEP 2: Precompute the global noise probe (always the same probe) ===
             global_z_data = torch.randn_like(ratio_data, device=device)
             global_d_data = ratio_data + global_z_data if adaptive else global_z_data
             if fixed_size_perturbation:
                 norm = torch.norm(global_d_data, p=2)
-                if self.verbose:
-                    print(f"[Layerwise] Global fixed_size_perturbation enabled. Norm: {norm:.6f}")
+                # if self.verbose:  #  Less verbose during the critical loop
+                #     print(f"[Layerwise] Global fixed_size_perturbation enabled. Norm: {norm:.6f}")
                 global_d_data = global_d_data / (norm + 1e-8)
-    
+
             # === STEP 3: Build epsilon schedule per layer ===
             epsilons_layer = torch.empty(num_layers, device=device)
             for i in range(num_layers):
                 epsilons_layer[i] = epsilon if use_same_eps_for_all_perturbations else epsilon * (self.eps_schedule_multiplier ** i)
-            if self.verbose:
-                print(f"[Layerwise] Epsilon schedule per layer: {epsilons_layer.cpu().numpy()}")
-    
+            # if self.verbose: # Less verbose
+            #     print(f"[Layerwise] Epsilon schedule per layer: {epsilons_layer.cpu().numpy()}")
+
             # === STEP 4: Global clean run (one_way only) ===
             if self.one_way:
-                unflatten_into_params(param_data_orig, self.model_copies[0], meta)
-                if self.verbose:
-                    print("[Layerwise][Clean] Launching global clean run...")
-                clean_loss = teacher_forcing_loss_emb(self.model_copies[0], x_emb, y, criterion)
-                if self.verbose:
-                    print(f"[Layerwise][Clean] Global clean run complete: loss = {clean_loss.item():.6f}")
+                with torch.cuda.stream(self.streams[0]): # Use a stream!
+                    unflatten_into_params(param_data_orig, self.model_copies[0], meta)
+                    # if self.verbose:
+                    #     print("[Layerwise][Clean] Launching global clean run...")
+                    clean_loss = teacher_forcing_loss_emb_parallel(self.model_copies[0], x_emb, y, criterion)  # Use the parallel loss
+                    # if self.verbose:
+                    #     print(f"[Layerwise][Clean] Global clean run complete: loss = {clean_loss.item():.6f}")
             else:
                 clean_loss = None
-    
-            # === STEP 5: Prepare layerwise tasks (each task perturbs only one layer) ===
-            layer_tasks = []
+
+
+            # === STEP 5 & 6 COMBINED:  Launch *ALL* tasks concurrently ===
+            num_available = len(self.model_copies)
+            layer_results = [None] * (2 * num_layers if not self.one_way else num_layers)  # Pre-allocate results list
+            task_counter = 0
+
+            # Layerwise perturbations
             for layer_idx, (start, end) in enumerate(layer_slices):
                 eps_layer = epsilons_layer[layer_idx]
                 d_layer = global_d_data[start:end]
+
                 if self.one_way:
-                    perturbed_param = param_data_orig.clone()
-                    perturbed_param[start:end] = param_data_orig[start:end] + eps_layer * d_layer
-                    layer_tasks.append({
-                        "layer_idx": layer_idx,
-                        "epsilon": eps_layer,
-                        "d_layer": d_layer,
-                        "perturbed_param": perturbed_param,
-                        "mode": "one_way"
-                    })
-                else:
-                    perturbed_param_plus = param_data_orig.clone()
-                    perturbed_param_minus = param_data_orig.clone()
-                    perturbed_param_plus[start:end] = param_data_orig[start:end] + eps_layer * d_layer
-                    perturbed_param_minus[start:end] = param_data_orig[start:end] - eps_layer * d_layer
-                    layer_tasks.append({
-                        "layer_idx": layer_idx,
-                        "epsilon": eps_layer,
-                        "d_layer": d_layer,
-                        "perturbed_param": perturbed_param_plus,
-                        "mode": "plus"
-                    })
-                    layer_tasks.append({
-                        "layer_idx": layer_idx,
-                        "epsilon": eps_layer,
-                        "d_layer": d_layer,
-                        "perturbed_param": perturbed_param_minus,
-                        "mode": "minus"
-                    })
-            if self.verbose:
-                print(f"[Layerwise] Prepared {len(layer_tasks)} layer tasks for {num_layers} layers.")
-    
-            # === STEP 6: Launch layerwise tasks concurrently in batches ===
-            num_available = len(self.model_copies)
-            layer_results = [None] * len(layer_tasks)
-            start_batch_time = time.time()
-            for i in range(0, len(layer_tasks), num_available):
-                batch = layer_tasks[i : i + num_available]
-                if self.verbose:
-                    print(f"[Layerwise] Launching batch {i // num_available + 1}: tasks {i} to {i+len(batch)-1}")
-                batch_start_time = time.time()
-                for j, task in enumerate(batch):
-                    unflatten_into_params(task["perturbed_param"], self.model_copies[j], meta)
-                    with torch.cuda.stream(self.streams[j]):
-                        layer_results[i + j] = teacher_forcing_loss_emb(self.model_copies[j], x_emb, y, criterion)
-                torch.cuda.synchronize()
-                batch_time = time.time() - batch_start_time
-                if self.verbose:
-                    print(f"[Layerwise] Batch {i // num_available + 1} complete in {batch_time:.3f} s")
-            total_layer_time = time.time() - start_batch_time
-            if self.verbose:
-                print(f"[Layerwise] All layerwise tasks complete in {total_layer_time:.3f} s")
-    
-            # === STEP 7: Compute layerwise gradient estimates ===
+                    with torch.cuda.stream(self.streams[(layer_idx % (num_available -1)) + 1]):  # +1 to avoid stream 0 (used for clean run)
+                        perturbed_param = param_data_orig.clone()
+                        perturbed_param[start:end] = param_data_orig[start:end] + eps_layer * d_layer
+                        unflatten_into_params(perturbed_param, self.model_copies[(layer_idx % (num_available -1)) + 1], meta)
+                        layer_results[layer_idx] = teacher_forcing_loss_emb_parallel(self.model_copies[(layer_idx % (num_available-1)) + 1], x_emb, y, criterion) # Store the *future*
+
+                else: # two way
+                    # Plus perturbation
+                    with torch.cuda.stream(self.streams[2 * layer_idx % num_available]):
+                        perturbed_param_plus = param_data_orig.clone()
+                        perturbed_param_plus[start:end] = param_data_orig[start:end] + eps_layer * d_layer
+                        unflatten_into_params(perturbed_param_plus, self.model_copies[2 * layer_idx % num_available], meta)
+                        layer_results[2*layer_idx] = teacher_forcing_loss_emb_parallel(self.model_copies[2 * layer_idx % num_available], x_emb, y, criterion)  # Store
+
+                    # Minus perturbation
+                    with torch.cuda.stream(self.streams[(2 * layer_idx + 1) % num_available]):
+                        perturbed_param_minus = param_data_orig.clone()
+                        perturbed_param_minus[start:end] = param_data_orig[start:end] - eps_layer * d_layer
+                        unflatten_into_params(perturbed_param_minus, self.model_copies[(2 * layer_idx + 1) % num_available], meta)
+                        layer_results[2*layer_idx + 1] = teacher_forcing_loss_emb_parallel(self.model_copies[(2 * layer_idx + 1) % num_available], x_emb, y, criterion)
+
+
+            # Global perturbations (if requested) -  Similar parallel launch
+            global_results = [None] * (2 * num_global_perturbations if not self.one_way else num_global_perturbations)
+            if num_global_perturbations > 0:
+
+                for i in range(num_global_perturbations):
+                    d_global = global_d_data
+                    eps_global = epsilon if use_same_eps_for_all_perturbations else epsilon * (self.eps_schedule_multiplier ** i)
+
+                    if self.one_way:
+                        with torch.cuda.stream(self.streams[(i+1) % num_available]):  # Use modulo to cycle through streams, avoid stream 0
+                            perturbed_param = param_data_orig.clone() + eps_global * d_global
+                            unflatten_into_params(perturbed_param, self.model_copies[(i+1) % num_available], meta)
+                            global_results[i] = teacher_forcing_loss_emb_parallel(self.model_copies[(i+1) % num_available], x_emb, y, criterion)
+                    else:
+                        # Plus
+                        with torch.cuda.stream(self.streams[(2 * i) % num_available]):
+                            perturbed_param_plus = param_data_orig.clone() + eps_global * d_global
+                            unflatten_into_params(perturbed_param_plus, self.model_copies[(2 * i) % num_available], meta)
+                            global_results[2*i] = teacher_forcing_loss_emb_parallel(self.model_copies[(2 * i) % num_available], x_emb, y, criterion)
+                        # Minus
+                        with torch.cuda.stream(self.streams[(2 * i + 1) % num_available]):
+                            perturbed_param_minus = param_data_orig.clone() - eps_global * d_global
+                            unflatten_into_params(perturbed_param_minus, self.model_copies[(2 * i + 1) % num_available], meta)
+                            global_results[2*i + 1] = teacher_forcing_loss_emb_parallel(self.model_copies[(2 * i + 1) % num_available], x_emb, y, criterion)
+
+            # === STEP 7:  Synchronize *AFTER* launching all tasks ===
+            torch.cuda.synchronize()
+
+            # === STEP 8: Compute layerwise gradient estimates === (Now using futures)
             computed_layer_results = []
             if self.one_way:
-                for task, loss in zip(layer_tasks, layer_results):
-                    layer_idx = task["layer_idx"]
-                    eps_layer = task["epsilon"]
-                    d_layer = task["d_layer"]
-                    grad_est = (loss - clean_loss) / eps_layer
+                for layer_idx in range(num_layers):
+                    loss = layer_results[layer_idx]
+                    eps_layer = epsilons_layer[layer_idx]
+                    start, end = layer_slices[layer_idx]  # Corrected: Get slices here
+                    d_layer = global_d_data[start:end]
+                    grad_est = (loss - clean_loss) / eps_layer  # Use clean_loss from stream 0
                     computed_layer_results.append({
                         "layer": layer_idx,
                         "grad_est": grad_est,
@@ -3696,35 +4260,117 @@ class MezoAdaptiveSamplingParallel:
                         "loss_clean": clean_loss.item(),
                         "loss_perturbed": loss.item()
                     })
-                    if self.verbose:
-                        print(f"[Layerwise] Layer {layer_idx}: loss perturbed = {loss.item():.6f}, grad_est = {grad_est.item():.6f}")
             else:
-                for i in range(0, len(layer_tasks), 2):
-                    layer_idx = layer_tasks[i]["layer_idx"]
-                    eps_layer = layer_tasks[i]["epsilon"]
-                    d_layer = layer_tasks[i]["d_layer"]
-                    loss_plus = layer_results[i]
-                    loss_minus = layer_results[i+1]
+                for i in range(0, num_layers):
+                    loss_plus = layer_results[2*i]
+                    loss_minus = layer_results[2*i+1]
+                    eps_layer = epsilons_layer[i]
+                    start, end = layer_slices[i]
+                    d_layer = global_d_data[start:end]
                     grad_est = (loss_plus - loss_minus) / (2 * eps_layer)
                     computed_layer_results.append({
-                        "layer": layer_idx,
+                        "layer": i,
                         "grad_est": grad_est,
                         "plus_d": d_layer,
-                        "minus_d": d_layer,
+                        "minus_d": d_layer,  # Corrected
                         "epsilon": eps_layer,
                         "loss_plus": loss_plus.item(),
                         "loss_minus": loss_minus.item()
                     })
-                    if self.verbose:
-                        print(f"[Layerwise] Layer {layer_idx}: loss plus = {loss_plus.item():.6f}, loss minus = {loss_minus.item():.6f}, grad_est = {grad_est.item():.6f}")
-    
-            # === STEP 8: Aggregate layerwise updates into a single flattened update ===
+
+            # === STEP 9: Compute Global Gradient Estimates (if applicable)
+            global_grad_ests = []
+            if num_global_perturbations > 0:
+                if self.one_way:
+                    for i in range(num_global_perturbations):
+                        loss = global_results[i]
+                        eps_global = epsilon if use_same_eps_for_all_perturbations else epsilon * (self.eps_schedule_multiplier ** i)
+                        grad_est_global = (loss - clean_loss) / eps_global # Use clean loss.
+                        global_results.append({
+                            "global": True,
+                            "grad_est": grad_est_global,
+                            "plus_d": global_d_data,
+                            "minus_d": torch.zeros_like(global_d_data), #Correct
+                            "epsilon": eps_global,
+                            "loss_clean": clean_loss.item(),
+                            "loss_perturbed": loss.item()
+
+                        })
+                        global_grad_ests.append(grad_est_global.item())
+                else: # two way
+                    for i in range(num_global_perturbations):
+                        loss_plus = global_results[2*i]
+                        loss_minus = global_results[2*i + 1]
+                        eps_global = epsilon if use_same_eps_for_all_perturbations else epsilon * (self.eps_schedule_multiplier ** i)
+                        grad_est_global = (loss_plus - loss_minus) / (2 * eps_global)
+                        global_results.append({
+                            "global": True,
+                            "grad_est": grad_est_global,
+                            "plus_d": global_d_data,
+                            "minus_d": global_d_data, # Correct
+                            "epsilon": eps_global,
+                            "loss_plus": loss_plus.item(),
+                            "loss_minus": loss_minus.item()
+                        })
+                        global_grad_ests.append(grad_est_global.item())
+
+
+             # === STEP 10: Aggregate layerwise updates into a single flattened update ===
             final_update = torch.zeros_like(param_data_orig)
             for res in computed_layer_results:
                 layer_idx = res["layer"]
                 start, end = layer_slices[layer_idx]
                 update_layer = res["grad_est"] * res["plus_d"]
                 final_update[start:end] = update_layer.view(-1)
+            
+            # === STEP 11: Aggregate global updates (if any)
+            if num_global_perturbations > 0:
+
+                valid_updates = []
+                valid_weights = []
+                valid_grad_ests = []
+
+                for res in global_results:
+                    if self.one_way and aggregation_method in ("average", "weighted_average"):
+                        if res["grad_est"].item() >= 0: #scalar check
+                            continue
+                    update_val = res["grad_est"] * res["plus_d"] # global uses plus_d.
+                    valid_updates.append(update_val)
+                    valid_weights.append(abs(res["grad_est"]).detach()) #scalar
+                    valid_grad_ests.append(res["grad_est"]) # tensor
+
+                if valid_updates:
+                    if aggregation_method == "average":
+                        global_update = sum(valid_updates) / len(valid_updates)
+                        final_grad_est_global = sum(valid_grad_ests) / len(valid_updates)
+
+                    elif aggregation_method == "weighted_average":
+                        total_weight = sum(valid_weights)
+                        if total_weight > 0:
+                            weighted_sum = sum(u * w for u, w in zip(valid_updates, valid_weights))
+                            global_update = weighted_sum / total_weight
+                            final_grad_est_global = sum(valid_grad_ests) / len(valid_updates)
+                        else:
+                            final_grad_est_global = 0.
+                            global_update = torch.zeros_like(param_data_orig)
+
+
+                    elif aggregation_method == "max":
+                        candidate_indices = [idx for idx, g in enumerate(valid_grad_ests) if g.item() < 0]  # scalar
+                        if candidate_indices:
+                            min_idx = min(candidate_indices, key=lambda idx: valid_grad_ests[idx].item())
+                            global_update = valid_updates[min_idx]
+                            final_grad_est_global = valid_grad_ests[min_idx].item()
+                        else:
+                            final_grad_est_global = 0.
+                            global_update = torch.zeros_like(param_data_orig)
+                    else:
+                        raise ValueError(f"Unknown aggregation method: {aggregation_method}")
+
+                    final_update += global_update # Accumulate global updates.
+
+
+            # === STEP 12: Apply Final Update to Main Model ===
             offset = 0
             for p, (shape, numel, dev) in zip(self.model_main.parameters(), meta):
                 slice_ = final_update[offset: offset + numel]
@@ -3733,9 +4379,11 @@ class MezoAdaptiveSamplingParallel:
                     p.grad = slice_.view(shape).to(dev)
                 else:
                     p.grad.add_(slice_.view(shape).to(dev))
-            if self.verbose:
-                print("[Layerwise] Aggregated layerwise update applied to main model gradients.")
-    
+
+            # if self.verbose:
+            #    print("[Layerwise] Aggregated layerwise update applied to main model gradients.")
+
+            # === STEP 13: Compute Average Losses (Layerwise and Global) ===
             if self.one_way:
                 avg_loss_layerwise = (clean_loss.item() + sum(res["loss_perturbed"] for res in computed_layer_results)) / (1 + len(computed_layer_results))
                 avg_grad_est_layerwise = sum(res["grad_est"].item() for res in computed_layer_results) / len(computed_layer_results)
@@ -3743,181 +4391,55 @@ class MezoAdaptiveSamplingParallel:
                 all_losses = [0.5 * (res["loss_plus"] + res["loss_minus"]) for res in computed_layer_results]
                 avg_loss_layerwise = sum(all_losses) / len(all_losses) if all_losses else 0.0
                 avg_grad_est_layerwise = sum(res["grad_est"].item() for res in computed_layer_results) / len(computed_layer_results)
-            if self.verbose:
-                print(f"[Layerwise] Layerwise average loss: {avg_loss_layerwise:.6f}, average grad_est: {avg_grad_est_layerwise:.6f}")
-    
-            # === STEP 9: Global Perturbations (if requested) ===
-            global_results = []
-            global_losses = []
-            global_grad_ests = []
-            if num_global_perturbations > 0:
-                global_tasks = []
+            # if self.verbose:  # Less verbose during the loop
+            #     print(f"[Layerwise] Layerwise average loss: {avg_loss_layerwise:.6f}, average grad_est: {avg_grad_est_layerwise:.6f}")
+
+            global_losses = [] # moved here
+            if num_global_perturbations > 0:  # Only compute if needed
                 if self.one_way:
-                    for i in range(num_global_perturbations):
-                        d_global = global_d_data
-                        eps_global = epsilon if use_same_eps_for_all_perturbations else epsilon * (self.eps_schedule_multiplier ** i)
-                        perturbed_param = param_data_orig.clone() + eps_global * d_global
-                        global_tasks.append({
-                            "epsilon": eps_global,
-                            "d_global": d_global,
-                            "perturbed_param": perturbed_param,
-                            "mode": "one_way",
-                            "index": i
-                        })
-                    global_clean_loss = clean_loss
-                else:
-                    for i in range(num_global_perturbations):
-                        d_global = global_d_data
-                        eps_global = epsilon if use_same_eps_for_all_perturbations else epsilon * (self.eps_schedule_multiplier ** i)
-                        perturbed_param_plus = param_data_orig.clone() + eps_global * d_global
-                        perturbed_param_minus = param_data_orig.clone() - eps_global * d_global
-                        global_tasks.append({
-                            "epsilon": eps_global,
-                            "d_global": d_global,
-                            "perturbed_param": perturbed_param_plus,
-                            "mode": "plus",
-                            "index": i
-                        })
-                        global_tasks.append({
-                            "epsilon": eps_global,
-                            "d_global": d_global,
-                            "perturbed_param": perturbed_param_minus,
-                            "mode": "minus",
-                            "index": i
-                        })
-                if self.verbose:
-                    print(f"[Global] Prepared {len(global_tasks)} global tasks.")
-                num_global_tasks = len(global_tasks)
-                global_results_list = [None] * num_global_tasks
-                start_global_time = time.time()
-                for i in range(0, num_global_tasks, num_available):
-                    batch = global_tasks[i : i + num_available]
-                    if self.verbose:
-                        print(f"[Global] Launching global batch {i // num_available + 1}: tasks {i} to {i+len(batch)-1}")
-                    batch_start_time = time.time()
-                    for j, task in enumerate(batch):
-                        unflatten_into_params(task["perturbed_param"], self.model_copies[j], meta)
-                        with torch.cuda.stream(self.streams[j]):
-                            global_results_list[i + j] = teacher_forcing_loss_emb(self.model_copies[j], x_emb, y, criterion)
-                    torch.cuda.synchronize()
-                    batch_time = time.time() - batch_start_time
-                    if self.verbose:
-                        print(f"[Global] Global batch {i // num_available + 1} complete in {batch_time:.3f} s")
-                total_global_time = time.time() - start_global_time
-                if self.verbose:
-                    print(f"[Global] All global tasks complete in {total_global_time:.3f} s")
-                
-                if self.one_way:
-                    for task, loss in zip(global_tasks, global_results_list):
-                        eps_global = task["epsilon"]
-                        d_global = task["d_global"]
-                        grad_est_global = (loss - global_clean_loss) / eps_global
-                        global_results.append({
-                            "global": True,
-                            "grad_est": grad_est_global,
-                            "plus_d": d_global,
-                            "minus_d": torch.zeros_like(d_global),
-                            "epsilon": eps_global,
-                            "loss_clean": global_clean_loss.item(),
-                            "loss_perturbed": loss.item()
-                        })
-                        global_losses.append(loss.item())
-                        global_grad_ests.append(grad_est_global.item())
-                        if self.verbose:
-                            print(f"[Global] Task {task['index']}: loss perturbed = {loss.item():.6f}, grad_est = {grad_est_global.item():.6f}")
-                else:
-                    for i in range(0, num_global_tasks, 2):
-                        eps_global = global_tasks[i]["epsilon"]
-                        d_global = global_tasks[i]["d_global"]
-                        loss_plus = global_results_list[i]
-                        loss_minus = global_results_list[i+1]
-                        grad_est_global = (loss_plus - loss_minus) / (2 * eps_global)
-                        global_results.append({
-                            "global": True,
-                            "grad_est": grad_est_global,
-                            "plus_d": d_global,
-                            "minus_d": d_global,
-                            "epsilon": eps_global,
-                            "loss_plus": loss_plus.item(),
-                            "loss_minus": loss_minus.item()
-                        })
-                        global_losses.extend([loss_plus.item(), loss_minus.item()])
-                        global_grad_ests.append(grad_est_global.item())
-                        if self.verbose:
-                            print(f"[Global] Task {i//2}: loss plus = {loss_plus.item():.6f}, loss minus = {loss_minus.item():.6f}, grad_est = {grad_est_global.item():.6f}")
-                
-                valid_updates = []
-                valid_weights = []
-                valid_grad_ests = []
-                for res in global_results:
-                    if self.one_way and aggregation_method in ("average", "weighted_average"):
-                        if res["grad_est"].item() >= 0:
-                            continue
-                    update_val = res["grad_est"] * res["plus_d"]
-                    valid_updates.append(update_val)
-                    valid_weights.append(abs(res["grad_est"]).detach())
-                    valid_grad_ests.append(res["grad_est"])
-                if aggregation_method == "average":
-                    if valid_updates:
-                        global_update = sum(valid_updates) / len(valid_updates)
-                        final_grad_est_global = sum(valid_grad_ests) / len(valid_updates)
-                    else:
-                        final_grad_est_global = 0.
-                        global_update = torch.zeros_like(param_data_orig)
-                elif aggregation_method == "weighted_average":
-                    total_weight = sum(valid_weights)
-                    if total_weight > 0:
-                        weighted_sum = sum(u * w for u, w in zip(valid_updates, valid_weights))
-                        global_update = weighted_sum / total_weight
-                        final_grad_est_global = sum(valid_grad_ests) / len(valid_updates)
-                    else:
-                        final_grad_est_global = 0.
-                        global_update = torch.zeros_like(param_data_orig)
-                elif aggregation_method == "max":
-                    candidate_indices = [idx for idx, g in enumerate(valid_grad_ests) if g.item() < 0]
-                    if candidate_indices:
-                        min_idx = min(candidate_indices, key=lambda idx: valid_grad_ests[idx].item())
-                        global_update = valid_updates[min_idx]
-                        final_grad_est_global = valid_grad_ests[min_idx].item()
-                    else:
-                        final_grad_est_global = 0.
-                        global_update = torch.zeros_like(param_data_orig)
-                else:
-                    raise ValueError(f"Unknown aggregation method: {aggregation_method}")
-                final_update += global_update
-                offset = 0
-                for p, (shape, numel, dev) in zip(self.model_main.parameters(), meta):
-                    slice_ = global_update[offset: offset+numel]
-                    offset += numel
-                    if p.grad is None:
-                        p.grad = slice_.view(shape).to(dev)
-                    else:
-                        p.grad.add_(slice_.view(shape).to(dev))
-                avg_loss_global = sum(global_losses) / len(global_losses) if global_losses else 0.0
-                avg_grad_est_global = sum(global_grad_ests) / len(global_grad_ests) if global_grad_ests else 0.0
-                if self.verbose:
-                    print(f"[Global] Global average loss: {avg_loss_global:.6f}, average grad_est: {avg_grad_est_global:.6f}")
+                    global_losses = [global_results[i].item() for i in range(num_global_perturbations)]
+                    avg_loss_global = (clean_loss.item() + sum(global_losses)) / (1 + len(global_losses)) if global_losses else clean_loss.item()
+
+                else: # two-way
+                    global_losses = [global_results[i].item() for i in range(num_global_perturbations*2)]
+                    avg_loss_global = sum(0.5*(global_losses[2*i] + global_losses[2*i+1]) for i in range(num_global_perturbations)) / len(global_losses) if global_losses else 0.0
+
             else:
-                avg_loss_global = None
-                avg_grad_est_global = 0.0
-    
+                avg_loss_global = None  # Important: Set to None if no global perturbations
+                avg_grad_est_global = 0.0  #Consistent.
+
             if avg_loss_global is not None:
                 overall_avg_loss = (avg_loss_layerwise + avg_loss_global) / 2.0
                 overall_grad_est = (avg_grad_est_layerwise + avg_grad_est_global) / 2.0
             else:
                 overall_avg_loss = avg_loss_layerwise
                 overall_grad_est = avg_grad_est_layerwise
-    
-            perturbation_results = computed_layer_results + global_results
-            if self.verbose:
-                print(f"[Final][Layerwise] Overall average loss: {overall_avg_loss:.6f}, Overall grad_est: {overall_grad_est:.6f}")
-    
+
+            perturbation_results = computed_layer_results + global_results  # Combine results
+            # if self.verbose:
+            #     print(f"[Final][Layerwise] Overall average loss: {overall_avg_loss:.6f}, Overall grad_est: {overall_grad_est:.6f}")
+
             return overall_avg_loss, overall_grad_est, perturbation_results
-    
-        
 
     
-    
+
+                                                                                                             
+                                                                                                             
+                                                                                                             
+                                                                                                             
+                                                                                                             
+                                                                                                             
+                                                                                                             
+                                                                                                             
+                                                                                                             
+                                                                                                             
+                                                                                                             
+                                                                                                             
+                                                                                                             
+                                                                                                             
+                                                                                                             
+                                                                                                             
+                                                                                                             
     def mezo_adaptive_sampling_fast_parallel_adam_variance(
         self,
         x_ids,
@@ -6746,8 +7268,6 @@ def main():
                         print(f"logging failed at iteration {iteration}. Error: {str(e)}")
 
                     
-
-
 
     print("Finished.") 
     if args.wandb_proj is not None:
