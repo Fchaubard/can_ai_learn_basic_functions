@@ -17,8 +17,6 @@ NTM/DNC/Transformer code with ASCII tasks, plus:
 import os
 os.environ["WANDB_API_KEY"] = ""
 
-
-
 import pdb
 import sys
 import math
@@ -3159,7 +3157,7 @@ def anp_single(model, x_ids, y, criterion, epsilon=1e-3, decorrelation_matrix=No
         # ---------------------------------------------------------------
         # 7) Compute gradient & apply to module.weight.grad
         # ---------------------------------------------------------------
-        grad_estimate = (loss_noisy - loss_clean) / (2.0 * epsilon)
+        grad_estimate = (loss_noisy - loss_clean) / (2.0 * epsilon) # TODO, do not think it should be 2.0 bc it is one way.
         if verbose:
             print(f"\nEstimated gradient: {grad_estimate.item():.6f}")
 
@@ -3341,7 +3339,8 @@ class MezoAdaptiveSamplingParallel:
         one_way=False,
         variance_reduction=1,
         eps_schedule_multiplier=1,
-        verbose=False
+        probe_dropout_rate=0.,
+        verbose=True
     ):
         self.model_main = model
         self.num_perturbations = num_perturbations
@@ -3349,6 +3348,7 @@ class MezoAdaptiveSamplingParallel:
         self.eps_schedule_multiplier = eps_schedule_multiplier
         self.verbose = verbose
         self.variance_reduction = variance_reduction
+        self.probe_dropout_rate = probe_dropout_rate
 
         _, meta = flatten_params(model)
         self.meta = meta
@@ -3367,6 +3367,9 @@ class MezoAdaptiveSamplingParallel:
         self.streams = [torch.cuda.Stream() for _ in range(num_copies)]
         
         if self.verbose:
+            num_params = sum(p.numel() for p in model.parameters())
+            num_layers = len(list(model.children()))
+            print(f"[Init] Model has {num_params} parameters across {num_layers} layers.")
             print(f"[Init] Allocated {num_copies} model copies and streams in VRAM.")
     
     
@@ -3405,6 +3408,10 @@ class MezoAdaptiveSamplingParallel:
             if use_same_probe_for_all_perturbations:
                 z_data = torch.randn_like(param_data_orig, device=device) / variance_reduction
                 d_data = (ratio_data + z_data if adaptive else z_data)
+                if self.probe_dropout_rate>0.0:
+                    mask = (torch.rand_like(d_data, device=device) > self.probe_dropout_rate).float()
+                    d_data = d_data * mask  # Apply mask to disable perturbations
+                    # print(f"probe_dropout_rate={self.probe_dropout_rate}")
                 if fixed_size_perturbation:
                     d_data = d_data / torch.norm(d_data, p=2)
                 perturbations = [d_data] * num_pert
@@ -3413,6 +3420,10 @@ class MezoAdaptiveSamplingParallel:
                 for _ in range(num_pert):
                     z_data = torch.randn_like(param_data_orig, device=device)
                     d_data = (ratio_data + z_data if adaptive else z_data)
+                    if self.probe_dropout_rate>0.0:
+                        mask = (torch.rand_like(d_data, device=device) > self.probe_dropout_rate).float()
+                        d_data = d_data * mask  # Apply mask to disable perturbations
+                        # print(f"probe_dropout_rate={self.probe_dropout_rate}")
                     if fixed_size_perturbation:
                         d_data = d_data / torch.norm(d_data, p=2)
                     perturbations.append(d_data)
@@ -3458,7 +3469,6 @@ class MezoAdaptiveSamplingParallel:
             # --- Synchronize *AFTER* all forward passes are launched ---
             torch.cuda.synchronize()
     
-    
             # --- Compute Gradient Estimates ---
             perturbation_results = []
             if self.one_way:
@@ -3493,9 +3503,12 @@ class MezoAdaptiveSamplingParallel:
             valid_weights = []
             valid_grad_ests = []
             for pr in perturbation_results:
-                if self.one_way and aggregation_method in ("average", "weighted_average"):
-                    if pr["grad_est"].item() >= 0:
-                        continue  # Corrected: Check as a scalar
+                # if pr["grad_est"].item() >= 0:
+                #         continue # skip if the grad estimate is not positive
+                    
+                # if self.one_way and aggregation_method in ("average", "weighted_average"):
+                    # if pr["grad_est"].item() >= 0:
+                    #     continue  # Corrected: Check as a scalar
                 update_val = pr["grad_est"] * pr["plus_d"]
                 valid_updates.append(update_val)
                 valid_weights.append(abs(pr["grad_est"]).detach())  # Corrected: Use .detach()
@@ -3504,21 +3517,21 @@ class MezoAdaptiveSamplingParallel:
             if len(valid_updates)>0:
                 if aggregation_method == "average":
                     final_grad_est = sum(valid_grad_ests) / len(valid_updates)
-                    final_update = final_grad_est * sum(valid_updates) / len(valid_updates)
+                    final_update = sum(valid_updates) / len(valid_updates)
                     
                 elif aggregation_method == "weighted_average":
                     total_weight = sum(valid_weights)
                     if total_weight > 0:
                         weighted_sum = sum(u * w for u, w in zip(valid_updates, valid_weights))
                         final_grad_est = sum(valid_grad_ests) / len(valid_updates)  # Corrected: Consistent averaging
-                        final_update = final_grad_est * weighted_sum / total_weight
+                        final_update = weighted_sum / total_weight
                         
                 elif aggregation_method == "max":
                     candidate_indices = [idx for idx, g in enumerate(valid_grad_ests) if g.item() < 0] # Corrected: Check as scalar
                     if candidate_indices:
                         min_idx = min(candidate_indices, key=lambda idx: valid_grad_ests[idx].item())  # Corrected: key should use .item()
                         final_grad_est = valid_grad_ests[min_idx].item()  # Corrected: Use .item()
-                        final_update = final_grad_est * valid_updates[min_idx]
+                        final_update =  valid_updates[min_idx]
                          
             # Update main model gradients (Corrected: Simplified loop)
             offset = 0
@@ -3540,9 +3553,11 @@ class MezoAdaptiveSamplingParallel:
             if self.one_way:
                 valid_losses = [losses[i+1].item() for i in range(num_pert)]
                 avg_loss = 0.5 * (losses[0].item() + (sum(valid_losses) / len(valid_losses)))
+                # print(f"   valid_losses (one way):{len(valid_losses)}")
             else:
                 loss_pairs = [(losses[2*i].item(), losses[2*i+1].item()) for i in range(num_pert)]
                 avg_loss = sum(sum(pair)/2 for pair in loss_pairs) / len(loss_pairs)
+                # print(f"   valid_losses (one way):{len(valid_losses)}")
     
             return avg_loss, final_grad_est, perturbation_results
     
@@ -6424,6 +6439,9 @@ def main():
     parser.add_argument("--adam_variance", action="store_true", help="then during adaptive sampling we use m2 for the var term.")
     parser.add_argument("--reset_solver_after_plateau", type=int, default=-1) #TODO! not implemented yet
     parser.add_argument("--num_global_perturbations", type=int, default=0)
+    parser.add_argument("--probe_dropout_rate", type=float, default=0.0)
+    parser.add_argument("--overfit_to_one_batch_flag", action="store_true",
+                        help="This will overfit to just one batch in train (not val) and is just to sanity check and ensure no bug, ensure train_loss hits 0 otherwise something is wrong.")
     
     args= parser.parse_args()
 
@@ -6574,7 +6592,7 @@ def main():
         # TODO, not tested
         mezo_state = init_rolling_mezo(model, args.epsilon)
 
-    if args.num_perturbations > 1:
+    if args.num_perturbations >= 1:
         # init MezoAdaptiveSamplingParallel and use that and later we call sampler.mezo_adaptive_sampling_fast_parallel()
         sampler = MezoAdaptiveSamplingParallel(
                 model,
@@ -6582,8 +6600,8 @@ def main():
                 one_way=('one_way' in args.mezo_flavor),  # example: set one_way if the flavor ends with "one_way"
                 eps_schedule_multiplier=args.eps_schedule_multiplier,
                 variance_reduction = args.variance_reduction,
-                verbose=False  # or args.verbose if you add that option
-            )
+                probe_dropout_rate = args.probe_dropout_rate
+        )
         
     # Warmup scheduler
     warmup_scheduler = WarmupScheduler( # TODO , you should have a counter inside of this, and then you just call .step() and it knows to increment or not and if not, then it return a bool.. will be simpler.
@@ -6615,13 +6633,11 @@ def main():
         model.eval()
         with torch.no_grad():
             prepare_model_for_fast_inference(model, dummy_data)
+    
     print(torch.cuda.max_memory_allocated(device) / (1024 ** 3), "GiB")
     print("Memory stats:")
     print(torch.cuda.memory_summary(device))
     print("Done")
-
-    
-
 
     if mezo_flavor in ["mezo_adaptive_sampling_layerwise_one_way", "mezo_adaptive_sampling_layerwise"] and args.num_perturbations<=1:
         raise("cant use mezo_layerwise with num_perturbations==1, will be too slow. bump up num_perturbations")
@@ -6657,7 +6673,30 @@ def main():
         print("Got the OWT dataset!")
                 
 
-    profile_mezo_flag = True
+    profile_mezo_flag = False
+
+    # sample just one batch.. and memorize it! 
+
+    overfit_to_one_batch_flag = args.overfit_to_one_batch_flag
+    
+    if overfit_to_one_batch_flag:
+        this_sample_context_length = 1 + np.random.randint( 
+                                                minimum_starting_point_context_length, 
+                                                max(1,current_context_len+1)
+                            ) # always at least generate 1.
+            
+        this_sample_max_num = 1+np.random.randint(0,max(1,current_max_num)) # always at least generate 1.
+    
+        
+        x_strs, y_strs= generate_task_data(total_samples_per_iter, args.task,
+                                           this_sample_context_length,
+                                           this_sample_max_num,
+                                           train=True,
+                                            ds = ds
+                                          )
+    
+        
+
 
     while True:
         #torch.cuda.reset_peak_memory_stats(device)        
@@ -6667,18 +6706,21 @@ def main():
         
         # generate data
         # we do a curriculum for train
-        this_sample_context_length = 1 + np.random.randint( 
-                                            minimum_starting_point_context_length, 
-                                            max(1,current_context_len+1)
-                        ) # always at least generate 1.
-        
-        this_sample_max_num = 1+np.random.randint(0,max(1,current_max_num)) # always at least generate 1.
-        x_strs, y_strs= generate_task_data(total_samples_per_iter, args.task,
-                                           this_sample_context_length,
-                                           this_sample_max_num,
-                                           train=True,
-                                            ds = ds
-                                          )
+
+        if not overfit_to_one_batch_flag:
+            this_sample_context_length = 1 + np.random.randint( 
+                                                minimum_starting_point_context_length, 
+                                                max(1,current_context_len+1)
+                            ) # always at least generate 1.
+            
+            this_sample_max_num = 1+np.random.randint(0,max(1,current_max_num)) # always at least generate 1.
+            
+            x_strs, y_strs= generate_task_data(total_samples_per_iter, args.task,
+                                               this_sample_context_length,
+                                               this_sample_max_num,
+                                               train=True,
+                                                ds = ds
+                                              )
         
         model.zero_grad()
         embed.zero_grad()
@@ -6719,7 +6761,7 @@ def main():
                         # # x_emb = x_emb.half()
                         model.eval()
 
-                        if args.num_perturbations>1:
+                        if args.num_perturbations>=1:
                             
                             # TODO NEED TO PULL ALL OF THIS INTO THE INIT! 
                             if mezo_flavor == "mezo_single_fast":
@@ -6951,11 +6993,11 @@ def main():
         #             print(f"Param {i}: No gradient calculated (None). Name: {param.shape}")
         #     pdb.set_trace()
 
-        if args.num_perturbations>1:
-            if final_grad_est!=0.0:
+        if args.num_perturbations>=1:
+            # if final_grad_est!=0.0:
                 optimizer.step()
-            else:
-                pass # we skip if final_grad_est==0.
+            # else:
+                # pass # we skip if final_grad_est==0.
         else:
             optimizer.step()
 
@@ -7128,6 +7170,12 @@ def main():
                                                    train=False,
                                                    ds = ds
                                               )
+
+
+                    # if overfit_to_one_batch_flag:
+                    #     vx, vy = x_strs, y_strs # override it bc i am just memorizing one batch. See if it will work.
+
+                    
                     
             
                     # Convert to tensors
@@ -7246,7 +7294,7 @@ def main():
                     "total_estimated_vram_gb":total_estimated_vram_gb,
                     "GPU(GB)-Hours":total_estimated_vram_gb*total_elapsed / 3600.0,
                     "gen_efficiency_gen_loss":gen_efficiency_gen_loss,
-                    "gen_efficiency_val_loss":gen_efficiency_val_loss,
+                    "gen_efficiency_val_loss":gen_efficiency_val_loss.item(),
                     "weight_decay_loss": weight_decay_loss.item(),
                     "vram_inferred":vram_inferred
                     # "vram_usage":vram_usage,
