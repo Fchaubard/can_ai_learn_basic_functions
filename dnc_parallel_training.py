@@ -1257,7 +1257,9 @@ def train_distributed():
     
     # Ensure all processes are synchronized before starting training
     if dist.is_initialized():
+        print("initializing")
         dist.barrier()
+        print("done initializing")
     
     # Load dataset if needed
     ds = None
@@ -1276,8 +1278,9 @@ def train_distributed():
                         break
                     except Exception as e:
                         print(f"Hugging face issue... {e}")
-                        time.sleep(5)
+                        time.sleep(2)
                         iterr += 1
+                        print(f"trying to get OWT: iter {iterr}")
                         if iterr > 100:
                             raise Exception("HUGGING FACE ISSUES AGAIN!")
                 print("Got the OWT dataset!")
@@ -1324,7 +1327,8 @@ def train_distributed():
                                             max(1, current_context_len+1)
                         )
         this_sample_max_num = 1 + np.random.randint(0, max(1, current_max_num))
-        
+
+        print("Generating task data.")
         x_strs, y_strs = generate_task_data(
             total_samples_per_iter, 
             args.task,
@@ -1333,6 +1337,7 @@ def train_distributed():
             train=True,
             ds=ds
         )
+        print("Generating task data generated.")
     
     # Track warmup steps
     warmup_counter = 0
