@@ -340,7 +340,7 @@ class MezoDistributedSampling:
         # Set up parameters
         self.num_perturbations = num_perturbations
         self.probe_dropout_rate = probe_dropout_rate
-        self.verbose = verbose
+        self.verbose = verbose  # Keep verbose for all ranks
         
         # Setup local model for each rank
         self.device = f'cuda:{self.rank}'
@@ -366,7 +366,7 @@ class MezoDistributedSampling:
             # Get meta info for parameter reshaping
             _, self.meta = flatten_params(model)
             
-            print(f"Created model on rank {self.rank}")
+            print(f"Created model on rank {self.rank}\n")
         else:
             # Initialize placeholder tensor for receiving dimensions
             dims = torch.zeros(6, dtype=torch.long, device=self.device)
@@ -403,18 +403,17 @@ class MezoDistributedSampling:
             self.local_model.eval()
             
             if self.verbose:
-                print(f"Created placeholder DNC model on rank {self.rank} with matching dimensions")
+                print(f"Created placeholder DNC model on rank {self.rank} with matching dimensions\n")
         
         # Broadcast meta information from rank 0 to all ranks
         self._broadcast_meta()
         
         if self.verbose:
             num_params = sum(p.numel() for p in self.local_model.parameters())
-            print(f"[Init] Model has {num_params} parameters.")
-            print(f"[Init] Using {self.world_size} GPUs for distributed training.")
-            print(f"[Init] Number of perturbations: {self.num_perturbations}")
-    
-        
+            print(f"[Init] Rank {self.rank}: Model has {num_params} parameters.\n")
+            print(f"[Init] Rank {self.rank}: Using {self.world_size} GPUs for distributed training.\n")
+            print(f"[Init] Rank {self.rank}: Number of perturbations: {self.num_perturbations}\n")
+            
     
     def _init_distributed(self):
         """Initialize the distributed environment."""
@@ -463,13 +462,11 @@ class MezoDistributedSampling:
 
 
 
-
-    
     def _broadcast_data_optimized(self, theta_cpu, theta_plus_adam_cpu, adam_ratio_cpu, seeds, x_ids, y):
         """
         Broadcast data from rank 0 to all other ranks with memory optimization.
         This includes theta, theta+adam_ratio, seeds, and dataset.
-        
+         
         Args:
             theta_cpu: Model parameters (valid on rank 0)
             theta_plus_adam_cpu: Theta + Adam ratio (valid on rank 0)
@@ -548,278 +545,6 @@ class MezoDistributedSampling:
         torch.cuda.empty_cache()
         
         return theta_cpu, theta_plus_adam_cpu, adam_ratio_cpu, seeds, x_ids, y
-
-    
-    # def mezo_distributed_sampling(
-    #     self,
-    #     x_ids,
-    #     y,
-    #     criterion,
-    #     optimizer,
-    #     epsilon=1e-3
-    # ):
-    #     """
-    #     Distributed implementation of Mezo Adaptive Sampling.
-    #     Implements the "one_way" version where rank 0 does clean forward pass and other ranks do perturbed passes.
-        
-    #     Args:
-    #         x_ids: Input token IDs
-    #         y: Target token IDs
-    #         criterion: Loss function
-    #         optimizer: Optimizer
-    #         epsilon: Perturbation scale
-            
-    #     Returns:
-    #         Average loss for this iteration
-    #     """
-    #     with torch.inference_mode():
-    #         # Record start time for performance tracking
-    #         start_time = time.time()
-            
-    #         # Synchronize all processes at the beginning
-    #         dist.barrier()
-            
-    #         # -------------------------------------------------------------
-    #         # Step 1-4: Create batch data, distribute model and adam ratio
-    #         # -------------------------------------------------------------
-    #         if self.rank == 0:
-    #             # Get original parameters
-    #             orig_param_data, _ = flatten_params(self.model_main)
-                
-    #             # Get adam ratio on CPU as requested
-    #             ratio_data = flatten_adam_ratio_data(self.model_main, optimizer).cpu()
-                
-    #             # Move parameters to CPU for broadcasting
-    #             orig_param_data_cpu = orig_param_data.cpu()
-                
-    #             # Generate random seeds for each rank
-    #             seeds = [random.randint(0, 2**32-1) for _ in range(self.world_size)]
-                
-    #             # Zero gradients in the main model
-    #             for p in self.model_main.parameters():
-    #                 if p.grad is not None:
-    #                     p.grad.zero_()
-    #         else:
-    #             # These will be filled by broadcast
-    #             orig_param_data_cpu = None
-    #             ratio_data = None
-    #             seeds = None
-            
-    #         # Broadcast data to all ranks (original parameters, adam ratio, seeds, and data)
-    #         orig_param_data_cpu, ratio_data, seeds, x_ids, y = self._broadcast_data(
-    #             orig_param_data_cpu, ratio_data, seeds, x_ids, y
-    #         )
-            
-    #         # Set random seed for this rank
-    #         torch.manual_seed(seeds[self.rank])
-    #         np.random.seed(seeds[self.rank])
-    #         random.seed(seeds[self.rank])
-            
-    #         # -------------------------------------------------------------
-    #         # Step 5-6: Memory-optimized parameter perturbation
-    #         # -------------------------------------------------------------
-            
-    #         # On rank 0, compute θ + ε*Adam Ratio for all ranks
-    #         if self.rank == 0:
-    #             # Move to GPU
-    #             orig_param_data = orig_param_data_cpu.to(self.device)
-    #             ratio_data_gpu = ratio_data.to(self.device)
-                
-    #             # Scale the ratio by epsilon
-    #             scaled_ratio = epsilon * ratio_data_gpu
-                
-    #             # Compute θ + ε*Adam Ratio
-    #             perturbed_base = orig_param_data + scaled_ratio
-                
-    #             # Clean up to save memory
-    #             ratio_data_gpu = None
-    #             scaled_ratio = None
-    #             torch.cuda.empty_cache()
-    #         else:
-    #             # Create a placeholder for receiving perturbed_base
-    #             orig_param_data = None
-    #             perturbed_base = torch.zeros(0, device=self.device)  # Will be resized during broadcast
-            
-    #         # Broadcast θ + ε*Adam Ratio from rank 0 to all ranks
-    #         perturbed_base = self._broadcast_tensor(perturbed_base, 0)
-            
-    #         # For rank 0, subtract back ε*Adam Ratio to get clean θ
-    #         if self.rank == 0:
-    #             # Move Adam Ratio to GPU temporarily for subtraction
-    #             ratio_data_gpu = ratio_data.to(self.device)
-                
-    #             # Get clean parameters by subtracting ε*Adam Ratio
-    #             param_data = perturbed_base - epsilon * ratio_data_gpu
-                
-    #             # Clean up
-    #             ratio_data_gpu = None
-    #             torch.cuda.empty_cache()
-                
-    #             # Apply to model
-    #             unflatten_into_params(param_data, self.local_model, self.meta)
-                
-    #             # We don't need a probe for rank 0
-    #             probe = None
-    #         else:
-    #             # For ranks 1 to num_perturbations, add random noise
-    #             if self.rank <= self.num_perturbations:
-    #                 # Create random probe with dropout
-    #                 probe = torch.randn_like(perturbed_base)
-    #                 if self.probe_dropout_rate > 0.0:
-    #                     mask = (torch.rand_like(probe) > self.probe_dropout_rate).float()
-    #                     probe *= mask
-                    
-    #                 # Scale probe by epsilon
-    #                 probe *= epsilon
-                    
-    #                 # Add probe to perturbed_base (which already contains θ + ε*Adam Ratio)
-    #                 param_data = perturbed_base + probe
-                    
-    #                 # Apply to model
-    #                 unflatten_into_params(param_data, self.local_model, self.meta)
-    #             else:
-    #                 # Ranks beyond num_perturbations don't participate
-    #                 param_data = perturbed_base  # Just use the base for consistency
-    #                 unflatten_into_params(param_data, self.local_model, self.meta)
-    #                 probe = None
-            
-    #         # Clean up to save memory
-    #         perturbed_base = None
-    #         torch.cuda.empty_cache()
-            
-    #         # -------------------------------------------------------------
-    #         # Step 7: Perform forward passes (parallel across ranks)
-    #         # -------------------------------------------------------------
-            
-    #         # Record start time for forward pass
-    #         fwd_start_time = time.time()
-    #         if self.verbose:
-    #             print(f"[Rank {self.rank}] Starting forward pass at {fwd_start_time:.3f}")
-            
-    #         # Perform forward pass
-    #         if self.rank <= self.num_perturbations:
-    #             # All participating ranks compute their loss
-    #             loss = teacher_forcing_loss_emb_parallel(
-    #                 self.local_model, x_ids, y, criterion
-    #             )
-    #         else:
-    #             # Non-participating ranks use a dummy loss
-    #             loss = torch.tensor(0.0, device=self.device)
-            
-    #         # Record end time for forward pass
-    #         fwd_end_time = time.time()
-    #         fwd_duration = fwd_end_time - fwd_start_time
-    #         if self.verbose:
-    #             print(f"[Rank {self.rank}] Completed forward pass at {fwd_end_time:.3f}, took {fwd_duration:.3f}s")
-            
-    #         # -------------------------------------------------------------
-    #         # Step 8: Gather losses and compute gradient estimates
-    #         # -------------------------------------------------------------
-            
-    #         # Gather losses from all ranks
-    #         losses = self._gather_losses(loss)
-            
-    #         # Get clean loss value (from rank 0)
-    #         clean_loss_val = losses[0].item()
-            
-    #         if self.rank == 0:
-    #             # Calculate grad estimates for monitoring
-    #             grad_ests = []
-    #             valid_grad_ests = []
-    #             for i in range(1, self.num_perturbations + 1):
-    #                 if i < len(losses):
-    #                     grad_est = (losses[i].item() - clean_loss_val) / epsilon
-    #                     grad_ests.append(grad_est)
-    #                     valid_grad_ests.append(grad_est)
-                
-    #             # Average loss for return value
-    #             perturbed_losses = [losses[i].item() for i in range(1, min(len(losses), self.num_perturbations + 1))]
-    #             avg_perturbed = sum(perturbed_losses) / len(perturbed_losses) if perturbed_losses else 0.0
-    #             avg_loss = (clean_loss_val + avg_perturbed) / 2
-                
-    #             # Log if verbose
-    #             if self.verbose:
-    #                 print(f"Clean loss: {clean_loss_val:.4f}, Avg perturbed: {avg_perturbed:.4f}, Avg loss: {avg_loss:.4f}")
-    #                 if grad_ests:
-    #                     print(f"Grad estimates: {', '.join([f'{g:.6f}' for g in grad_ests])}")
-            
-    #         # -------------------------------------------------------------
-    #         # Step 9: Multiply each probe by its gradient estimate
-    #         # -------------------------------------------------------------
-            
-    #         if 1 <= self.rank <= self.num_perturbations:
-    #             # Only participating perturbation ranks
-    #             perturbed_loss_val = losses[self.rank].item()
-    #             grad_est = (perturbed_loss_val - clean_loss_val) / epsilon
-                
-    #             # Scale probe by grad_est
-    #             probe *= grad_est
-            
-    #         # -------------------------------------------------------------
-    #         # Step 10: Average probes across perturbation ranks
-    #         # -------------------------------------------------------------
-            
-    #         # Reduce probes to get weighted average
-    #         weighted_avg_probe = self._reduce_probes(probe)
-            
-    #         # -------------------------------------------------------------
-    #         # Step 11-12: Update Adam moments on CPU and apply to model
-    #         # -------------------------------------------------------------
-            
-    #         if self.rank == 0:
-    #             # Apply gradient to model parameters
-    #             offset = 0
-    #             for p, (shape, numel, _) in zip(self.model_main.parameters(), self.meta):
-    #                 slice_ = weighted_avg_probe[offset:offset + numel].view(shape)
-    #                 if p.grad is None:
-    #                     p.grad = slice_.to(p.device)
-    #                 else:
-    #                     p.grad.copy_(slice_.to(p.device))
-    #                 offset += numel
-                
-    #             # Update model with optimizer step
-    #             optimizer.step()
-    #             optimizer.zero_grad()
-                
-    #             # Get updated parameters and adam ratio
-    #             updated_params, _ = flatten_params(self.model_main)
-    #             updated_ratio = flatten_adam_ratio_data(self.model_main, optimizer).cpu()
-                
-    #             # Move parameters to CPU for broadcasting
-    #             updated_params_cpu = updated_params.cpu()
-    #         else:
-    #             # Placeholders for non-rank-0 processes
-    #             updated_params_cpu = None
-    #             updated_ratio = None
-    #             avg_loss = 0.0
-            
-    #         # Broadcast updated model and adam ratio to all ranks
-    #         updated_params_cpu, updated_ratio = self._broadcast_updated_model(
-    #             updated_params_cpu, updated_ratio
-    #         )
-            
-    #         # Update local model with new parameters
-    #         if self.rank != 0:
-    #             updated_params = updated_params_cpu.to(self.device)
-    #             unflatten_into_params(updated_params, self.local_model, self.meta)
-            
-    #         # Synchronize before next iteration
-    #         dist.barrier()
-            
-    #         # -------------------------------------------------------------
-    #         # Step 13: Log timing info
-    #         # -------------------------------------------------------------
-            
-    #         end_time = time.time()
-    #         if self.rank == 0:
-    #             iter_time = end_time - start_time
-    #             if self.verbose:
-    #                 print(f"Iteration completed in {iter_time:.4f}s")
-    #             return avg_loss
-    #         else:
-    #             return 0.0  # Non-root ranks return dummy value
-            
-            
     
     def mezo_distributed_sampling(
         self,
@@ -830,11 +555,12 @@ class MezoDistributedSampling:
         epsilon=1e-3
     ):
         """
-        Optimized distributed implementation of Mezo Adaptive Sampling.
+        Distributed implementation of Mezo Adaptive Sampling.
         Implements the "one_way" version where rank 0 does clean forward pass and other ranks do perturbed passes.
         """
         with torch.inference_mode():
-            # Record start time for performance tracking
+            # Synchronize all processes at the start
+            dist.barrier()
             start_time = time.time()
             
             # -------------------------------------------------------------
@@ -844,7 +570,7 @@ class MezoDistributedSampling:
                 # Get original parameters
                 orig_param_data, _ = flatten_params(self.model_main)
                 
-                # Get adam ratio on CPU (keep it on CPU throughout)
+                # Get adam ratio on CPU
                 ratio_data = flatten_adam_ratio_data(self.model_main, optimizer).cpu()
                 
                 # Move parameters to CPU for broadcasting
@@ -867,7 +593,7 @@ class MezoDistributedSampling:
                 ratio_data = None
                 seeds = None
             
-            # Broadcast data to all ranks (original parameters, adam ratio, seeds, and data)
+            # Broadcast data to all ranks
             orig_param_data_cpu, ratio_data, seeds, x_ids, y = self._broadcast_data(
                 orig_param_data_cpu, ratio_data, seeds, x_ids, y
             )
@@ -878,180 +604,124 @@ class MezoDistributedSampling:
             random.seed(seeds[self.rank])
             
             # -------------------------------------------------------------
-            # Step 5-6: Memory-optimized parameter perturbation
+            # Step 5-6: Parameter perturbation
             # -------------------------------------------------------------
             
-            # Move parameters to GPU - creating streams for overlapped operations
-            compute_stream = torch.cuda.Stream()
-            with torch.cuda.stream(compute_stream):
-                # On rank 0, compute θ + ε*Adam Ratio for all ranks
-                if self.rank == 0:
-                    # Move to GPU
-                    orig_param_data = orig_param_data_cpu.to(self.device)
-                    ratio_data_gpu = ratio_data.to(self.device)
-                    
-                    # Scale ratio and add in-place to save memory
-                    scaled_ratio = epsilon * ratio_data_gpu
-                    orig_param_data.add_(scaled_ratio)
-                    
-                    # Now orig_param_data is actually (θ + ε*Adam Ratio)
-                    perturbed_base = orig_param_data
-                    
-                    # Clean up to save memory
-                    scaled_ratio = None
-                    ratio_data_gpu = None
-                    torch.cuda.empty_cache()
-                else:
-                    # Create a placeholder for receiving perturbed_base
-                    perturbed_base = torch.zeros(0, device=self.device)  # Will be resized during broadcast
+            # Move original parameters to device
+            orig_param_data = orig_param_data_cpu.to(self.device)
             
-            # Synchronize compute stream
-            torch.cuda.synchronize()
+            # Apply parameters based on rank
+            if self.rank == 0:
+                # Rank 0 uses original params (no perturbation)
+                unflatten_into_params(orig_param_data, self.local_model, self.meta)
+                probe = None
+            elif 1 <= self.rank <= self.num_perturbations:
+                # Create random probe
+                probe = torch.randn_like(orig_param_data)
+                
+                # Apply dropout if needed
+                if self.probe_dropout_rate > 0.0:
+                    mask = (torch.rand_like(probe) > self.probe_dropout_rate).float()
+                    probe *= mask
+                
+                # Scale probe by epsilon
+                probe *= epsilon
+                
+                # Apply perturbed parameters to model
+                param_data = orig_param_data + probe
+                unflatten_into_params(param_data, self.local_model, self.meta)
+            else:
+                # Ranks beyond num_perturbations don't participate
+                unflatten_into_params(orig_param_data, self.local_model, self.meta)
+                probe = None
             
-            # Broadcast θ + ε*Adam Ratio from rank 0 to all ranks - this is a critical path, so no async
-            perturbed_base = self._broadcast_tensor(perturbed_base, 0)
-            
-            # Process different ranks using separate streams
-            with torch.cuda.stream(compute_stream):
-                # For rank 0, get back to original params by subtracting ε*Adam Ratio
-                if self.rank == 0:
-                    # We need to prepare the clean theta for rank 0's forward pass
-                    ratio_data_gpu = ratio_data.to(self.device)
-                    
-                    # Create param_data by modifying a clone of perturbed_base
-                    param_data = perturbed_base.clone()
-                    param_data.sub_(epsilon * ratio_data_gpu)
-                    
-                    # Clean up immediately
-                    ratio_data_gpu = None
-                    torch.cuda.empty_cache()
-                    
-                    # Apply to model
-                    unflatten_into_params(param_data, self.local_model, self.meta)
-                    
-                    # We don't need a probe for rank 0
-                    probe = None
-                    
-                    # Clean up
-                    param_data = None
-                    torch.cuda.empty_cache()
-                else:
-                    # For ranks 1 to num_perturbations, add random noise
-                    if self.rank <= self.num_perturbations:
-                        # Create random probe with dropout
-                        probe = torch.randn_like(perturbed_base)
-                        if self.probe_dropout_rate > 0.0:
-                            mask = (torch.rand_like(probe) > self.probe_dropout_rate).float()
-                            probe *= mask
-                        
-                        # Scale probe by epsilon
-                        probe *= epsilon
-                        
-                        # Add probe to perturbed_base (which already contains θ + ε*Adam Ratio)
-                        param_data = perturbed_base.clone()
-                        param_data.add_(probe)
-                        
-                        # Apply to model
-                        unflatten_into_params(param_data, self.local_model, self.meta)
-                        
-                        # Clean up
-                        param_data = None
-                        torch.cuda.empty_cache()
-                    else:
-                        # Ranks beyond num_perturbations don't participate
-                        # Apply perturbed_base directly
-                        unflatten_into_params(perturbed_base, self.local_model, self.meta)
-                        probe = None
-            
-            # Clean up memory and synchronize before forward pass
-            perturbed_base = None
+            # Clean up tensors
+            orig_param_data = None
             torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            
+            # Synchronize before forward pass
+            dist.barrier()
             
             # -------------------------------------------------------------
-            # Step 7: Perform forward passes (parallel across ranks)
+            # Step 7: Forward passes
             # -------------------------------------------------------------
             
             # Record start time for forward pass
             fwd_start_time = time.time()
             if self.verbose:
-                print(f"[Rank {self.rank}] Starting forward pass at {fwd_start_time:.3f}")
+                print(f"[Rank {self.rank}] Starting forward pass at {fwd_start_time:.3f}\n")
             
             # Perform forward pass
             if self.rank <= self.num_perturbations:
-                # Enable cudnn benchmarking for faster ops
-                torch.backends.cudnn.benchmark = True
-                
-                # All participating ranks compute their loss
                 loss = teacher_forcing_loss_emb_parallel(
                     self.local_model, x_ids, y, criterion, chunk_size=1024
                 )
             else:
-                # Non-participating ranks use a dummy loss
                 loss = torch.tensor(0.0, device=self.device)
             
             # Record end time for forward pass
             fwd_end_time = time.time()
             fwd_duration = fwd_end_time - fwd_start_time
             if self.verbose:
-                print(f"[Rank {self.rank}] Completed forward pass at {fwd_end_time:.3f}, took {fwd_duration:.3f}s")
+                print(f"[Rank {self.rank}] Completed forward pass at {fwd_end_time:.3f}, took {fwd_duration:.3f}s\n")
+            
+            # Synchronize after forward passes
+            dist.barrier()
             
             # -------------------------------------------------------------
-            # Step 8: Gather losses and compute gradient estimates
+            # Step 8: Gather losses
             # -------------------------------------------------------------
             
-            # Start gather operation while preparing for next steps
             losses = self._gather_losses(loss)
-            
-            # Get clean loss value (from rank 0)
             clean_loss_val = losses[0].item()
             
-            # Rank 0 processes the losses for logging
+            # Rank 0 processes losses for logging
             if self.rank == 0:
-                # Calculate grad estimates for monitoring
                 grad_ests = []
                 for i in range(1, self.num_perturbations + 1):
                     if i < len(losses):
                         grad_est = (losses[i].item() - clean_loss_val) / epsilon
                         grad_ests.append(grad_est)
                 
-                # Average loss for return value
                 perturbed_losses = [losses[i].item() for i in range(1, min(len(losses), self.num_perturbations + 1))]
                 avg_perturbed = sum(perturbed_losses) / len(perturbed_losses) if perturbed_losses else 0.0
                 avg_loss = (clean_loss_val + avg_perturbed) / 2
                 
-                # Log if verbose
                 if self.verbose:
                     print(f"Clean loss: {clean_loss_val:.4f}, Avg perturbed: {avg_perturbed:.4f}, Avg loss: {avg_loss:.4f}")
                     if grad_ests:
                         print(f"Grad estimates: {', '.join([f'{g:.6f}' for g in grad_ests])}")
             
             # -------------------------------------------------------------
-            # Step 9: Multiply each probe by its gradient estimate
+            # Step 9: Scale probes by gradient estimates
             # -------------------------------------------------------------
             
-            # Scale probe by gradient estimate on perturbation ranks
             if 1 <= self.rank <= self.num_perturbations:
                 perturbed_loss_val = losses[self.rank].item()
                 grad_est = (perturbed_loss_val - clean_loss_val) / epsilon
-                probe.mul_(grad_est)  # In-place operation
+                
+                # Debug output for large gradient estimates
+                if abs(grad_est) > 1000 and self.verbose:
+                    print(f"[WARNING] Rank {self.rank} has large gradient estimate: {grad_est:.6f}")
+                    print(f"  Clean loss: {clean_loss_val}, Perturbed loss: {perturbed_loss_val}, Epsilon: {epsilon}")
+                
+                # Scale probe by gradient estimate
+                probe.mul_(grad_est)
             
             # -------------------------------------------------------------
-            # Step 10: Average probes across perturbation ranks
+            # Step 10: Average probes
             # -------------------------------------------------------------
             
-            # Reduce probes using optimized method
             weighted_avg_probe = self._reduce_probes(probe)
             
-            # Clean up to save memory
+            # Clean up
             probe = None
             torch.cuda.empty_cache()
             
             # -------------------------------------------------------------
-            # Step 11-12: Update Adam moments on CPU and apply to model
+            # Step 11-12: Update model
             # -------------------------------------------------------------
             
-            # Rank 0 applies the gradient
             if self.rank == 0:
                 # Apply gradient to model parameters
                 offset = 0
@@ -1066,46 +736,12 @@ class MezoDistributedSampling:
                 # Update model with optimizer step
                 optimizer.step()
                 optimizer.zero_grad()
-                
-                # Get updated parameters and adam ratio
-                updated_params, _ = flatten_params(self.model_main)
-                updated_ratio = flatten_adam_ratio_data(self.model_main, optimizer).cpu()
-                
-                # Move parameters to CPU for broadcasting
-                updated_params_cpu = updated_params.cpu()
-                
-                # Clean up to save memory
-                updated_params = None
-                torch.cuda.empty_cache()
-            else:
-                # Placeholders for non-rank-0 processes
-                updated_params_cpu = None
-                updated_ratio = None
-                avg_loss = 0.0
             
-            # -------------------------------------------------------------
-            # Step 13: Broadcast updated model to all ranks
-            # -------------------------------------------------------------
-            
-            # Broadcast updated model and adam ratio to all ranks
-            updated_params_cpu, updated_ratio = self._broadcast_updated_model(
-                updated_params_cpu, updated_ratio
-            )
-            
-            # Update local model with new parameters
-            if self.rank != 0:
-                updated_params = updated_params_cpu.to(self.device)
-                unflatten_into_params(updated_params, self.local_model, self.meta)
-                
-                # Clean up
-                updated_params = None
-                torch.cuda.empty_cache()
-            
-            # Synchronize once at the end of iteration
+            # Final synchronization
             dist.barrier()
             
             # -------------------------------------------------------------
-            # Step 14: Log timing info
+            # Step 13: Log timing info
             # -------------------------------------------------------------
             
             end_time = time.time()
@@ -1115,13 +751,7 @@ class MezoDistributedSampling:
                     print(f"Iteration completed in {iter_time:.4f}s")
                 return avg_loss
             else:
-                return 0.0  # Non-root ranks return dummy value
-        
-    
-
-
-
-
+                return 0.0
 
 
 
@@ -1292,77 +922,48 @@ class MezoDistributedSampling:
         
         return gathered_losses
 
-
-
     
     def _reduce_probes(self, probe):
         """
-        Optimized function to reduce probes across ranks
+        Gather and average probes across perturbation ranks.
         """
-        # Handle probe size consistently across ranks
-        if probe is not None:
-            probe_size = torch.tensor([probe.numel()], dtype=torch.long, device=self.device)
-        else:
+        # Handle case where probe is None
+        if probe is None:
             probe_size = torch.tensor([0], dtype=torch.long, device=self.device)
+        else:
+            probe_size = torch.tensor([probe.numel()], dtype=torch.long, device=self.device)
         
-        # Get max size
+        # Broadcast probe size to all ranks
         dist.all_reduce(probe_size, op=dist.ReduceOp.MAX)
         max_size = probe_size.item()
         
-        # Prepare for reduction - ALL ranks must create a tensor of the right size
+        # Create empty probe for ranks without one
         if probe is None or probe.numel() == 0:
-            # Create empty probe for non-participating ranks
             probe = torch.zeros(max_size, device=self.device)
         
-        # Ensure only perturbation ranks (1 to num_perturbations) contribute
+        # Zero out probe for non-participating ranks
         if not (1 <= self.rank <= self.num_perturbations):
-            # Zero out probe for non-participating ranks
             probe.zero_()
         
-        # Reduce using async operation
-        if self.rank == 0:
-            reduced_probe = probe  # Use the same tensor for rank 0
+        # Create buffer for reduction result on rank 0
+        result = probe.clone() if self.rank == 0 else None
+        
+        # Sum all probes to rank 0
+        dist.reduce(probe, 0, op=dist.ReduceOp.SUM)
+        
+        # On rank 0, scale by number of perturbations
+        if self.rank == 0 and self.num_perturbations > 0:
+            probe.div_(self.num_perturbations)
+            result_cpu = probe.cpu()
         else:
-            reduced_probe = probe.clone()  # Clone for other ranks
+            result_cpu = torch.zeros(max_size, device='cpu')
         
-        # Start reduction
-        reduce_handle = dist.reduce(reduced_probe, 0, op=dist.ReduceOp.SUM, async_op=True)
-        
-        # On rank 0, prepare memory for CPU result while reduction completes
-        if self.rank == 0:
-            reduced_probe_cpu = torch.zeros(max_size, device='cpu')
-        else:
-            reduced_probe_cpu = torch.zeros(max_size, device='cpu')
-            reduced_probe_broadcast = torch.zeros(max_size, device=self.device)
-        
-        # Wait for reduction to complete
-        reduce_handle.wait()
-        
-        # On rank 0, scale the result and prepare for broadcast
-        if self.rank == 0:
-            # Average across participating ranks
-            reduced_probe.div_(self.num_perturbations)
-            
-            # Move to CPU
-            reduced_probe_cpu.copy_(reduced_probe.cpu())
-            
-            # Keep a version for broadcasting
-            reduced_probe_broadcast = reduced_probe
-        
-        # Broadcast the result
-        dist.broadcast(reduced_probe if self.rank == 0 else reduced_probe_broadcast, 0)
-        
-        # Move result to CPU on non-rank-0 processes
-        if self.rank != 0:
-            reduced_probe_cpu.copy_(reduced_probe_broadcast.cpu())
-        
-        # Clean up GPU tensors
-        if self.rank != 0:
-            reduced_probe_broadcast = None
+        # Clean up
+        probe = None
         torch.cuda.empty_cache()
         
-        return reduced_probe_cpu
-    
+        return result_cpu
+        
     
     def _broadcast_updated_model(self, updated_params, updated_ratio):
         """
@@ -1466,7 +1067,7 @@ def train_distributed():
     parser.add_argument("--log_interval", type=int, default=300)
     parser.add_argument("--wandb_proj", type=str, default=None)
     parser.add_argument("--wandb_run_name", type=str, default=None)
-    parser.add_argument("--minimum_starting_point_context_length", type=int, default=100, 
+    parser.add_argument("--minimum_starting_point_context_length", type=int, default=10, 
                       help="min seq length fed into the model to start the curriculum learning")
     parser.add_argument("--num_perturbations", type=int, default=1,
                       help="Number of perturbations used in the MeZO sampling.")
@@ -1738,7 +1339,7 @@ def train_distributed():
     
     # Main training loop
     iteration = 0
-    while iteration < args.max_iters:
+    while True:#iteration < args.max_iters:
         iteration += 1
         iter_start_time = time.time()
         
