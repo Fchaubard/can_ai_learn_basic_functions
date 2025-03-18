@@ -1,14 +1,174 @@
 #!/usr/bin/env python3: python -m torch.distributed.launch --nproc_per_node=10 dnc_distributed.py 
 import os, argparse, time
+import string
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from ntm_with_modern_training_runs import DNC, teacher_forcing_loss_emb_parallel
+from ntm_with_modern_training_runs import teacher_forcing_loss_emb_parallel
 import datetime
 import wandb
 import math
+from datasets import load_dataset
+import random
 
 CHUNK_SIZE = 1048576
+
+
+class DNC(nn.Module):
+    def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed, device=None):
+        super(DNC, self).__init__()
+        
+        # Set the device for initialization
+        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Move the model to the specified device immediately
+        self.to(self.device)
+        
+        self.input_size = input_size
+        self.output_size = output_size  # This should be vocab_size
+        self.hidden_size = hidden_size
+        self.memory_size = memory_size
+        self.head_size = head_size
+        self.num_reads = num_heads
+        self.embed = embed
+
+        # Input normalization
+        controller_input_size = input_size + self.num_reads * self.head_size
+        self.input_norm = nn.LayerNorm(controller_input_size).to(self.device)
+        
+        # Controller with normalization
+        self.controller = nn.LSTM(controller_input_size, hidden_size, batch_first=True).to(self.device)
+        self.controller_norm = nn.LayerNorm(hidden_size).to(self.device)
+
+        # Memory operation layers with normalization
+        self.fc_read_keys = nn.Linear(hidden_size, self.num_reads * self.head_size).to(self.device)
+        self.fc_write_keys = nn.Linear(hidden_size, self.head_size).to(self.device)
+        self.fc_write_strength = nn.Linear(hidden_size, 1).to(self.device)
+        self.fc_erase_vector = nn.Linear(hidden_size, self.head_size).to(self.device)
+        self.fc_add_vector = nn.Linear(hidden_size, self.head_size).to(self.device)
+
+        self.read_keys_norm = nn.LayerNorm(head_size).to(self.device)
+        self.write_keys_norm = nn.LayerNorm(head_size).to(self.device)
+        self.memory_norm = nn.LayerNorm(head_size).to(self.device)
+
+        # Output projection with normalization - project directly to vocab size
+        total_output_size = hidden_size + self.num_reads * self.head_size
+        self.pre_output_norm = nn.LayerNorm(total_output_size).to(self.device)
+        self.fc_proj = nn.Linear(total_output_size, output_size).to(self.device)  # Project directly to vocab size
+
+        # Initialize parameters on GPU
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        """Initialize parameters directly on the GPU"""
+        # Initialize LSTM params
+        for name, p in self.controller.named_parameters():
+            if 'weight' in name:
+                # Create the initialization tensor directly on the device
+                init_tensor = torch.zeros_like(p, device=self.device)
+                nn.init.orthogonal_(init_tensor)
+                p.data.copy_(init_tensor)
+            elif 'bias' in name:
+                # Initialize bias directly on the device
+                p.data.zero_()
+    
+        # Initialize memory operation layers
+        for name, p in self.named_parameters():
+            if 'fc_' in name and 'weight' in name:
+                # Create and initialize tensor directly on the device
+                init_tensor = torch.zeros_like(p, device=self.device)
+                nn.init.xavier_uniform_(init_tensor)
+                p.data.copy_(init_tensor)
+            elif 'fc_' in name and 'bias' in name:
+                # Initialize bias directly on the device
+                p.data.zero_()
+
+
+                
+    def _read_memory(self, memory, read_keys):
+        """Read from memory using normalized attention."""
+        # Normalize memory and keys
+        memory_normalized = self.memory_norm(memory)
+        read_keys = self.read_keys_norm(read_keys.view(-1, self.head_size)).view(-1, self.num_reads, self.head_size)
+
+        # Compute attention weights (no scaling, let LayerNorm handle it)
+        read_weights = torch.softmax(
+            torch.einsum('bnh,bmh->bnm', read_keys, memory_normalized),
+            dim=2
+        )
+        read_vectors = torch.einsum('bnm,bmh->bnh', read_weights, memory)
+        return read_vectors
+
+    def _write_memory(self, memory, write_keys, write_str, erase_vec, write_vec):
+        """Write to memory using normalized attention."""
+        # Normalize memory and keys
+        memory_normalized = self.memory_norm(memory)
+        write_keys = self.write_keys_norm(write_keys)
+
+        # Compute write weights
+        write_weights = torch.softmax(
+            torch.einsum('bh,bmh->bm', write_keys, memory_normalized),
+            dim=1
+        ).unsqueeze(1)  # [B, 1, memory_size]
+
+        # Scale by write strength
+        write_weights = write_weights * write_str.unsqueeze(1)
+
+        # Erase and write operations
+        erase = torch.einsum('bnm,bh->bmh', write_weights, erase_vec)
+        write = torch.einsum('bnm,bh->bmh', write_weights, write_vec)
+        
+        # Update memory
+        memory = memory * (1 - erase) + write
+        return memory
+
+    def forward(self, x_emb, hidden=None, memory=None):
+        B, L, E = x_emb.size()
+        device = x_emb.device
+
+        # Initialize states if needed
+        if hidden is None:
+            h0 = x_emb.new_zeros(1, B, self.hidden_size)
+            c0 = x_emb.new_zeros(1, B, self.hidden_size)
+            hidden = (h0, c0)
+
+        if memory is None:
+            memory = x_emb.new_zeros(B, self.memory_size, self.head_size)
+
+        read_vec = x_emb.new_zeros(B, self.num_reads * self.head_size)
+        outputs = []
+
+        for t in range(L):
+            # Normalize and combine input with read vector
+            controller_input = torch.cat([x_emb[:, t, :], read_vec], dim=-1)
+            controller_input = self.input_norm(controller_input)
+            
+            # Controller
+            out_ctrl, hidden = self.controller(controller_input.unsqueeze(1), hidden)
+            h = self.controller_norm(out_ctrl.squeeze(1))
+
+            # Memory parameters
+            read_keys = self.fc_read_keys(h).view(B, self.num_reads, self.head_size)
+            write_keys = self.fc_write_keys(h)
+            write_str = torch.sigmoid(self.fc_write_strength(h))
+            erase_vec = torch.sigmoid(self.fc_erase_vector(h))
+            write_vec = torch.tanh(self.fc_add_vector(h))
+
+            # Memory operations
+            memory = self._write_memory(memory, write_keys, write_str, erase_vec, write_vec)
+            read_vectors = self._read_memory(memory, read_keys)
+            read_vec = read_vectors.reshape(B, -1)
+
+            # Output projection with normalization - project directly to logits
+            output = torch.cat([h, read_vec], dim=-1)
+            output = self.pre_output_norm(output)
+            logits = self.fc_proj(output)  # Direct projection to vocab size
+            outputs.append(logits.unsqueeze(1))
+
+        outputs = torch.cat(outputs, dim=1)
+        return outputs, memory, hidden
+
+
 
 # =============================================================================
 # Logging Helpers
@@ -187,33 +347,51 @@ class MezoAdaptiveSamplingParallel:
         # -------------------- Stage 0c: Broadcast x_ids and y from Rank 1 to Dirty Ranks --------------------
         if self.verbose:
             log_start("Stage 0c", rank)
-        if rank >= 2:
-            # Create empty tensors to receive the x and y data
-            shape_tensor = torch.empty(2, device=device, dtype=torch.int)
-            dist.broadcast(shape_tensor, src=1, group=self.group_except_zero)
-            batch_size, seq_len = shape_tensor.tolist()
-            
-            # Create empty tensors with the right shapes
-            x_ids = torch.zeros((batch_size, seq_len), device=device, dtype=torch.long)
-            y = torch.zeros((batch_size, seq_len), device=device, dtype=torch.long)
+    
+        # Only ranks >= 1 participate in the data broadcast
+        if rank >= 1:
+            # Broadcast input dimension information
+            if rank == 1:
+                # Send the dimensions of both tensors
+                x_shape = torch.tensor([x_ids.size(0), x_ids.size(1)], device=device, dtype=torch.long)
+                y_shape = torch.tensor([y.size(0), y.size(1)], device=device, dtype=torch.long)
                 
-            # Receive the actual data
-            dist.broadcast(x_ids, src=1, group=self.group_except_zero)
-            dist.broadcast(y, src=1, group=self.group_except_zero)
+                # Make sure tensors are on the correct device
+                x_ids = x_ids.to(device)
+                y = y.to(device)
+                
+                if self.verbose:
+                    log_msg("Stage 0c", rank, f"Broadcasting shapes - x: {x_shape}, y: {y_shape}")
+                    log_msg("Stage 0c", rank, f"Broadcasting data - x: {x_ids.shape}, y: {y.shape}")
+            else:
+                # Initialize shape tensors for receiving
+                x_shape = torch.zeros(2, device=device, dtype=torch.long)
+                y_shape = torch.zeros(2, device=device, dtype=torch.long)
+    
+            # Broadcast shapes first - only in group_except_zero
+            broadcast_in_group(x_shape, src_rank=1, group=self.group_except_zero)
+            broadcast_in_group(y_shape, src_rank=1, group=self.group_except_zero)
+            
+            # Now create properly sized tensors on receiving ranks
+            if rank >= 2:
+                x_ids = torch.zeros((x_shape[0].item(), x_shape[1].item()), 
+                                device=device, dtype=torch.long)
+                y = torch.zeros((y_shape[0].item(), y_shape[1].item()), 
+                            device=device, dtype=torch.long)
+                
+                if self.verbose:
+                    log_msg("Stage 0c", rank, f"Created receiving tensors - x: {x_ids.shape}, y: {y.shape}")
+            
+            # Broadcast the actual data - only in group_except_zero
+            broadcast_in_group(x_ids, src_rank=1, group=self.group_except_zero)
+            broadcast_in_group(y, src_rank=1, group=self.group_except_zero)
             
             if self.verbose:
-                log_msg("Stage 0c", rank, f"Received x_ids and y from rank 1: shapes {x_ids.shape}, {y.shape}")
-        elif rank == 1:
-            # Send shapes first
-            shape_tensor = torch.tensor([x_ids.shape[0], x_ids.shape[1]], device=device, dtype=torch.int)
-            dist.broadcast(shape_tensor, src=1, group=self.group_except_zero)
-            
-            # Send actual data
-            dist.broadcast(x_ids, src=1, group=self.group_except_zero)
-            dist.broadcast(y, src=1, group=self.group_except_zero)
-            
-            if self.verbose:
-                log_msg("Stage 0c", rank, f"Broadcast x_ids and y to dirty ranks: shapes {x_ids.shape}, {y.shape}")
+                if rank == 1:
+                    log_msg("Stage 0c", rank, f"Broadcast completed - x: {x_ids.shape}, y: {y.shape}")
+                elif rank >= 2:
+                    log_msg("Stage 0c", rank, f"Received data - x: {x_ids.shape}, y: {y.shape}, x[0,0]: {x_ids[0,0]}")
+        
         dist.barrier()
         if self.verbose:
             log_end("Stage 0c", rank)
@@ -223,7 +401,7 @@ class MezoAdaptiveSamplingParallel:
         for meta_pert in range(self.meta_perturbations):
 
             if self.verbose:
-                log_msg(f"Perturbation {meta_pert+1} of {self.meta_perturbations}", rank)
+                log_msg(f"Perturbation {meta_pert+1} of {self.meta_perturbations}", rank, "")
 
             
             # -------------------- Stage 3: Dirty Ranks Compute Their Dirty theta_t --------------------
@@ -503,50 +681,284 @@ class MezoAdaptiveSamplingParallel:
 
 
 
+##############################################################################
+# Convert strings -> fixed [B, max_seq_len], pad or truncate
+##############################################################################
+def tensor_to_string(tensor, id_to_char):
+    """
+    Convert a tensor of token IDs (1D or 2D) back into a string or list of strings.
+
+    Args:
+        tensor (torch.Tensor): Tensor of token IDs (e.g., [1, 10, 11, 12, 13, 2]).
+        id_to_char (dict): A mapping from token IDs to characters.
+
+    Returns:
+        str or List[str]: The corresponding string(s) representation of the tensor.
+    """
+    if tensor.ndim == 1:
+        # Process a single tensor
+        tokens = [id_to_char.get(id.item(), '<UNK>') for id in tensor if id.item() != 0]  # Exclude <PAD>
+        return ''.join(tokens)
+    elif tensor.ndim == 2:
+        # Process a batch tensor
+        return [''.join([id_to_char.get(id.item(), '<UNK>') for id in row if id.item() != 0]) for row in tensor]
+    else:
+        raise ValueError("Input tensor must be 1D or 2D.")
+
+
+
+def str_to_tensor(batch_strs, char_to_id):
+    """
+    Convert a batch of strings (which may contain special tokens like <bos>, <eos>, etc.)
+    into a padded LongTensor of shape [B, max_len].
+
+    1) For each string, call `tokenize_special(...)` to produce a list of tokens.
+    2) Find the maximum sequence length across the batch.
+    3) Create a tensor [B, max_len] of zeros (padding index=0).
+    4) Fill in the token IDs for each sequence up to its length.
+    """
+    # 1) Tokenize each string
+    token_lists = []
+    for s in batch_strs:
+        tokens = tokenize_special(s)
+        token_lists.append(tokens)
+
+    # 2) Find the maximum length across all tokenized strings
+    max_len = max(len(toks) for toks in token_lists) if token_lists else 1
+
+    # 3) Create the output tensor [B, max_len], initialized to 0 (PAD)
+    B = len(batch_strs)
+    out = torch.zeros(B, max_len, dtype=torch.long)
+
+    # 4) Fill in the token IDs
+    for i, tokens in enumerate(token_lists):
+        for j, tok in enumerate(tokens):
+            out[i, j] = char_to_id.get(tok, char_to_id["<UNK>"])
+
+    return out
+
+
+def tokenize_special(s):
+    """
+    Example tokenizer that treats any substring like <bos>, <eos>, <PAD>, etc.
+    as *single* tokens if present. Otherwise, each character is its own token.
+
+    This is just a toy example. Adjust it to fit your needs (e.g. handling
+    <bos>... in the input more robustly).
+    """
+    tokens = []
+    i = 0
+    while i < len(s):
+        if s[i] == '<':
+            # Try to find the matching '>'
+            j = s.find('>', i + 1)
+            if j == -1:
+                # No '>' found => treat '<' as a normal character (unlikely in well-formed data).
+                tokens.append(s[i])
+                i += 1
+            else:
+                # Collect the full '<...>'
+                tokens.append(s[i : j+1])
+                i = j + 1
+        else:
+            # Normal character
+            tokens.append(s[i])
+            i += 1
+    return tokens
+
+
+##############################################################################
+# Shift-by-one logic for tasks
+##############################################################################
+def shift_by_one_pairs(x_str, y_str):
+    return f"<bos>{x_str}", f"{y_str}<eos>"
+
+
+def get_char_vocab():
+    # Special tokens
+    special = ['<PAD>', '<bos>', '<eos>', '<UNK>']
+    
+    # Numbers row (non-shifted and shifted)
+    numbers = list('1234567890')
+    numbers_shifted = list('!@#$%^&*()')
+    
+    # Letter rows
+    letters = list(string.ascii_lowercase)  # a-z
+    letters_upper = list(string.ascii_uppercase)  # A-Z
+    
+    # Keyboard rows with symbols (non-shifted)
+    symbols = list('`-=[]\\;\',./')
+    # Shifted versions of those symbols
+    symbols_shifted = list('~_+{}|:"<>?')
+    
+    # Space and tab
+    whitespace = [' ', '\t']
+    
+    # Combine all into vocabulary list
+    vocab_list = (numbers + special + numbers_shifted + letters + 
+                 letters_upper + symbols + symbols_shifted + whitespace)
+    
+    # Create mapping dictionaries
+    char_to_id = {ch: i for i, ch in enumerate(vocab_list)}
+    id_to_char = {i: ch for i, ch in enumerate(vocab_list)}
+    
+    return vocab_list, char_to_id, id_to_char
+
+
+def generate_openwebtext_task_str(
+    num_samples: int,
+    context_length: int,
+    ds,
+    max_n=None,   # unused in OWT, but we keep the signature to match the others
+    train: bool = True,
+    min_total_seq_len=100,
+    vebose=False
+):
+    split_name = "train" if train else "validation"
+
+    size_of_ds = len(ds)
+    in_list = []
+    out_list = []
+    
+    while len(in_list) < num_samples:
+        # Keep trying docs until we find one that meets our length requirement
+        max_tries = 100  # Avoid infinite loop
+        tries = 0
+        valid_doc = False
+        
+        while not valid_doc and tries < max_tries:
+            doc_idx = random.randint(0, size_of_ds - 1)
+            doc = ds[doc_idx]
+            text = doc["text"] if doc["text"] else ""
+            
+            # Calculate total sequence length including special tokens
+            # Length will be: len(<bos> + prefix) + len(remainder + <eos>)
+            # = 5 + len(text) [5 comes from <bos> and <eos>]
+            total_seq_len = len(text) + 5  # +5 for <bos> and <eos>
+            
+            if total_seq_len >= min_total_seq_len and total_seq_len<20000: # crazy large number
+                valid_doc = True
+            else:
+                tries += 1
+        
+        # If we couldn't find a long enough doc after max_tries,
+        # pad the last one we found
+        if not valid_doc:
+            needed = min_total_seq_len - total_seq_len
+            text = text + (" " * needed)
+            
+        # Now ensure text is at least context_length
+        if len(text) < context_length:
+            needed = context_length - len(text)
+            text = text + (" " * needed)
+            
+        # Split into prefix and remainder
+        prefix = text[:context_length]
+        remainder = text[context_length:min_total_seq_len] # HACKY! TODO TO CLEAN UP BUT ONLY THING I CAN DO TO MAKE NTM AND DNC FASTER
+        
+        # Create input and target strings
+        input_str = f"<bos>{prefix}"
+        target_str = f"{remainder}<eos>"
+        
+        in_list.append(input_str)
+        out_list.append(target_str)
+        
+    # Debug prints
+    max_out_len = max(len(i) for i in out_list)
+    
+
+    if vebose:
+        print(f"   Max lengths: max={max_out_len}")
+        
+        min_in_len = min(len(i) for i in in_list)
+        min_out_len = min(len(i) for i in out_list)
+        max_in_len = max(len(i) for i in in_list)
+        max_out_len = max(len(i) for i in out_list)
+        
+        print(f"Sequence length stats:")
+        print(f"Input lengths: min={min_in_len}, max={max_in_len}")
+        print(f"Output lengths: min={min_out_len}, max={max_out_len}")
+        print(f"Min total lengths: {[len(i) + len(j) for i,j in zip(in_list, out_list)]}")
+
+   
+    return in_list, out_list
+
+
 # =============================================================================
 # Main Routine
 # =============================================================================
 def main():
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
     parser.add_argument("--mode", type=str, choices=["test", "train"], default="train", help="Run mode: test or train.")
     parser.add_argument("--max_iters", type=int, default=1e10, help="Maximum iterations for training.")
-    parser.add_argument("--learning_rate", type=float, default=0.001, help="Base learning rate (and eps, tied 1:1).")
+    parser.add_argument("--schedule_patience", type=int, default=1, help="Maximum iterations for training.")
+    parser.add_argument("--learning_rate", type=float, default=0.0001, help="Base learning rate (and eps, tied 1:1).")
+    parser.add_argument("--beta1", type=float, default=0.999, help="Base learning rate (and eps, tied 1:1).")
+    parser.add_argument("--beta2", type=float, default=0.99999, help="Base learning rate (and eps, tied 1:1).")
     parser.add_argument("--epsilon", type=float, default=0.001, help="Perturbation scale epsilon (tied to learning rate).")
-    parser.add_argument("--probe_dropout_rate", type=float, default=0.99, help="Dropout rate for probe vector.")
+    parser.add_argument("--probe_dropout_rate", type=float, default=0.9999, help="Dropout rate for probe vector.")
     parser.add_argument("--wandb_proj", type=str, default="DNC-SINGLE-DISTRIBUTED", help="WandB project name (optional)")
-    parser.add_argument("--wandb_run", type=str, default="test1", help="WandB run name (optional)")
-        
+    parser.add_argument("--wandb_run", type=str, default="", help="WandB run name (optional)")
+    parser.add_argument("--warmup_iters", type=int, default=100, help="Warmup iterations.")
+    parser.add_argument("--cosine_wavelength", type=int, default=10000000000, help="Cosine LR wavelength, init to very high.")
+    parser.add_argument("--val_iters", type=int, default=500, help="Warmup iterations.")
+    parser.add_argument("--meta_perturbations", type=int, default=1, help="Number of Perturbations for all ranks per step.")
     
     
+    # parser.add_argument(
+    #     "--precision", 
+    #     type=str, 
+    #     choices=["fp32", "fp16", "bf16", "fp8", "int8"], 
+    #     default="fp32", 
+    #     help="Set precision mode: fp32, fp16, bf16, fp8, int8."
+    # )
     
     # New CLI arguments for model configuration
     parser.add_argument("--model_scale", type=int, default=1, help="Scaling factor for model dimensions.")
     parser.add_argument("--vocab_size", type=int, default=150, help="Vocabulary size.")
     parser.add_argument("--num_heads", type=int, default=1, help="# dnc heads.")
-    parser.add_argument("--memory_size", type=int, default=1, help="memory_size.")
-    parser.add_argument("--hidden_size", type=int, default=1, help="hidden_size.")
-    parser.add_argument("--input_size", type=int, default=1, help="Input size.")
-    parser.add_argument("--head_size", type=int, default=1, help="head_size .")
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size.")
+    parser.add_argument("--memory_size", type=int, default=100, help="memory_size.")
+    parser.add_argument("--hidden_size", type=int, default=100, help="hidden_size.")
+    parser.add_argument("--input_size", type=int, default=100, help="Input size.")
+    parser.add_argument("--head_size", type=int, default=100, help="head_size .")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size.")
     parser.add_argument("--seq_len", type=int, default=10, help="Sequence length.")
-    parser.add_argument("--warmup_iters", type=int, default=10, help="Warmup iterations.")
-    parser.add_argument("--meta_perturbations", type=int, default=1, help="Number of Perturbations for all ranks per step.")
-
+    
     args = parser.parse_args()
 
+    #####################################################################################
+    # SETUP TRAINING
+    #####################################################################################
+    run_name = f"{args.mode}_lr{args.learning_rate}_scale{args.model_scale}_pdrop{args.probe_dropout_rate}"
+    
+    # Add model architecture details
+    model_params = f"_h{args.hidden_size}"
+    
+    # Add training configuration
+    train_params = f"_bs{args.batch_size}_seq{args.seq_len}_b1_{args.beta1}_b2_{args.beta2}"
+    
+    # Add optimization details
+    opt_params = f"_coswav_{cosine_wavelength}_wu{args.warmup_iters}_mp{args.meta_perturbations}_pat{args.schedule_patience}"
+    
+    # Combine all parts
+    if args.wandb_run=="":
+         args.wandb_run = run_name + model_params + train_params + opt_params
+    
+    vocab_list, char_to_id, id_to_char = get_char_vocab()
+    vocab_size = len(vocab_list)
+    
+    args.vocab_size = vocab_size
 
     # Derived values based on model_scale
-    args.hidden_size = 100 * args.model_scale
-    args.memory_size = 100 * args.model_scale
-    args.head_size = 100 * args.model_scale
-    args.input_size = 100 * args.model_scale
-    args.num_heads = 1  # Static, not dependent on model_scale
-    
-
+    args.hidden_size = args.hidden_size * args.model_scale
+    args.memory_size = args.memory_size * args.model_scale
+    args.head_size = args.head_size * args.model_scale
+    args.input_size = args.input_size * args.model_scale
 
     # TEMP OVERRIDE FOR NOW SO WE CAN DEBUG
-    args.wandb_proj = None
+    # args.wandb_proj = None
     verbose = False
     
     
@@ -562,18 +974,17 @@ def main():
     # set the random seed differently per rank
     torch.manual_seed(torch.initial_seed() + rank) 
 
-    # Only Rank 1 creates the full model and input data.
-    
-
     log_msg("Trying first dist.barrier(), if hanging here, no infiniband likely on node, need to turn off p2p",rank,"if so, run export NCCL_P2P_DISABLE=1")
     dist.barrier()
     
 
     log_start("INIT MODEL", rank)
 
-    
-    embed = nn.Embedding(args.vocab_size, args.input_size).to(device)
-    model = DNC(input_size=args.input_size, output_size=args.vocab_size, hidden_size=args.hidden_size, memory_size=args.memory_size, head_size=args.head_size, num_heads=args.num_heads, embed=embed).to(device)
+    time.sleep(rank) # we stagger the launch of DNC formation prevent RAM issues
+    embed = nn.Embedding(args.vocab_size, args.input_size,device=device)
+    model = DNC(input_size=args.input_size, output_size=args.vocab_size, hidden_size=args.hidden_size, memory_size=args.memory_size, head_size=args.head_size, num_heads=args.num_heads, embed=embed, device=device)
+    model.controller.flatten_parameters()
+    model.eval()
     
     criterion = nn.CrossEntropyLoss().to(device)
     
@@ -603,6 +1014,8 @@ def main():
         learning_rate=args.learning_rate,
         probe_dropout_rate=args.probe_dropout_rate,
         epsilon=args.epsilon,
+        beta1=args.beta1,
+        beta2=args.beta2,
         meta_perturbations=args.meta_perturbations,
         verbose=verbose
     )
@@ -618,99 +1031,178 @@ def main():
         # Cosine learning rate scheduling parameters
         base_lr = args.learning_rate
         min_lr = base_lr * 0.001
-        cosine_wavelength = 1000  # Length of each cosine cycle
-        lr_decay = 0.99
-        current_lr = base_lr
+        cosine_wavelength = args.cosine_wavelength #1000  # Length of each cosine cycle
         schedule_iteration = 0
+        patience_counter = 0
         
         # Track previous loss
         prev_loss = float('inf')
         
     
     if rank == 1 and args.wandb_proj is not None and wandb is not None:
-        wandb.init(project=args.wandb_proj, name=args.wandb_run)
+        # wandb.init(project=args.wandb_proj, name=args.wandb_run)
+        wandb.init(project=args.wandb_proj,name=args.wandb_run)
         print("[Rank 1] Initialized wandb logging.")
 
+    #####################################################################################
+    # Load the dataset
+    #####################################################################################
+    if rank == 1:
+        # generate OWT 
+        ds = None
+        iterr = 0
+        while True:
+            try:
+                ds = load_dataset(
+                    "haritzpuerto/the_pile_00_OpenWebText2",
+                    split="train",
+                    # cache_dir="/hf_cache/",
+                    # use_auth_token=False,  # Disable authentication to avoid API calls
+                    download_mode="reuse_dataset_if_exists"  # Reuse the cached dataset
+                )
+                break
+            except Exception as e:
+                print("Hugging face issue...")
+                print(e)
+                time.sleep(5)
+                iterr+=1
+                if iterr>100:
+                    raise Exception("HUGGING FACE ISSUES AGAIN!")
+        print("Got the OWT dataset!")
+                
+    #####################################################################################
+    # START TRAINING
+    #####################################################################################
+    val_loss = 1e4 # placeholder value
     start_time = datetime.datetime.now()
     with torch.inference_mode():
         
         for i in range(int(args.max_iters) ):
             # TODO: Sample x_ids,y from dataset
-            loss_val = distributed_adaptive.distributed_step(x_ids, y, criterion, iteration=i, warmup_iters=args.warmup_iters)
+            if rank == 1 and args.mode == "train":
+
+                # GENERATE TRAIN BATCH
+                x_strs, y_strs = generate_openwebtext_task_str(
+                                            args.batch_size,
+                                            1,
+                                            ds,
+                                            train = True,
+                                            min_total_seq_len=args.seq_len,
+                                            vebose = False
+                                        )  
+                
+                x_ids = str_to_tensor(x_strs, char_to_id).to(device)
+                y = str_to_tensor(y_strs, char_to_id).to(device)
+
+                if verbose:
+                    print(f" x_ids {x_ids.shape} y {y.shape}" )
+                    
+            dist.barrier()
+                    
+            train_loss = distributed_adaptive.distributed_step(x_ids, y, criterion, iteration=i, warmup_iters=args.warmup_iters)
             
             if rank == 1:
-                                
+
+
+                if loss_ema_fast is None:
+                    # Initialize both EMAs with the current loss value
+                    loss_ema_fast = train_loss
+                    loss_ema_slow = train_loss
+
+                
+                loss_ema_fast = ema_alpha_fast * loss_ema_fast + (1 - ema_alpha_fast) * train_loss
+                loss_ema_slow = ema_alpha_slow * loss_ema_slow + (1 - ema_alpha_slow) * train_loss
+                
+                #####################################################################################
                 # UPDATE THE LEARNING RATE WITH OUR FAST/SLOW EMA COSINE LR SCHEDULE
+                #####################################################################################
                 if i < args.warmup_iters:
                     # Linear warmup
-                    current_lr = base_lr * (i / args.warmup_iters)
-                    
+                    distributed_adaptive.learning_rate = base_lr * (i / args.warmup_iters)
                 else:
-                    # Update EMAs at every iteration
-                    if loss_ema_fast is None:
-                        # First iteration - initialize both EMAs to the current loss
-                        loss_ema_fast = loss_val
-                        loss_ema_slow = loss_val
-                    else:
-                        # Update both EMAs with their respective decay rates
-                        loss_ema_fast = ema_alpha_fast * loss_ema_fast + (1 - ema_alpha_fast) * loss_val
-                        loss_ema_slow = ema_alpha_slow * loss_ema_slow + (1 - ema_alpha_slow) * loss_val
-    
-
                     
-                    # Compare fast vs slow EMA to detect if we are not improving, step schedule
-                    if loss_ema_fast > (loss_ema_slow + 1e-5) and i > (warmup_iters + 1000):
-                        # Loss is decreasing or stable, follow the schedule
-                        schedule_iteration+=1
-
-                        if schedule_iteration%100 == 0:
-                            # Calculate position within current cycle
-                            cycle_iteration = (schedule_iteration // 100) % cosine_wavelength
-                            
-                            # Calculate cosine annealing for this cycle
-                            progress = cycle_iteration / cosine_wavelength
-                            cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
-                            current_lr = min_lr + (base_lr - min_lr) * cosine_factor
-                        
-                        
+                    # Check if the fast EMA is higher than the slow EMA (by a small threshold)
+                    # if loss_ema_fast > (loss_ema_slow + 1e-5):
+                    #     patience_counter += 1
+                    # else:
+                    #     patience_counter = 0  # reset if condition is not met
                 
-                # Update the learning rate in the optimizer
-                distributed_adaptive.learning_rate = current_lr
+                    # # Only step the cosine schedule if we have been patient enough
+                    # if patience_counter >= args.schedule_patience:
+                    #     schedule_iteration += 1
+                    #     patience_counter = 0  # reset the counter after stepping
+                
+                    # Compute the position within the cosine cycle.
+                    # Here, schedule_iteration is used to determine how far we are along the cycle.
+                    # cycle_iteration = schedule_iteration % cosine_wavelength
+                    
+                    # progress = schedule_iteration / cosine_wavelength
+                    progress = i / cosine_wavelength
+                    cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
+                    distributed_adaptive.learning_rate = min_lr + (base_lr - min_lr) * cosine_factor
+                
                             
+                
+
+                #####################################################################################
+                # RUN VALIDATION
+                #####################################################################################
+
+                if rank == 1 and args.mode == "train" and (i % args.val_iters == 0):
+    
+                    # GENERATE VAL BATCH and run
+                    x_strs, y_strs = generate_openwebtext_task_str(
+                                                args.batch_size,
+                                                1,
+                                                ds,
+                                                train = False,
+                                                min_total_seq_len=args.seq_len,
+                                                vebose = False
+                                            )  
+                    
+                    x_ids = str_to_tensor(x_strs, char_to_id).to(device)
+                    y = str_to_tensor(y_strs, char_to_id).to(device)
+                    val_loss = teacher_forcing_loss_emb_parallel(model, x_ids, y, criterion)
+                    
+                    # log to wandb every val_iters iterations.
+                    if args.wandb_proj is not None and wandb is not None:
+                        # Compute a dummy weight decay loss (if applicable)
+                        weight_decay_loss = 0.0
+                        for param in model.parameters():
+                            if param.requires_grad:
+                                weight_decay_loss += (1e-2 / 2) * torch.sum(param ** 2)  # using 1e-2 as dummy weight_decay
+    
+    
+                        
+                        log_data = {
+                            "train_loss": train_loss, 
+                            "val_loss": val_loss, 
+                            "loss_ema_fast":loss_ema_fast,
+                            "loss_ema_slow":loss_ema_slow,
+                            "lr": distributed_adaptive.learning_rate,
+                            "weight_decay_loss": weight_decay_loss.item(),
+                        }
+                        
+                        try:
+                            wandb.log(log_data, step=i)
+                        except Exception as e:
+                            print(e)
+                    
                 # Log information
                 print("="*50)
-                print(f"[Train] Iteration {i}, loss = {loss_val}, loss_ema_fast = {loss_ema_fast}, loss_ema_slow = {loss_ema_slow}, lr = {current_lr}")
+                print(f"[Train] Iteration {i}, train_loss = {train_loss}, loss_ema_fast = {loss_ema_fast}, loss_ema_slow = {loss_ema_slow}, lr = {distributed_adaptive.learning_rate}, val_loss = {val_loss}")
                 
-                # Only Rank 1 logs metrics to wandb every 100 iterations.
-                if args.wandb_proj is not None and wandb is not None and (i % 100 == 0):
-                    # Compute a dummy weight decay loss (if applicable)
-                    weight_decay_loss = 0.0
-                    for param in model.parameters():
-                        if param.requires_grad:
-                            weight_decay_loss += (1e-2 / 2) * torch.sum(param ** 2)  # using 1e-2 as dummy weight_decay
-        
-                    log_data = {
-                        "train_loss": loss_val, 
-                        "loss_ema_fast":loss_ema_fast,
-                        "loss_ema_slow":loss_ema_slow,
-                        "lr": current_lr,
-                        "weight_decay_loss": weight_decay_loss.item(),
-                    }
-                    
-                    try:
-                        wandb.log(log_data, step=i)
-                    except Exception as e:
-                        print(e)
+               
 
             dist.barrier()
             if rank==1:
-                if loss_val < 0.1:
+                if train_loss < 0.1:
 
                     end_time = datetime.datetime.now()
                     print("="*50)
                     print("="*50)
                     print("="*50)
-                    log_msg("FINISHED TRAINING", rank, f"in {i} iterations acheived {loss_val} loss in {end_time - start_time} seconds.")
+                    log_msg("FINISHED TRAINING", rank, f"in {i} iterations acheived {train_loss} loss in {end_time - start_time} seconds.")
                     print(f"[Init] Model has {num_params} parameters across {num_layers} layers.")
             
                     print("="*50)
