@@ -888,6 +888,7 @@ def generate_openwebtext_task_str(
 # Main Routine
 # =============================================================================
 def main():
+    import os
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
@@ -940,7 +941,7 @@ def main():
     train_params = f"_bs{args.batch_size}_seq{args.seq_len}_b1_{args.beta1}_b2_{args.beta2}"
     
     # Add optimization details
-    opt_params = f"_coswav_{cosine_wavelength}_wu{args.warmup_iters}_mp{args.meta_perturbations}_pat{args.schedule_patience}"
+    opt_params = f"_coswav_{args.cosine_wavelength}_wu{args.warmup_iters}_mp{args.meta_perturbations}_pat{args.schedule_patience}"
     
     # Combine all parts
     if args.wandb_run=="":
