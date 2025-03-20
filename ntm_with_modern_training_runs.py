@@ -17,6 +17,7 @@ NTM/DNC/Transformer code with ASCII tasks, plus:
 import os
 os.environ["WANDB_API_KEY"] = ""
 
+
 import pdb
 import sys
 import math
@@ -1529,114 +1530,55 @@ class MambaEncoder(nn.Module):
 ############
 # DNC
 ##############
+
 class DNC(nn.Module):
-    def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed):
-        super(DNC, self).__init__()
-        self.input_size = input_size
-        self.output_size = output_size  # This should be vocab_size
-        self.hidden_size = hidden_size
-        self.memory_size = memory_size
-        self.head_size = head_size
-        self.num_reads = num_heads
-        self.embed = embed
-
-        # Input normalization
-        controller_input_size = input_size + self.num_reads * self.head_size
-        self.input_norm = nn.LayerNorm(controller_input_size)
-        
-        # Controller with normalization
-        self.controller = nn.LSTM(controller_input_size, hidden_size, batch_first=True)
-        self.controller_norm = nn.LayerNorm(hidden_size)
-
-        # Memory operation layers with normalization
-        self.fc_read_keys = nn.Linear(hidden_size, self.num_reads * self.head_size)
-        self.fc_write_keys = nn.Linear(hidden_size, self.head_size)
-        self.fc_write_strength = nn.Linear(hidden_size, 1)
-        self.fc_erase_vector = nn.Linear(hidden_size, self.head_size)
-        self.fc_add_vector = nn.Linear(hidden_size, self.head_size)
-
-        self.read_keys_norm = nn.LayerNorm(head_size)
-        self.write_keys_norm = nn.LayerNorm(head_size)
-        self.memory_norm = nn.LayerNorm(head_size)
-
-        # Output projection with normalization - project directly to vocab size
-        total_output_size = hidden_size + self.num_reads * self.head_size
-        self.pre_output_norm = nn.LayerNorm(total_output_size)
-        self.fc_proj = nn.Linear(total_output_size, output_size)  # Project directly to vocab size
-
-        self.reset_parameters()
-
-    def accumulate_gradients_one_step(self, x_emb, y_ids, criterion):
-        """
-        Process the sequence one time step at a time (TBPTT with step=1) and
-        backprop each step's loss so that gradients accumulate into each parameter's .grad.
-        
-        Args:
-            x_emb (Tensor): Input embeddings of shape (B, L, E).
-            y_ids (Tensor): Target token ids of shape (B, L).
-            criterion: Loss function (e.g., nn.CrossEntropyLoss()).
-        
-        Returns:
-            float: The average loss over the sequence.
-        """
-        
+    def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed, device=None):
+            super(DNC, self).__init__()
+            # with torch.inference_mode():
+            # Set the device for initialization
+            self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             
-        # Clear any existing gradients.
-        self.zero_grad()
-        B, L, E = x_emb.size()
-        total_loss = 0.0
+            # Move the model to the specified device immediately
+            self.to(self.device)
+            
+            self.input_size = input_size
+            self.output_size = output_size  # This should be vocab_size
+            self.hidden_size = hidden_size
+            self.memory_size = memory_size
+            self.head_size = head_size
+            self.num_reads = num_heads
+            self.embed = embed
     
-        # Initialize hidden state and memory as None so that forward() creates proper zero-states.
-        hidden = None
-        memory = None
+            # Input normalization
+            controller_input_size = input_size + self.num_reads * self.head_size
+            self.input_norm = nn.LayerNorm(controller_input_size, device=self.device)
+            
+            # Controller with normalization
+            self.controller = nn.LSTM(controller_input_size, hidden_size, batch_first=True, device=self.device)
+            self.controller_norm = nn.LayerNorm(hidden_size, device=self.device)
     
-        # Ensure gradients are enabled even if an outer context is using no_grad().
-        with torch.enable_grad():
-            for t in range(L):
-                # Extract one time-step input of shape (B, 1, E)
-                x_t = x_emb[:, t:t+1, :]
-                # Forward one time step.
-                output, memory, hidden = self.forward(x_t, hidden=hidden, memory=memory)
-                # Squeeze out the time dimension: (B, output_size)
-                logits = output.squeeze(1)
-                # Get the target tokens for the current time step.
-                target = y_ids[:, t]
-                # Compute the loss.
-                loss = criterion(logits, target)
-                # Backpropagate.
-                # if t < L - 1:
-                #     loss.backward(retain_graph=True)
-                # else:
-                loss.backward()
-                total_loss += loss.item()
-                
-                # Detach hidden state and memory to prevent gradients flowing back through time.
-                if hidden is not None:
-                    # Assuming hidden is a tuple (h, c) as in an LSTM.
-                    hidden = (hidden[0].detach(), hidden[1].detach())
-                if memory is not None:
-                    memory = memory.detach()
-                torch.cuda.empty_cache()
-        
-        return total_loss / L
-
-
-        
-    # def reset_parameters(self):
-    #     """Initialize parameters with appropriate distributions"""
-    #     # Initialize LSTM params
-    #     for name, p in self.controller.named_parameters():
-    #         if 'weight' in name:
-    #             nn.init.orthogonal_(p)
-    #         elif 'bias' in name:
-    #             nn.init.constant_(p, 0)
-
-    #     # Initialize memory operation layers
-    #     for name, p in self.named_parameters():
-    #         if 'fc_' in name and 'weight' in name:
-    #             nn.init.uniform_(p, -0.1, 0.1)
-    #         elif 'fc_' in name and 'bias' in name:
-    #             nn.init.constant_(p, 0)
+            # Memory operation layers with normalization
+            self.fc_read_keys = nn.Linear(hidden_size, self.num_reads * self.head_size, device=self.device)
+            self.fc_write_keys = nn.Linear(hidden_size, self.head_size, device=self.device)
+            self.fc_write_strength = nn.Linear(hidden_size, 1, device=self.device)
+            self.fc_erase_vector = nn.Linear(hidden_size, self.head_size, device=self.device)
+            self.fc_add_vector = nn.Linear(hidden_size, self.head_size, device=self.device)
+    
+            self.read_keys_norm = nn.LayerNorm(head_size, device=self.device)
+            self.write_keys_norm = nn.LayerNorm(head_size, device=self.device)
+            self.memory_norm = nn.LayerNorm(head_size, device=self.device)
+    
+            # Output projection with normalization - project directly to vocab size
+            total_output_size = hidden_size + self.num_reads * self.head_size
+            self.pre_output_norm = nn.LayerNorm(total_output_size, device=self.device)
+            self.fc_proj = nn.Linear(total_output_size, output_size, device=self.device) # Project directly to vocab size
+    
+            # Initialize parameters on GPU
+            self.reset_parameters()
+    
+    
+    
+    
     def reset_parameters(self):
         """Initialize parameters with appropriate distributions"""
         # Initialize LSTM params
@@ -1736,7 +1678,6 @@ class DNC(nn.Module):
 
         outputs = torch.cat(outputs, dim=1)
         return outputs, memory, hidden
-
 
 
 
@@ -3366,7 +3307,7 @@ class MezoAdaptiveSamplingParallel:
         # Create one stream per model copy
         self.streams = [torch.cuda.Stream() for _ in range(num_copies)]
         
-        if self.verbose:
+        if True:#self.verbose:
             num_params = sum(p.numel() for p in model.parameters())
             num_layers = len(list(model.children()))
             print(f"[Init] Model has {num_params} parameters across {num_layers} layers.")
@@ -6177,7 +6118,7 @@ def generate_task_data(num_samples, task, context_len, maxn, train=True, ds=None
     elif task=="factorial":
         return generate_factorial_task_str(num_samples, context_len, max_n=maxn, train=train)
     elif task=="owt":
-        return generate_openwebtext_task_str(num_samples, context_len, ds, max_n=maxn, train=train, min_total_seq_len=2*context_len) # I will sample x_id as 0:context_len and then eval on context_len:2*context_len.. TODO this is hacky and I hate it.. but ICML deadline! :(
+        return generate_openwebtext_task_str(num_samples, 1, ds, max_n=maxn, train=train, min_total_seq_len=context_len) # I will sample x_id as 0:context_len and then eval on context_len:2*context_len.. TODO this is hacky and I hate it.. but ICML deadline! :(
     else:
         raise ValueError(f"Unknown task {task}")
 
@@ -6396,13 +6337,12 @@ def main():
     parser.add_argument("--head_size", type=int, default=64)
     parser.add_argument("--num_heads", type=int, default=1)
 
-    parser.add_argument("--optimizer", type=str, default="sgd", choices=["sgd","mezo"])
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
     parser.add_argument("--tie_epsilon_to_lr_ratio", type=float, default=-1)
     parser.add_argument("--epsilon", type=float, default=1e-2, help="MeZO eps.")
 
-    parser.add_argument("--mezo_flavor", type=str, default="None", choices=["mezo_single", "mezo_rolling", "anp", "warm_single_mezo", "mezo_adaptive_sampling", "mezo_adaptive_sampling_fast", "mezo_single_fast", "mezo_adaptive_sampling_fast_one_way", "mezo_adaptive_sampling_layerwise", "mezo_adaptive_sampling_layerwise_one_way", "mezo_single_fast_one_way", "None"])
+    parser.add_argument("--mezo_flavor", type=str, default="sgd", choices=["mezo_single", "mezo_rolling", "anp", "warm_single_mezo", "mezo_adaptive_sampling", "mezo_adaptive_sampling_fast", "mezo_single_fast", "mezo_adaptive_sampling_fast_one_way", "mezo_adaptive_sampling_layerwise", "mezo_adaptive_sampling_layerwise_one_way", "mezo_single_fast_one_way", "sgd"])
 
     parser.add_argument("--fixed_size_perturbation", action="store_true")
     
@@ -6446,6 +6386,7 @@ def main():
     args= parser.parse_args()
 
     
+    
     verbose = False 
     alpha = args.ema_coine_lr_alpha  # smoothing factor for the EMA; adjust as needed
     ema_loss = None  # will hold the running EMA of the loss
@@ -6467,11 +6408,8 @@ def main():
     vocab_list, char_to_id, id_to_char = get_char_vocab()
     vocab_size= len(vocab_list)
 
-    if args.optimizer == "sgd":
-        mezo_flavor = "sgd"
-    else:
-        mezo_flavor = args.mezo_flavor
-        
+    mezo_flavor = args.mezo_flavor
+
     vram_stats = calculate_vram_usage_direct(
         args.arch,
         args.hidden_size,
@@ -6545,10 +6483,14 @@ def main():
         model = SimpleLSTM(args.input_size, vocab_size, args.hidden_size, embed).to(device)  
     else: # "tra"
         model = Transformer(args.input_size, vocab_size, args.hidden_size, args.memory_size, args.head_size, args.num_heads, embed).to(device) 
-        
+
+
+    num_params = sum(p.numel() for p in model.parameters())
+    num_layers = len(list(model.children()))
+
     # build optimizer
     params= list(model.parameters())+ list(embed.parameters())
-    if args.optimizer=="sgd": 
+    if args.mezo_flavor=="sgd": 
         optimizer= optim.Adam(params, lr=args.learning_rate, weight_decay=args.weight_decay,  betas=(0.9, 0.999), eps=1e-08, amsgrad=False )
     else:
         # mezo uses the same optimizer for momentum, we'll do param.grad => momentum => param.data
@@ -6584,15 +6526,15 @@ def main():
     current_max_num= 15 # used only in arithmetic functions
 
     # lets make sure the user knows how the curriculum works
-    assert current_max_num <= args.max_num, "Must have max_num > 15"
-    assert current_context_len <= args.input_sample_length, f"Must have input_sample_length > 1: current_context_len:{current_context_len} and input_sample_length:{args.input_sample_length}"
+    # assert current_max_num <= args.max_num, "Must have max_num > 15"
+    # assert current_context_len <= args.input_sample_length, f"Must have input_sample_length > 1: current_context_len:{current_context_len} and input_sample_length:{args.input_sample_length}"
 
     mezo_state = None
     if args.mezo_flavor == "mezo_rolling": 
         # TODO, not tested
         mezo_state = init_rolling_mezo(model, args.epsilon)
 
-    if args.num_perturbations >= 1:
+    if args.num_perturbations >= 1 and 'mezo' in args.mezo_flavor:
         # init MezoAdaptiveSamplingParallel and use that and later we call sampler.mezo_adaptive_sampling_fast_parallel()
         sampler = MezoAdaptiveSamplingParallel(
                 model,
@@ -6623,7 +6565,7 @@ def main():
 
     
     # verbose = True
-    if args.optimizer=="sgd":
+    if args.mezo_flavor=="sgd":
         # optimize the model
         prepare_model_for_fast_inference(model, dummy_data)
     else:
@@ -6680,12 +6622,15 @@ def main():
     overfit_to_one_batch_flag = args.overfit_to_one_batch_flag
     
     if overfit_to_one_batch_flag:
-        this_sample_context_length = 1 + np.random.randint( 
-                                                minimum_starting_point_context_length, 
-                                                max(1,current_context_len+1)
-                            ) # always at least generate 1.
+        this_sample_context_length = minimum_starting_point_context_length 
+        
+        #1 + np.random.randint( 
+                            # minimum_starting_point_context_length, 
+                            # max(1,current_context_len+1)
+                            # ) # always at least generate 1.
             
-        this_sample_max_num = 1+np.random.randint(0,max(1,current_max_num)) # always at least generate 1.
+        this_sample_max_num = current_max_num 
+        #1+np.random.randint(0,max(1,current_max_num)) # always at least generate 1.
     
         
         x_strs, y_strs= generate_task_data(total_samples_per_iter, args.task,
@@ -6756,7 +6701,7 @@ def main():
                 if args.tie_epsilon_to_lr_ratio>-1:
                     args.epsilon = args.tie_epsilon_to_lr_ratio * optimizer.param_groups[0]['lr']
     
-                if args.optimizer=="mezo":
+                if "mezo" in args.mezo_flavor:
                     with torch.inference_mode():
                         # # x_emb = x_emb.half()
                         model.eval()
@@ -6959,7 +6904,7 @@ def main():
                 
 
         # do momentum-based step
-        if args.optimizer == "mezo" and args.macro_batch_size>1:
+        if "mezo" in args.mezo_flavor and args.macro_batch_size>1:
            
             for p in model.parameters():
                 if p.grad is not None:
@@ -7001,7 +6946,7 @@ def main():
         else:
             optimizer.step()
 
-        train_loss_mezo = micro_loss_sum / args.macro_batch_size
+        train_loss = micro_loss_sum / args.macro_batch_size
 
         # Warmup step, TODO, not sure how much this adds TBH.. should ablate
         if warmup_counter <= args.warmup_steps:
@@ -7015,9 +6960,9 @@ def main():
                     # Update the exponential moving average (EMA) for the training loss.
                     # For the first epoch, initialize ema_loss with the current loss.
                     if ema_loss is None:
-                        ema_loss = train_loss_mezo
+                        ema_loss = train_loss
                     else:
-                        ema_loss = alpha * train_loss_mezo + (1 - alpha) * ema_loss
+                        ema_loss = alpha * train_loss + (1 - alpha) * ema_loss
                 
                     # Append the current EMA to the history.
                     ema_history.append(ema_loss)
@@ -7089,186 +7034,195 @@ def main():
         #       f"context_len={current_context_len}, max_num={current_max_num}")
         vram_inferred = torch.cuda.max_memory_allocated(device)/1024**3
 
-        msg= (f"Iter={iteration}, train_loss={train_loss_mezo:.3f}, "
+        msg= (f"Iter={iteration}, train_loss={train_loss:.3f}, "
               f"LR={lr_current:.6f}, eps={args.epsilon:.6f}, vram_inferred={vram_inferred:.6f} GB iter_time={iteration_time:.2f}s, total_time={total_elapsed/60:.2f}m, "
               f"context_len={current_context_len}, max_num={current_max_num}, gen_eff_token={gen_efficiency_gen_loss}, gen_eff_sample={gen_efficiency_val_loss}")
+        print(f"Model has {num_params} parameters across {num_layers} layers.")
 
         print(msg)
         sys.stdout.flush()
 
-        if train_loss_mezo>100:
-            raise Exception(f"Ending training train_loss_mezo diverging: {train_loss_mezo}")
+        if train_loss>100:
+            raise Exception(f"Ending training train_loss diverging: {train_loss}")
 
         ####################################
         # VALIDATION LOOP
         ####################################
         # validation every log_interval
         if iteration % args.log_interval == 0:
-
-            # compute train accuracy on last micro-batch
-            with torch.inference_mode():
-                    # x_ids = str_to_tensor(cur_x, char_to_id, args.max_seq_len).to(device)  # [B, Lx]
-                    # y_ids = str_to_tensor(cur_y, char_to_id, args.max_seq_len).to(device)  # [B, Ly]
-                    x_ids = str_to_tensor(cur_x, char_to_id).to(device)  # [B, Lx]
-                    y_ids = str_to_tensor(cur_y, char_to_id).to(device)  # [B, Ly]
+            val_gen_loss = 0
+            val_gen_acc = 0
+            gen_efficiency_gen_loss = 0
+            gen_efficiency_val_loss = 0
+            val_loss = 0
+            train_acc = 0
+            
+            if not args.overfit_to_one_batch_flag: 
     
-                    # iterate on the train just to show accuracy as mezo makes it difficult to get a good gauge on accuracy as the model is not ever truly represented
-
-                    
-                    # fallback to your old code for RNN
-                    generated_strs, generated_strs_with_padding, gen_ids_batch, probs_batch, train_loss, train_acc, train_acc_sample  = generate_sequence_batched(
-                        model=model,
-                        x_ids=x_ids,
-                        embed=embed,
-                        char_to_id=char_to_id,
-                        id_to_char=id_to_char,
-                        max_seq_len=args.max_seq_len,
-                        device=device,
-                        criterion=criterion,
-                        y_ids=y_ids
-                    )
-
-                    counter=0
-                    for b in range(len(generated_strs)):
-                        print("="*30)
-                        print(f" [Sample {b}] Input: {cur_x[b]}")
-                        print(f" [Sample {b}] Target: {cur_y[b]}")
-                        print(f" [Sample {b}] Generated (w/ spec toks): {generated_strs_with_padding[b]}")
-                        print(f" [Sample {b}] Generated: {generated_strs[b]}")
-                        print(f" [Sample {b}] Token IDs: {gen_ids_batch[b]}")
-                        print(f" [Sample {b}] Probabilities: {probs_batch[b]}")
-                        print("="*30)
-                        counter+=1
-                        if counter>4:
-                            break
+                # compute train accuracy on last micro-batch
+                with torch.inference_mode():
+                        # x_ids = str_to_tensor(cur_x, char_to_id, args.max_seq_len).to(device)  # [B, Lx]
+                        # y_ids = str_to_tensor(cur_y, char_to_id, args.max_seq_len).to(device)  # [B, Ly]
+                        x_ids = str_to_tensor(cur_x, char_to_id).to(device)  # [B, Lx]
+                        y_ids = str_to_tensor(cur_y, char_to_id).to(device)  # [B, Ly]
+        
+                        # iterate on the train just to show accuracy as mezo makes it difficult to get a good gauge on accuracy as the model is not ever truly represented
+    
                         
-                    print(f"Generation loss: {train_loss}, Generation accuracy: {train_acc}, Generation sample accuracy: {train_acc_sample}")
-                    print("="*30)
-                    print("="*30)
+                        # fallback to your old code for RNN
+                        generated_strs, generated_strs_with_padding, gen_ids_batch, probs_batch, train_loss, train_acc, train_acc_sample  = generate_sequence_batched(
+                            model=model,
+                            x_ids=x_ids,
+                            embed=embed,
+                            char_to_id=char_to_id,
+                            id_to_char=id_to_char,
+                            max_seq_len=args.max_seq_len,
+                            device=device,
+                            criterion=criterion,
+                            y_ids=y_ids
+                        )
     
-                    # Generate Val Samples that are hold out numbers and seq length
-                
+                        counter=0
+                        for b in range(len(generated_strs)):
+                            print("="*30)
+                            print(f" [Sample {b}] Input: {cur_x[b]}")
+                            print(f" [Sample {b}] Target: {cur_y[b]}")
+                            print(f" [Sample {b}] Generated (w/ spec toks): {generated_strs_with_padding[b]}")
+                            print(f" [Sample {b}] Generated: {generated_strs[b]}")
+                            print(f" [Sample {b}] Token IDs: {gen_ids_batch[b]}")
+                            print(f" [Sample {b}] Probabilities: {probs_batch[b]}")
+                            print("="*30)
+                            counter+=1
+                            if counter>4:
+                                break
+                            
+                        print(f"Generation loss: {train_loss}, Generation accuracy: {train_acc}, Generation sample accuracy: {train_acc_sample}")
+                        print("="*30)
+                        print("="*30)
         
-                    this_sample_context_length_for_val = 1 + np.random.randint( 
-                                            minimum_starting_point_context_length, 
-                                            max(1,current_context_len+1)
-                        ) # always at least generate 1.
-        
-                    ### TURN THIS BACK ON IF YOU WANT TO SAMPLE FULL LENGTH.. BUT ITS SLOW..
-                    # this_sample_context_length_for_val = 1+np.random.randint(args.input_sample_length, args.input_sample_length)
-        
-                    this_sample_max_num_for_val = 1+np.random.randint(0,max(args.max_num,args.max_num)) # always at least generate 1.
-                    
-                    # TODO, maybe this should be different? can update later if we want
-                    val_samples = 5 # total_samples_per_iter 
-                    
-                    # Generate a validation batch (vx, vy)
-                    vx, vy= generate_task_data(val_samples, 
-                                                   args.task,
-                                                   this_sample_context_length_for_val, 
-                                                   this_sample_max_num_for_val,
-                                                   train=False,
-                                                   ds = ds
-                                              )
-
-
-                    # if overfit_to_one_batch_flag:
-                    #     vx, vy = x_strs, y_strs # override it bc i am just memorizing one batch. See if it will work.
-
-                    
+                        # Generate Val Samples that are hold out numbers and seq length
                     
             
-                    # Convert to tensors
-                    # vx_ids= str_to_tensor(vx, char_to_id, args.max_seq_len).to(device)
-                    # vy_ids= str_to_tensor(vy, char_to_id, args.max_seq_len).to(device)
-                    vx_ids= str_to_tensor(vx, char_to_id).to(device)
-                    vy_ids= str_to_tensor(vy, char_to_id).to(device)
+                        this_sample_context_length_for_val = 1 + np.random.randint( 
+                                                minimum_starting_point_context_length, 
+                                                max(1,current_context_len+1)
+                            ) # always at least generate 1.
             
-                    # --------------------------------------------------------------------
-                    # 1) Optionally, do a teacher-forced pass to measure "val_loss"
-                    # --------------------------------------------------------------------
-
-                    # vx_emb = embed(vx_ids)
-                    vx_emb = vx_ids # VERY HACKKY TODO SAME REASON AS ABOVE
+                        ### TURN THIS BACK ON IF YOU WANT TO SAMPLE FULL LENGTH.. BUT ITS SLOW..
+                        # this_sample_context_length_for_val = 1+np.random.randint(args.input_sample_length, args.input_sample_length)
+            
+                        this_sample_max_num_for_val = 1+np.random.randint(0,max(args.max_num,args.max_num)) # always at least generate 1.
+                        
+                        # TODO, maybe this should be different? can update later if we want
+                        val_samples = 5 # total_samples_per_iter 
+                        
+                        # Generate a validation batch (vx, vy)
+                        vx, vy= generate_task_data(val_samples, 
+                                                       args.task,
+                                                       this_sample_context_length_for_val, 
+                                                       this_sample_max_num_for_val,
+                                                       train=False,
+                                                       ds = ds
+                                                  )
+    
+    
+                        # if overfit_to_one_batch_flag:
+                        #     vx, vy = x_strs, y_strs # override it bc i am just memorizing one batch. See if it will work.
+    
+                        
+                        
                 
-                    #             vy_emb = embed(vy_ids)[:, :-1, :]  # Exclude last token from input since we'll predict it
-                    #             v_full = torch.cat([vx_emb, vy_emb], dim=1)  # Concatenate along sequence length dimension
-                                
-                    #             Bx, Lx, Vx = vx_emb.size()
-                    #             model.eval()
-                    #             outputs, _, _ = model(v_full)
-                    #             B2,L2,V2= outputs.size()
-                                
-                    #             logits = outputs[:, Lx-1:, :].contiguous()  # Get predictions starting from after input sequence
-                    #             logits = logits.view(-1, logits.size(-1))  # [batch_size * seq_len, num_classes]
+                        # Convert to tensors
+                        # vx_ids= str_to_tensor(vx, char_to_id, args.max_seq_len).to(device)
+                        # vy_ids= str_to_tensor(vy, char_to_id, args.max_seq_len).to(device)
+                        vx_ids= str_to_tensor(vx, char_to_id).to(device)
+                        vy_ids= str_to_tensor(vy, char_to_id).to(device)
+                
+                        # --------------------------------------------------------------------
+                        # 1) Optionally, do a teacher-forced pass to measure "val_loss"
+                        # --------------------------------------------------------------------
+    
+                        # vx_emb = embed(vx_ids)
+                        vx_emb = vx_ids # VERY HACKKY TODO SAME REASON AS ABOVE
                     
-                    # # Reshape targets
-                    #             targets = vy_ids.contiguous().view(-1)  # [batch_size * seq_len]
-                
-                    #             val_loss= criterion(logits, targets)
-                    val_loss = teacher_forcing_loss_emb(model, vx_emb, vy_ids, criterion)
-
-                
-                    # --------------------------------------------------------------------
-                    # 2) Now do an auto-regressive generation pass
-                    # --------------------------------------------------------------------
-                    generated_strs,generated_strs_with_padding, gen_ids_batch, probs_batch, val_gen_loss, val_gen_acc, val_gen_acc_sample = generate_sequence_batched(
-                        model=model,
-                        x_ids=vx_ids,
-                        embed=embed,
-                        char_to_id=char_to_id,
-                        id_to_char=id_to_char,
-                        max_seq_len=args.max_seq_len,
-                        device=device,
-                        criterion=criterion,  # we pass it to measure cross-entropy while generating
-                        y_ids=vy_ids
-                    )
-
-            # For debugging, let's print a few val random samples
-            sample_indices= random.sample(range(len(generated_strs)), min(3,len(generated_strs)))
-            print("\n[DEBUG] Random Val Samples:")
-            for idx in sample_indices:
-                print(f"  [Val idx={idx}]")
-                print(f"    Input:  '{vx[idx]}'")
-                print(f"    Target: '{vy[idx]}'")
-                print(f"    Generated(w/ spec toks): '{generated_strs_with_padding[idx]}'")
-                generated_strs_with_padding
-                print(f"    Generated: '{generated_strs[idx]}'")
-                print(f"    Token IDs: {gen_ids_batch[idx]}")
-                print(f"    Probabilities: {probs_batch[idx]}")
-                
+                        #             vy_emb = embed(vy_ids)[:, :-1, :]  # Exclude last token from input since we'll predict it
+                        #             v_full = torch.cat([vx_emb, vy_emb], dim=1)  # Concatenate along sequence length dimension
+                                    
+                        #             Bx, Lx, Vx = vx_emb.size()
+                        #             model.eval()
+                        #             outputs, _, _ = model(v_full)
+                        #             B2,L2,V2= outputs.size()
+                                    
+                        #             logits = outputs[:, Lx-1:, :].contiguous()  # Get predictions starting from after input sequence
+                        #             logits = logits.view(-1, logits.size(-1))  # [batch_size * seq_len, num_classes]
+                        
+                        # # Reshape targets
+                        #             targets = vy_ids.contiguous().view(-1)  # [batch_size * seq_len]
+                    
+                        #             val_loss= criterion(logits, targets)
+                        val_loss = teacher_forcing_loss_emb(model, vx_emb, vy_ids, criterion).item()
     
-                # If you want to see raw token IDs:
-                # print(f"    gen_ids_batch[idx] = {gen_ids_batch[idx]}")
+                    
+                        # --------------------------------------------------------------------
+                        # 2) Now do an auto-regressive generation pass
+                        # --------------------------------------------------------------------
+                        generated_strs,generated_strs_with_padding, gen_ids_batch, probs_batch, val_gen_loss, val_gen_acc, val_gen_acc_sample = generate_sequence_batched(
+                            model=model,
+                            x_ids=vx_ids,
+                            embed=embed,
+                            char_to_id=char_to_id,
+                            id_to_char=id_to_char,
+                            max_seq_len=args.max_seq_len,
+                            device=device,
+                            criterion=criterion,  # we pass it to measure cross-entropy while generating
+                            y_ids=vy_ids
+                        )
     
-                # If you'd like to see probabilities for newly generated tokens:
-                # print(f"    probs_batch[idx] = {probs_batch[idx]}")
+                # For debugging, let's print a few val random samples
+                sample_indices= random.sample(range(len(generated_strs)), min(3,len(generated_strs)))
+                print("\n[DEBUG] Random Val Samples:")
+                for idx in sample_indices:
+                    print(f"  [Val idx={idx}]")
+                    print(f"    Input:  '{vx[idx]}'")
+                    print(f"    Target: '{vy[idx]}'")
+                    print(f"    Generated(w/ spec toks): '{generated_strs_with_padding[idx]}'")
+                    generated_strs_with_padding
+                    print(f"    Generated: '{generated_strs[idx]}'")
+                    print(f"    Token IDs: {gen_ids_batch[idx]}")
+                    print(f"    Probabilities: {probs_batch[idx]}")
+                    
+        
+                    # If you want to see raw token IDs:
+                    # print(f"    gen_ids_batch[idx] = {gen_ids_batch[idx]}")
+        
+                    # If you'd like to see probabilities for newly generated tokens:
+                    # print(f"    probs_batch[idx] = {probs_batch[idx]}")
+    
+                gen_efficiency_gen_loss = val_gen_loss * 100.0 / (total_estimated_vram_gb * (total_elapsed / 3600.0))
+                gen_efficiency_val_loss = val_loss * 100.0 / (total_estimated_vram_gb * (total_elapsed / 3600.0)).item()
+                print(f"Generation loss: {val_gen_loss}, Generation accuracy: {val_gen_acc}, Generation sample accuracy: {val_gen_acc_sample}")
+                print(f"Generalization Efficiency:")
+                print(f"    VRAM: {total_estimated_vram_gb}")
+                print(f"    Wall-Clock Hrs: {total_elapsed / 3600.0}")
+                print(f"    val_gen_acc: {val_gen_acc}")
+                print(f"    val_gen_acc_sample: {val_gen_acc_sample}")
+                print(f"    Gen Eff (token): {gen_efficiency_gen_loss}")
+                print(f"    Gen Eff (sample): {gen_efficiency_val_loss}")
+                    
+                print("="*30)
+                print("="*30)
+    
+                print("[END DEBUG]\n")
 
-            gen_efficiency_gen_loss = val_gen_loss * 100.0 / (total_estimated_vram_gb * (total_elapsed / 3600.0))
-            gen_efficiency_val_loss = val_loss * 100.0 / (total_estimated_vram_gb * (total_elapsed / 3600.0))
-            print(f"Generation loss: {val_gen_loss}, Generation accuracy: {val_gen_acc}, Generation sample accuracy: {val_gen_acc_sample}")
-            print(f"Generalization Efficiency:")
-            print(f"    VRAM: {total_estimated_vram_gb}")
-            print(f"    Wall-Clock Hrs: {total_elapsed / 3600.0}")
-            print(f"    val_gen_acc: {val_gen_acc}")
-            print(f"    val_gen_acc_sample: {val_gen_acc_sample}")
-            print(f"    Gen Eff (token): {gen_efficiency_gen_loss}")
-            print(f"    Gen Eff (sample): {gen_efficiency_val_loss}")
-                
-            print("="*30)
-            print("="*30)
-
-            print("[END DEBUG]\n")
-            
-            # check to see if we should update curriculum
-            new_ctx, new_mn, consecutive_succ= maybe_update_curriculum(train_acc, current_context_len, current_max_num, consecutive_succ)
-            if current_context_len!=new_ctx:
-                print(f"!!!!! UPDATING CURRICULUM FROM {current_context_len} to {new_ctx}")
-                print(f"!!!!! UPDATING CURRICULUM FROM {current_context_len} to {new_ctx}")
-                print(f"!!!!! UPDATING CURRICULUM FROM {current_context_len} to {new_ctx}")
-                # pdb.set_trace()
-            current_context_len= new_ctx
-            current_max_num= new_mn
+                # check to see if we should update curriculum
+                new_ctx, new_mn, consecutive_succ= maybe_update_curriculum(train_acc, current_context_len, current_max_num, consecutive_succ)
+                if current_context_len!=new_ctx:
+                    print(f"!!!!! UPDATING CURRICULUM FROM {current_context_len} to {new_ctx}")
+                    print(f"!!!!! UPDATING CURRICULUM FROM {current_context_len} to {new_ctx}")
+                    print(f"!!!!! UPDATING CURRICULUM FROM {current_context_len} to {new_ctx}")
+                    # pdb.set_trace()
+                current_context_len= new_ctx
+                current_max_num= new_mn
 
             sys.stdout.flush()
         
@@ -7280,21 +7234,20 @@ def main():
                         weight_decay_loss += (args.weight_decay / 2) * torch.sum(param ** 2)
 
                 msg = {
-                    "train_loss": train_loss_mezo,
-                    "train_gen_loss": train_loss,
+                    "train_loss": train_loss,
                     "train_acc": train_acc,
                     "lr": lr_current,
                     "iter_time_s": iteration_time,
                     "total_time_hours": total_elapsed / 3600.0,
                     "curr_context_len": current_context_len,
                     "curr_max_num": current_max_num,
-                    "val_loss": val_loss.item(),        # teacher-forced
+                    "val_loss": val_loss,        # teacher-forced
                     "val_gen_loss": val_gen_loss,       # from generation
                     "val_gen_acc": val_gen_acc,
                     "total_estimated_vram_gb":total_estimated_vram_gb,
                     "GPU(GB)-Hours":total_estimated_vram_gb*total_elapsed / 3600.0,
                     "gen_efficiency_gen_loss":gen_efficiency_gen_loss,
-                    "gen_efficiency_val_loss":gen_efficiency_val_loss.item(),
+                    "gen_efficiency_val_loss":gen_efficiency_val_loss,
                     "weight_decay_loss": weight_decay_loss.item(),
                     "vram_inferred":vram_inferred
                     # "vram_usage":vram_usage,
