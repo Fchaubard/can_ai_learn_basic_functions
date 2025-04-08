@@ -3452,6 +3452,7 @@ class MezoAdaptiveSamplingParallel:
         variance_reduction=1,
         eps_schedule_multiplier=1,
         probe_dropout_rate=0.,
+        first_warmup_perturbations=-1,
         verbose=True
     ):
         self.model_main = model
@@ -3462,6 +3463,7 @@ class MezoAdaptiveSamplingParallel:
         self.verbose = verbose
         self.variance_reduction = variance_reduction
         self.probe_dropout_rate = probe_dropout_rate
+        self.first_warmup_perturbations = first_warmup_perturbations
 
         _, meta = flatten_params(model)
         self.meta = meta
@@ -3478,15 +3480,13 @@ class MezoAdaptiveSamplingParallel:
         num_layers = len(list(model.children()))
         print(f"[Init] Model has {num_params} parameters across {num_layers} layers.")
         # print(f"[Init] Allocated {num_copies} model copies and streams in VRAM.")
-    
-    
 
     def mezo_adaptive_sampling_fast_layerwise(
         self,
         x_emb,
         y,
         criterion,
-        optimizer,        # e.g. Adam
+        optimizer,        
         epsilon=1e-3,
         fixed_size_perturbation=False,
         use_same_probe_for_all_perturbations=True,  # now always True
@@ -3495,163 +3495,145 @@ class MezoAdaptiveSamplingParallel:
         num_global_perturbations=0
     ):
         """
-        Optimized layer‐wise finite‐difference perturbations.  Now TRULY parallel.
+        Optimized layer-wise finite-difference perturbations with direct parameter manipulation.
         """
-        adaptive=self.adaptive
         device = next(self.model_main.parameters()).device
+        torch.cuda.empty_cache()
                 
         # Zero gradients in the main model
         for p in self.model_main.parameters():
             if p.grad is not None:
                 p.grad.zero_()
     
-        # === STEP 1: Flatten parameters and prepare metadata ===
-        param_data_orig, meta = flatten_params(self.model_main)
+        # Get named modules for layer-wise perturbation
+        modules = list(self.model_main.named_children())
+        num_layers = len(modules)
         
-        layer_slices = []
-        offset = 0
-        
-        # Group parameters by module using model.named_children()
-        module_to_params = []
-        for name, module in self.model_main.named_children():
-            params = list(module.parameters())
-            if params:
-                flat_size = sum(p.numel() for p in params)
-                if flat_size > 0:
-                    module_to_params.append((name, flat_size))
-        
-        # Now build the slices
-        for name, numel in module_to_params:
-            layer_slices.append((offset, offset + numel))
-            offset += numel
-        
-        num_layers = len(layer_slices)
-        
-        # Build parameter map for correct gradient assignment
-        param_mapping = []
-        offset = 0
-        for name, module in self.model_main.named_children():
-            params = list(module.parameters())
-            for p in params:
-                numel = p.numel()
-                if numel > 0:
-                    param_mapping.append((offset, offset + numel, p))
-                    offset += numel
-    
-        if self.adaptive:
-            ratio_data = flatten_adam_ratio_data(self.model_main, optimizer)
-        else:
-            ratio_data = 0
-            
-        # === STEP 2: Precompute the global noise probe (always the same probe) ===
-        global_d_data = torch.randn_like(param_data_orig, device=device)
-        global_d_data = ratio_data + global_d_data if adaptive else global_d_data
-        if fixed_size_perturbation:
-            norm = torch.norm(global_d_data, p=2)
-            global_d_data = global_d_data / (norm + 1e-8)
-    
-        # === STEP 3: Build epsilon schedule per layer ===
-        epsilons_layer = torch.ones(num_layers, device=device)*epsilon
+        # === STEP 1: Build epsilon schedule per layer ===
+        epsilons_layer = torch.ones(num_layers, device=device) * epsilon
         for i in range(num_layers):
             epsilons_layer[i] = epsilon if use_same_eps_for_all_perturbations else epsilon * (self.eps_schedule_multiplier ** i)
-    
+        
+        num_actual_perturbations = max(1, num_global_perturbations)
+        
         with torch.inference_mode():
-            # === STEP 4: Global clean run (one_way only) ===
+            # === STEP 2: Global clean run (one_way only) ===
             if self.one_way:
-                    clean_loss = teacher_forcing_loss_emb_parallel(self.model_main, x_emb, y, criterion).detach()
+                clean_loss = teacher_forcing_loss_emb_parallel(self.model_main, x_emb, y, criterion).detach()
             else:
                 clean_loss = None
                 
-            # === STEP 5 & 6: Launch tasks and accumulate gradients ===
-            layer_results = [None] * (2 * num_layers if not self.one_way else num_layers)
             final_loss = []
             
-            # Initialize weighted probe with zeros
-            sum_weighted_probe = torch.zeros_like(global_d_data)
-            num_actual_perturbations = max(1, num_global_perturbations)
-            perturbed_param = param_data_orig.clone()
+            # Initialize placeholder for tracking gradient accumulation
+            # We'll use this to track when to normalize by num_perturbations
+            for p in self.model_main.parameters():
+                if p.requires_grad and p.grad is not None:
+                    p.grad.zero_()
+            
+            # Loop over perturbations
             for pert in range(num_actual_perturbations):
-                # Layerwise perturbations
-                for layer_idx, (start, end) in enumerate(layer_slices):
-                    eps_layer = epsilons_layer[layer_idx]
-                    d_layer = global_d_data[start:end]
-    
+                # Loop over layers (modules)
+                for layer_idx, (module_name, module) in enumerate(modules):
+                    # Get parameters for this module
+                    params = list(module.parameters())
+                    if not params or all(not p.requires_grad for p in params):
+                        continue  # Skip modules with no trainable parameters
+                    
+                    # Generate layer perturbation
+                    perturbations = []
+                    for p in params:
+                        if p.requires_grad:
+                            d = torch.randn_like(p)
+                            
+                            if fixed_size_perturbation:
+                                d = d / (torch.norm(d) + 1e-8)
+                            
+                            perturbations.append(d)
+                    
                     if self.one_way:
-                        # Efficient one-way: Apply perturbation directly to original parameters
-                        perturbed_param[start:end] = perturbed_param[start:end] + eps_layer * d_layer
-                        unflatten_into_params(perturbed_param, self.model_main, meta)
+                        # Apply positive perturbation directly
+                        for p, d in zip(params, perturbations):
+                            if p.requires_grad:
+                                p.data.add_(d, alpha=epsilons_layer[layer_idx].item())
                         
+                        # Compute perturbed loss
                         layer_loss = teacher_forcing_loss_emb_parallel(self.model_main, x_emb, y, criterion)
-                        layer_results[layer_idx] = layer_loss
-                        
-                        perturbed_param[start:end] = perturbed_param[start:end] - eps_layer * d_layer
-                                                
-                        # Gradient estimation
-                        grad_est = (layer_loss - clean_loss)/eps_layer
-                        sum_weighted_probe[start:end] += grad_est * d_layer
                         final_loss.append(layer_loss)
                         
-                        # Restore original parameters
-                        unflatten_into_params(param_data_orig, self.model_main, meta)
-                    else: # two way
-                        # Efficient two-way: First do the positive perturbation
+                        # Compute gradient estimate
+                        grad_est = (layer_loss - clean_loss) / epsilons_layer[layer_idx].item()
                         
-                        perturbed_param[start:end] = param_data_orig[start:end] + eps_layer * d_layer
-                        unflatten_into_params(perturbed_param, self.model_main, meta)
+                        # Apply gradients directly
+                        for p, d in zip(params, perturbations):
+                            if p.requires_grad:
+                                if p.grad is None:
+                                    p.grad = grad_est * d
+                                else:
+                                    p.grad.add_(grad_est * d)
+                        
+                        # Restore original parameters by subtracting the perturbation
+                        for p, d in zip(params, perturbations):
+                            if p.requires_grad:
+                                p.data.sub_(d, alpha=epsilons_layer[layer_idx].item())
+                        
+                        print(f"pert {pert}, layer {layer_idx}, grad_est {grad_est.item()}")
+                    else:  # two-way
+                        # Apply positive perturbation
+                        for p, d in zip(params, perturbations):
+                            if p.requires_grad:
+                                p.data.add_(d, alpha=epsilons_layer[layer_idx].item())
+                        
+                        # Compute positive perturbed loss
                         layer_loss_plus = teacher_forcing_loss_emb_parallel(self.model_main, x_emb, y, criterion)
-                        layer_results[2*layer_idx] = layer_loss_plus
                         
-                        # Then transform directly to the negative perturbation
-                        perturbed_param[start:end] = perturbed_param[start:end] - 2 * eps_layer * d_layer  # No need for a new clone
-                        unflatten_into_params(perturbed_param, self.model_main, meta)
+                        # Switch to negative perturbation (subtract 2*eps)
+                        for p, d in zip(params, perturbations):
+                            if p.requires_grad:
+                                p.data.sub_(d, alpha=2*epsilons_layer[layer_idx].item())
+                        
+                        # Compute negative perturbed loss
                         layer_loss_minus = teacher_forcing_loss_emb_parallel(self.model_main, x_emb, y, criterion)
-                        layer_results[2*layer_idx + 1] = layer_loss_minus
-    
-                        # Gradient estimation
-                        grad_est = (layer_loss_plus - layer_loss_minus)/(2*eps_layer)
-                        sum_weighted_probe[start:end] += grad_est * d_layer
-    
+                        
+                        # Add losses to final_loss
                         final_loss.append(layer_loss_plus)
                         final_loss.append(layer_loss_minus)
                         
-                        # Restore original parameters
-                        # unflatten_into_params(param_data_orig, self.model_main, meta)
-                        perturbed_param[start:end] = perturbed_param[start:end] + eps_layer * d_layer 
-
+                        # Compute gradient estimate with central difference
+                        grad_est = (layer_loss_plus - layer_loss_minus) / (2 * epsilons_layer[layer_idx].item())
+                        
+                        # Apply gradients directly
+                        for p, d in zip(params, perturbations):
+                            if p.requires_grad:
+                                if p.grad is None:
+                                    p.grad = grad_est * d
+                                else:
+                                    p.grad.add_(grad_est * d)
+                        
+                        # Restore original parameters by adding back eps*d
+                        for p, d in zip(params, perturbations):
+                            if p.requires_grad:
+                                p.data.add_(d, alpha=epsilons_layer[layer_idx].item())
+                        
+                        print(f"pert {pert}, layer {layer_idx}, grad_est {grad_est.item()}")
                     
-                    print(f"pert {pert}, layer {layer_idx}, grad_est {grad_est} ")
-                
-                if num_global_perturbations > 1 and pert < num_global_perturbations - 1:
-                    # Generate new perturbation for next iteration
-                    global_d_data = torch.randn_like(param_data_orig, device=device)
-                    global_d_data = ratio_data + global_d_data if adaptive else global_d_data
-                    if fixed_size_perturbation:
-                        norm = torch.norm(global_d_data, p=2)
-                        global_d_data = global_d_data / (norm + 1e-8)
-    
-        # === Apply gradients to model parameters ===
-        # Normalize the gradient by the actual number of perturbations
-        sum_weighted_probe = sum_weighted_probe / num_actual_perturbations
-        print("Grad norm:", torch.norm(sum_weighted_probe).item())
-    
-        # Map gradient estimates back to parameters using param_mapping
-        unflatten_into_params(param_data_orig, self.model_main, meta)
-        for start, end, param in param_mapping:
-            if start < sum_weighted_probe.size(0) and end <= sum_weighted_probe.size(0):
-                grad_slice = sum_weighted_probe[start:end].view_as(param)
-                if param.grad is None:
-                    param.grad = grad_slice.clone()
-                else:
-                    # param.grad.add_(grad_slice)
-                    param.grad.copy_(grad_slice)
+                    torch.cuda.empty_cache()
             
+            # Normalize the gradients by the number of perturbations
+            for p in self.model_main.parameters():
+                if p.requires_grad and p.grad is not None:
+                    p.grad.div_(num_actual_perturbations)
+        
+        # Calculate the final average loss
         if self.one_way:
             avg_loss_global = clean_loss
-        else: # two-way
-            avg_loss_global = sum(final_loss)/len(final_loss)
+        else:  # two-way
+            avg_loss_global = sum(final_loss) / len(final_loss)
             
         return avg_loss_global
 
+
+        
                                                                                                              
     def mezo_adaptive_sampling_fastest(
         self,
@@ -3664,12 +3646,26 @@ class MezoAdaptiveSamplingParallel:
         fixed_size_perturbation=False,
         use_same_probe_for_all_perturbations=True,
         use_same_eps_for_all_perturbations=True,
-        aggregation_method="average"
+        aggregation_method="average",
+        debias=False
     ):
         # with torch.inference_mode():
-        
+        torch.cuda.empty_cache()
         adaptive=self.adaptive
         device = next(self.model_main.parameters()).device
+
+        if self.first_warmup_perturbations>0:
+            print(f"FIRST TIME, doing {self.first_warmup_perturbations} perturbations to warmup")
+            num_perturbations = self.first_warmup_perturbations
+            self.first_warmup_perturbations = -1 # reset it so its not done again.
+        else:
+            num_perturbations = self.num_perturbations
+
+        
+        if self.adaptive:
+            ratio_data = flatten_adam_ratio_data(self.model_main, optimizer)
+        else:
+            ratio_data = 0
         
         # Zero gradients in the main model
         for p in self.model_main.parameters():
@@ -3680,22 +3676,23 @@ class MezoAdaptiveSamplingParallel:
         param_data_orig, _ = flatten_params(self.model_main)
         # param_data_orig = orig_param_data.clone()
         
-        if self.adaptive:
-            ratio_data = flatten_adam_ratio_data(self.model_main, optimizer) if adaptive else None
-
         # Pre-compute epsilons and perturbations
-        epsilons = [epsilon * (1 if use_same_eps_for_all_perturbations else self.eps_schedule_multiplier ** i) for i in range(self.num_perturbations)]
+        epsilons = [epsilon * (1 if use_same_eps_for_all_perturbations else self.eps_schedule_multiplier ** i) for i in range(num_perturbations)]
         
         if self.one_way:
-            losses = [None] * (self.num_perturbations + 1)
+            losses = [None] * (num_perturbations + 1)
         else:
-            losses = [None] * (self.num_perturbations * 2) 
+            losses = [None] * (num_perturbations * 2) 
 
         # if use_same_probe_for_all_perturbations:
 
         # sample the first d (perturbation) either way
         d_data = torch.randn_like(param_data_orig, device=device) / variance_reduction
         d_data = (ratio_data + d_data if adaptive else d_data)
+        
+        torch.cuda.empty_cache()
+
+
         if self.probe_dropout_rate>0.0:
             mask = (torch.rand_like(d_data, device=device) > self.probe_dropout_rate).float()
             d_data = d_data * mask  # Apply mask to disable perturbations
@@ -3706,6 +3703,7 @@ class MezoAdaptiveSamplingParallel:
 
         sum_of_weighted_probes = torch.zeros_like(param_data_orig)
 
+
         with torch.inference_mode():
             if self.one_way:
                 # Clean copy (if one_way)
@@ -3713,20 +3711,31 @@ class MezoAdaptiveSamplingParallel:
                 losses[0] = teacher_forcing_loss_emb_parallel(self.model_main, x_ids, y, criterion).detach()
     
                 # Perturbed copies
-                for i in range(self.num_perturbations):
+                for i in range(num_perturbations):
                     # with torch.cuda.stream(self.streams[copy_idx]):
-                    perturbed_param = param_data_orig + epsilons[i] * d_data
-                    unflatten_into_params(perturbed_param, self.model_main, self.meta)
+                    if i>len(epsilons):
+                        epss=epsilons[-1] # just reuse last one just in case
+                    else:
+                        epss=epsilons[i]
+                    
+                    param_data_orig.add_(d_data, alpha=epss)
+
+                    unflatten_into_params(param_data_orig, self.model_main, self.meta)
                     losses[i+1] = teacher_forcing_loss_emb_parallel(self.model_main, x_ids, y, criterion).detach()
-    
+
+                    param_data_orig.sub_(d_data, alpha=epss)
+
                     # add to sum of weighted probe in .grad()
-                    grad_est = (losses[i+1] - losses[0]) / epsilons[i]
-                    sum_of_weighted_probes += grad_est * d_data
+                    grad_est = (losses[i+1] - losses[0]) / epss
+                    sum_of_weighted_probes.add_(d_data, alpha=grad_est)
+                    torch.cuda.empty_cache()
                     
                     # resample another d_data
                     if not use_same_probe_for_all_perturbations:
                         d_data = torch.randn_like(param_data_orig, device=device) / variance_reduction
                         d_data = (ratio_data + d_data if adaptive else d_data)
+                        torch.cuda.empty_cache()
+
                         if self.probe_dropout_rate>0.0:
                             mask = (torch.rand_like(d_data, device=device) > self.probe_dropout_rate).float()
                             d_data = d_data * mask  # Apply mask to disable perturbations
@@ -3737,31 +3746,40 @@ class MezoAdaptiveSamplingParallel:
                         
                 
             else:  # Two-way
-                for i in range(self.num_perturbations):
-                    eps = epsilons[i]
+                for i in range(num_perturbations):
+
+                    if i>len(epsilons):
+                        epss=epsilons[-1] # just reuse last one
+                    else:
+                        epss=epsilons[i]
     
                     # Plus pass
                     idx_plus = 2 * i
                     # with torch.cuda.stream(self.streams[idx_plus]):
-                    perturbed_param = param_data_orig + eps * d_data
-                    unflatten_into_params(perturbed_param, self.model_main, self.meta)
+                    param_data_orig.add_(d_data, alpha=epss)
+                    unflatten_into_params(param_data_orig, self.model_main, self.meta)
                     losses[idx_plus] = teacher_forcing_loss_emb_parallel(self.model_main, x_ids, y, criterion).detach()
                     
                     # Minus pass
                     idx_minus = 2 * i + 1
                     # with torch.cuda.stream(self.streams[idx_plus]):
-                    perturbed_param = param_data_orig - eps * d_data
-                    unflatten_into_params(perturbed_param, self.model_main, self.meta)
+                    param_data_orig.sub_(d_data, alpha=2*epss)
+                    unflatten_into_params(param_data_orig, self.model_main, self.meta)
                     losses[idx_minus] = teacher_forcing_loss_emb_parallel(self.model_main, x_ids, y, criterion).detach()
-    
+
+                    param_data_orig.add_(d_data, alpha=epss)
+                    
                     # add to sum of weighted probe in .grad()
                     grad_est = (losses[idx_plus] - losses[idx_minus]) / (2*eps)
-                    sum_of_weighted_probes += grad_est * d_data
+                    sum_of_weighted_probes.add_(d_data, alpha=grad_est)
                     
                     # resample another d_data
                     if not use_same_probe_for_all_perturbations: 
+                        
                         d_data = torch.randn_like(param_data_orig, device=device) / variance_reduction
                         d_data = (ratio_data + d_data if adaptive else d_data)
+                        torch.cuda.empty_cache()
+
                         if self.probe_dropout_rate>0.0:
                             mask = (torch.rand_like(d_data, device=device) > self.probe_dropout_rate).float()
                             d_data = d_data * mask  # Apply mask to disable perturbations
@@ -3774,9 +3792,59 @@ class MezoAdaptiveSamplingParallel:
         offset = 0
         unflatten_into_params(param_data_orig, self.model_main, self.meta)    
         print("Grad norm:", torch.norm(sum_of_weighted_probes).item())
+        sum_of_weighted_probes.div_( num_perturbations)
+
+
+        if self.adaptive and debias:
+            
+            p = 1.0 - self.probe_dropout_rate
+            r = ratio_data                         # [n], will be overwritten
+            g = sum_of_weighted_probes            # [n], final averaged gradient
+            n = r.numel()
+        
+            # First pass: compute r = D_inv * r, and g = D_inv * g, in-place
+            # Also compute dot products r^T D_inv g and r^T D_inv r incrementally
+            rDg = 0.0
+            rDr = 0.0
+
+            CHUNK_SIZE = 10_000_000
+            
+            for i in range(0, n, CHUNK_SIZE):
+                #pdb.set_trace()
+                end = min(i + CHUNK_SIZE, n)
+        
+                r_chunk = r[i:end]
+                g_chunk = g[i:end]
+        
+                r_orig = r_chunk.clone()  # store original r_i before squaring
+        
+                # A_diag = p + p(1 - p) * r^2
+                A_diag = r_chunk.square_().mul_(p * (1 - p)).add_(p)
+        
+                # D_inv = 1 / A_diag
+                A_diag.reciprocal_()
+        
+                # Update r_chunk = D_inv * r (in-place)
+                r_chunk.mul_(A_diag)
+        
+                # Update g_chunk = D_inv * g (in-place)
+                g_chunk.mul_(A_diag)
+        
+                # Incremental dot products
+                rDg += torch.dot(r_chunk, g_chunk)
+                rDr += torch.dot(r_chunk, r_chunk)
+        
+            # Compute correction factor
+            factor = rDg / (1.0 + rDr)
+        
+            # Second pass: apply final update g -= factor * D_inv * r
+            for i in range(0, n, CHUNK_SIZE):
+                end = min(i + CHUNK_SIZE, n)
+                sum_of_weighted_probes[i:end].add_(r[i:end], alpha=-factor)
+
 
         for p, (shape, numel, dev) in zip(self.model_main.parameters(), self.meta):
-            slice_ = sum_of_weighted_probes[offset:offset + numel].view(shape).to(dev) / self.num_perturbations
+            slice_ = sum_of_weighted_probes[offset:offset + numel].view(shape).to(dev)
             if p.grad is None:
                 p.grad = slice_
             else:
@@ -3789,10 +3857,12 @@ class MezoAdaptiveSamplingParallel:
             avg_loss = losses[0] #0.5 * (losses[0].item() + (sum(valid_losses) / len(valid_losses)))
             # print(f"   valid_losses (one way):{len(valid_losses)}")
         else:
-            loss_pairs = [(losses[2*i], losses[2*i+1]) for i in range(self.num_perturbations)]
+            loss_pairs = [(losses[2*i], losses[2*i+1]) for i in range(num_perturbations)]
             avg_loss = sum(sum(pair)/2 for pair in loss_pairs) / len(loss_pairs)
             # print(f"   valid_losses (one way):{len(valid_losses)}")
 
+        del param_data_orig, d_data, losses   # or loss_clean, loss_perturbed if one-way
+        torch.cuda.empty_cache()
         return avg_loss 
 
                                                                                               
@@ -5747,12 +5817,14 @@ def main():
     parser.add_argument("--mezo_flavor", type=str, default="sgd", choices=["mezo_single", "sgd", "mezo_layerwise"])
     parser.add_argument("--adaptive", action="store_true")
     parser.add_argument("--one_way", action="store_true")
+    parser.add_argument("--tanh_dor_schedule", action="store_true")
     parser.add_argument("--fixed_size_perturbation", action="store_true")
     
     parser.add_argument("--cosine_lr", action="store_true")
     parser.add_argument("--warmup_steps", type=int, default=1)
 
-    parser.add_argument("--grad_norm", action="store_true")
+    parser.add_argument("--grad_norm", action="store_true", help="If true, we take grad norm before adding to optim.")
+    parser.add_argument("--debias", action="store_true", help="If true, we mult by A_inv for mezo_single")
     parser.add_argument("--grad_clip", type=float, default=0.0, help="If >0, grad norm clipped.")
 
     
@@ -5787,8 +5859,17 @@ def main():
     parser.add_argument("--adam_variance", action="store_true", help="then during adaptive sampling we use m2 for the var term.")
     parser.add_argument("--reset_solver_after_plateau", type=int, default=-1) #TODO! not implemented yet
     parser.add_argument("--probe_dropout_rate", type=float, default=0.0)
+    parser.add_argument("--first_warmup_perturbations", type=int, default=-1)
     parser.add_argument("--overfit_to_one_batch_flag", action="store_true",
                         help="This will overfit to just one batch in train (not val) and is just to sanity check and ensure no bug, ensure train_loss hits 0 otherwise something is wrong.")
+
+    parser.add_argument(
+        "--precision", 
+        type=str, 
+        choices=["fp32", "fp16", "bf16"], 
+        default="fp32", 
+        help="Set precision mode: fp32, fp16, bf16."
+    )
     
     args= parser.parse_args()
 
@@ -5983,7 +6064,8 @@ def main():
             adaptive=args.adaptive, 
             eps_schedule_multiplier=args.eps_schedule_multiplier,
             variance_reduction = args.variance_reduction,
-            probe_dropout_rate = args.probe_dropout_rate
+            probe_dropout_rate = args.probe_dropout_rate,
+            first_warmup_perturbations = args.first_warmup_perturbations
     )
         
     # Warmup scheduler
@@ -5998,11 +6080,11 @@ def main():
 
     print("Optimizing the model")
     
-    dummy_data = torch.zeros(args.micro_batch_size,
-        args.minimum_starting_point_context_length,
-        args.input_size,
-        device=device
-    )
+    # dummy_data = torch.zeros(args.micro_batch_size,
+    #     args.minimum_starting_point_context_length,
+    #     args.input_size,
+    #     device=device
+    # )
 
     
     # # verbose = True
@@ -6088,6 +6170,9 @@ def main():
 
 
     print("here4")
+    pdor_schedule_iteration = 0
+    if args.tanh_dor_schedule:
+        sampler.probe_dropout_rate = 0.
     
     while True:
         #torch.cuda.reset_peak_memory_stats(device)        
@@ -6147,6 +6232,8 @@ def main():
                 x_emb =  x_ids # REALLY HACKKY! NEED TO FIX BUT JUST DOING THIS TO MAKE TEACHER FORCING WORK FOR TRANSFORMERS
                 
                 # loss_val, decorrelation_matrix, best_seed = train_micro_batch(model, x_emb, y_ids, criterion, optimizer, mezo_flavor, args, mezo_state, decorrelation_matrix, best_seed)
+
+                
                 
                 if args.tie_epsilon_to_lr_ratio>-1:
                     args.epsilon = args.tie_epsilon_to_lr_ratio * optimizer.param_groups[0]['lr']
@@ -6168,7 +6255,8 @@ def main():
                             fixed_size_perturbation=args.fixed_size_perturbation,
                             use_same_probe_for_all_perturbations=args.use_same_probe_for_all_perturbations,
                             use_same_eps_for_all_perturbations=args.use_same_eps_for_all_perturbations,
-                            aggregation_method=args.aggregation_method
+                            aggregation_method=args.aggregation_method,
+                            debias=args.debias
                         )
                         
                     elif args.mezo_flavor == "mezo_layerwise":
@@ -6313,7 +6401,7 @@ def main():
                 
                    
     
-                micro_loss_sum+= loss_val
+                micro_loss_sum += loss_val
                 #torch.cuda.empty_cache()
     
     
@@ -6350,13 +6438,13 @@ def main():
                 if p.grad is not None:
                     p.grad.div_(float(args.macro_batch_size))
     
-        # if args.grad_norm:
-        #     # Add gradient normalization
-        #     total_norm = torch.norm(torch.stack([torch.norm(p.grad) for p in model.parameters() if p.grad is not None]))
-        #     scale = 1.0 / (total_norm + 1e-6)  # Add epsilon to avoid division by zero
-        #     for p in model.parameters():
-        #         if p.grad is not None:
-        #             p.grad.mul_(scale)
+        if args.grad_norm:
+            # Add gradient normalization
+            total_norm = torch.norm(torch.stack([torch.norm(p.grad) for p in model.parameters() if p.grad is not None]))
+            scale = 1.0 / (total_norm + 1e-6)  # Add epsilon to avoid division by zero
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.mul_(scale)
         
         if args.grad_clip>0.0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -6467,8 +6555,8 @@ def main():
         vram_inferred = torch.cuda.max_memory_allocated(device)/1024**3
 
         msg= (f"Iter={iteration}, train_loss={train_loss:.3f}, "
-              f"LR={lr_current:.6f}, eps={args.epsilon:.6f}, vram_inferred={vram_inferred:.6f} GB iter_time={iteration_time:.2f}s, total_time={total_elapsed/60:.2f}m, "
-              f"context_len={current_context_len}, max_num={current_max_num}, gen_eff_token={gen_efficiency_gen_loss}, gen_eff_sample={gen_efficiency_val_loss}")
+              f"LR={lr_current:.6f}, dor {sampler.probe_dropout_rate}, eps={args.epsilon:.6f}, vram_inferred={vram_inferred:.6f} GB iter_time={iteration_time:.2f}s, total_time={total_elapsed/60:.2f}m, "
+              f"context_len={current_context_len}, max_num={current_max_num}, gen_eff_token={gen_efficiency_gen_loss}, gen_eff_sample={gen_efficiency_val_loss} ")
         print(f"Model has {num_params} parameters across {num_layers} layers.")
 
         print(msg)
@@ -6481,7 +6569,18 @@ def main():
 
         loss_ema_fast = 0.9 * loss_ema_fast + (1 - 0.9 ) * train_loss
         loss_ema_slow = 0.999 * loss_ema_slow + (1 - 0.999) * train_loss
-           
+
+        
+        # dor scheduler step, ablating..
+        ema_learning_rate = (loss_ema_fast-train_loss.item())
+        if args.tanh_dor_schedule and ema_learning_rate<.1 and iteration>50:
+            print(f"ema_learning_rate {ema_learning_rate}")
+            # we want to use 
+            
+            pdor_schedule_iteration += 1
+            sampler.probe_dropout_rate = min(args.probe_dropout_rate, 0.5 * (np.tanh(1 * (pdor_schedule_iteration / 200  - 0.5)) + 1))
+
+        
         
         if train_loss>100:
             raise Exception(f"Ending training train_loss diverging: {train_loss}")
@@ -6511,36 +6610,36 @@ def main():
                 # iterate on the train just to show accuracy as mezo makes it difficult to get a good gauge on accuracy as the model is not ever truly represented
 
                 
-                # fallback to your old code for RNN
-                generated_strs, generated_strs_with_padding, gen_ids_batch, probs_batch, train_loss, train_acc, train_acc_sample  = generate_sequence_batched(
-                    model=model,
-                    x_ids=x_ids,
-                    embed=embed,
-                    char_to_id=char_to_id,
-                    id_to_char=id_to_char,
-                    max_seq_len=args.max_seq_len,
-                    device=device,
-                    criterion=criterion,
-                    y_ids=y_ids
-                )
+                # # fallback to your old code for RNN
+                # generated_strs, generated_strs_with_padding, gen_ids_batch, probs_batch, train_loss, train_acc, train_acc_sample  = generate_sequence_batched(
+                #     model=model,
+                #     x_ids=x_ids,
+                #     embed=embed,
+                #     char_to_id=char_to_id,
+                #     id_to_char=id_to_char,
+                #     max_seq_len=args.max_seq_len,
+                #     device=device,
+                #     criterion=criterion,
+                #     y_ids=y_ids
+                # )
 
-                counter=0
-                for b in range(len(generated_strs)):
-                    print("="*30)
-                    print(f" [Sample {b}] Input: {cur_x[b]}")
-                    print(f" [Sample {b}] Target: {cur_y[b]}")
-                    print(f" [Sample {b}] Generated (w/ spec toks): {generated_strs_with_padding[b]}")
-                    print(f" [Sample {b}] Generated: {generated_strs[b]}")
-                    print(f" [Sample {b}] Token IDs: {gen_ids_batch[b]}")
-                    print(f" [Sample {b}] Probabilities: {probs_batch[b]}")
-                    print("="*30)
-                    counter+=1
-                    if counter>4:
-                        break
+                # counter=0
+                # for b in range(len(generated_strs)):
+                #     print("="*30)
+                #     print(f" [Sample {b}] Input: {cur_x[b]}")
+                #     print(f" [Sample {b}] Target: {cur_y[b]}")
+                #     print(f" [Sample {b}] Generated (w/ spec toks): {generated_strs_with_padding[b]}")
+                #     print(f" [Sample {b}] Generated: {generated_strs[b]}")
+                #     print(f" [Sample {b}] Token IDs: {gen_ids_batch[b]}")
+                #     print(f" [Sample {b}] Probabilities: {probs_batch[b]}")
+                #     print("="*30)
+                #     counter+=1
+                #     if counter>4:
+                #         break
                     
-                print(f"Generation loss: {train_loss}, Generation accuracy: {train_acc}, Generation sample accuracy: {train_acc_sample}")
-                print("="*30)
-                print("="*30)
+                # print(f"Generation loss: {train_loss}, Generation accuracy: {train_acc}, Generation sample accuracy: {train_acc_sample}")
+                # print("="*30)
+                # print("="*30)
 
                 # Generate Val Samples that are hold out numbers and seq length
             
@@ -6610,63 +6709,64 @@ def main():
                 # --------------------------------------------------------------------
                 # 2) Now do an auto-regressive generation pass
                 # --------------------------------------------------------------------
-                generated_strs,generated_strs_with_padding, gen_ids_batch, probs_batch, val_gen_loss, val_gen_acc, val_gen_acc_sample = generate_sequence_batched(
-                    model=model,
-                    x_ids=vx_ids,
-                    embed=embed,
-                    char_to_id=char_to_id,
-                    id_to_char=id_to_char,
-                    max_seq_len=args.max_seq_len,
-                    device=device,
-                    criterion=criterion,  # we pass it to measure cross-entropy while generating
-                    y_ids=vy_ids
-                )
+                # generated_strs,generated_strs_with_padding, gen_ids_batch, probs_batch, val_gen_loss, val_gen_acc, val_gen_acc_sample = generate_sequence_batched(
+                #     model=model,
+                #     x_ids=vx_ids,
+                #     embed=embed,
+                #     char_to_id=char_to_id,
+                #     id_to_char=id_to_char,
+                #     max_seq_len=args.max_seq_len,
+                #     device=device,
+                #     criterion=criterion,  # we pass it to measure cross-entropy while generating
+                #     y_ids=vy_ids
+                # )
+                generated_strs,generated_strs_with_padding, gen_ids_batch, probs_batch, val_gen_loss, val_gen_acc, val_gen_acc_sample = 0,0,0,0,0,0,0
     
-                # For debugging, let's print a few val random samples
-                sample_indices= random.sample(range(len(generated_strs)), min(3,len(generated_strs)))
-                print("\n[DEBUG] Random Val Samples:")
-                for idx in sample_indices:
-                    print(f"  [Val idx={idx}]")
-                    print(f"    Input:  '{vx[idx]}'")
-                    print(f"    Target: '{vy[idx]}'")
-                    print(f"    Generated(w/ spec toks): '{generated_strs_with_padding[idx]}'")
-                    generated_strs_with_padding
-                    print(f"    Generated: '{generated_strs[idx]}'")
-                    print(f"    Token IDs: {gen_ids_batch[idx]}")
-                    print(f"    Probabilities: {probs_batch[idx]}")
+                # # For debugging, let's print a few val random samples
+                # sample_indices= random.sample(range(len(generated_strs)), min(3,len(generated_strs)))
+                # print("\n[DEBUG] Random Val Samples:")
+                # for idx in sample_indices:
+                #     print(f"  [Val idx={idx}]")
+                #     print(f"    Input:  '{vx[idx]}'")
+                #     print(f"    Target: '{vy[idx]}'")
+                #     print(f"    Generated(w/ spec toks): '{generated_strs_with_padding[idx]}'")
+                #     generated_strs_with_padding
+                #     print(f"    Generated: '{generated_strs[idx]}'")
+                #     print(f"    Token IDs: {gen_ids_batch[idx]}")
+                #     print(f"    Probabilities: {probs_batch[idx]}")
                     
         
-                    # If you want to see raw token IDs:
-                    # print(f"    gen_ids_batch[idx] = {gen_ids_batch[idx]}")
+                #     # If you want to see raw token IDs:
+                #     # print(f"    gen_ids_batch[idx] = {gen_ids_batch[idx]}")
         
-                    # If you'd like to see probabilities for newly generated tokens:
-                    # print(f"    probs_batch[idx] = {probs_batch[idx]}")
+                #     # If you'd like to see probabilities for newly generated tokens:
+                #     # print(f"    probs_batch[idx] = {probs_batch[idx]}")
     
-                gen_efficiency_gen_loss = val_gen_loss * 100.0 / (total_estimated_vram_gb * (total_elapsed / 3600.0))
-                gen_efficiency_val_loss = val_loss * 100.0 / (total_estimated_vram_gb * (total_elapsed / 3600.0))
-                print(f"Generation loss: {val_gen_loss}, Generation accuracy: {val_gen_acc}, Generation sample accuracy: {val_gen_acc_sample}")
-                print(f"Generalization Efficiency:")
-                print(f"    VRAM: {total_estimated_vram_gb}")
-                print(f"    Wall-Clock Hrs: {total_elapsed / 3600.0}")
-                print(f"    val_gen_acc: {val_gen_acc}")
-                print(f"    val_gen_acc_sample: {val_gen_acc_sample}")
-                print(f"    Gen Eff (token): {gen_efficiency_gen_loss}")
-                print(f"    Gen Eff (sample): {gen_efficiency_val_loss}")
+                # gen_efficiency_gen_loss = val_gen_loss * 100.0 / (total_estimated_vram_gb * (total_elapsed / 3600.0))
+                # gen_efficiency_val_loss = val_loss * 100.0 / (total_estimated_vram_gb * (total_elapsed / 3600.0))
+                # print(f"Generation loss: {val_gen_loss}, Generation accuracy: {val_gen_acc}, Generation sample accuracy: {val_gen_acc_sample}")
+                # print(f"Generalization Efficiency:")
+                # print(f"    VRAM: {total_estimated_vram_gb}")
+                # print(f"    Wall-Clock Hrs: {total_elapsed / 3600.0}")
+                # print(f"    val_gen_acc: {val_gen_acc}")
+                # print(f"    val_gen_acc_sample: {val_gen_acc_sample}")
+                # print(f"    Gen Eff (token): {gen_efficiency_gen_loss}")
+                # print(f"    Gen Eff (sample): {gen_efficiency_val_loss}")
                     
-                print("="*30)
-                print("="*30)
+                # print("="*30)
+                # print("="*30)
     
-                print("[END DEBUG]\n")
+                # print("[END DEBUG]\n")
 
-                # check to see if we should update curriculum
-                new_ctx, new_mn, consecutive_succ= maybe_update_curriculum(train_acc, current_context_len, current_max_num, consecutive_succ)
-                if current_context_len!=new_ctx:
-                    print(f"!!!!! UPDATING CURRICULUM FROM {current_context_len} to {new_ctx}")
-                    print(f"!!!!! UPDATING CURRICULUM FROM {current_context_len} to {new_ctx}")
-                    print(f"!!!!! UPDATING CURRICULUM FROM {current_context_len} to {new_ctx}")
-                    # pdb.set_trace()
-                current_context_len= new_ctx
-                current_max_num= new_mn
+                # # check to see if we should update curriculum
+                # new_ctx, new_mn, consecutive_succ= maybe_update_curriculum(train_acc, current_context_len, current_max_num, consecutive_succ)
+                # if current_context_len!=new_ctx:
+                #     print(f"!!!!! UPDATING CURRICULUM FROM {current_context_len} to {new_ctx}")
+                #     print(f"!!!!! UPDATING CURRICULUM FROM {current_context_len} to {new_ctx}")
+                #     print(f"!!!!! UPDATING CURRICULUM FROM {current_context_len} to {new_ctx}")
+                #     # pdb.set_trace()
+                # current_context_len= new_ctx
+                # current_max_num= new_mn
 
             sys.stdout.flush()
         
