@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 NTM/DNC/Transformer code with ASCII tasks, plus:
@@ -34,6 +35,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import json
 
 ##############################################################################
 # GPU selection
@@ -1526,10 +1528,69 @@ class MambaEncoder(nn.Module):
 
 
 
+def update_args_from_file(args, file_path):
+    """
+    Read the JSON file and update args in memory if the keys exist 
+    and their values differ from the current args.
+    """
+    try:
+        changed = False
+        # Check if file exists before reading.
+        if os.path.exists(file_path):
+            with open(file_path, 'r', encoding='utf-8') as file:
+                content = file.read().strip()  # Remove extra whitespace
+                if content:  # Only proceed if the file is not empty.
+                    data = json.loads(content)
+
+                    override = data.get("override_with_interaction_file", True)
+                    if not override:
+                        # Do not update if override flag is False.
+                        print("No update bc override_with_interaction_file flag is false")
+                        return False
+                    
+                    # Loop through keys in the JSON data.
+                    for key, new_value in data.items():
+                        if hasattr(args, key):
+                            current_value = getattr(args, key)
+                            # For simplicity, only update if type is similar.
+                            if isinstance(current_value, bool):
+                                # Cast the value to bool if possible.
+                                new_value = bool(new_value)
+                            elif isinstance(current_value, int):
+                                new_value = int(new_value)
+                            elif isinstance(current_value, float):
+                                new_value = float(new_value)
+                            elif isinstance(current_value, str):
+                                new_value = str(new_value)
+                            
+                            # Only update if there is a change.
+                            if new_value != current_value:
+                                changed=True
+                                print(f"Training with updated configs {key} {current_value} -> {new_value}")
+                                setattr(args, key, new_value)
+                    #print(vars(args))
+    
+    except Exception as e:
+        print(f"An error occurred trying to update from the training_interaction_file: {e}")
+        
+    return changed
+
+def write_initial_config(args, file_path):
+    """
+    Write the initial args configuration to the file.
+    """
+    # Use vars(args) to convert the Namespace into a dictionary.
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        
+    with open(file_path, 'w', encoding='utf-8') as file:
+        json.dump(vars(args), file, indent=4)
+
+
+
 ############
 # DNC
 ##############
-
 class DNC(nn.Module):
     def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed, device=None):
             super(DNC, self).__init__()
@@ -2162,12 +2223,15 @@ def group_params_by_layer(named_params):
 #     avg_loss = total_loss / total_predicted_tokens
 #     return avg_loss
 
-def teacher_forcing_loss_emb(model, x_ids, y_ids_unpadded, criterion, chunk_size=32, x_emb=None):
+def teacher_forcing_loss_emb(model, x_ids, y_ids_unpadded, criterion, chunk_size=32, x_emb=None, return_predictions=False):
 
     try:
         
         if x_emb == None:
             x_emb = model.embed(x_ids)
+            
+        if x_emb.dtype != next(model.parameters()).dtype:
+            x_emb = x_emb.to(dtype=next(model.parameters()).dtype)
             
         B, Lx, E = x_emb.shape
         Ly = y_ids_unpadded.shape[1]
@@ -2202,10 +2266,17 @@ def teacher_forcing_loss_emb(model, x_ids, y_ids_unpadded, criterion, chunk_size
             # print(f"logits_2d size : {logits_2d.shape} gold size : {gold.shape}")
             # Calculate loss (similar to RNN branch)
             avg_loss = criterion(logits_2d, gold)
-            
-            return avg_loss  
+
+            if return_predictions:
+                preds = torch.argmax(logits_2d, dim=-1).reshape(y_ids_unpadded.shape)
+                return avg_loss, preds
+            else:
+                return avg_loss
+    
         else:
-            
+
+            if return_predictions:
+                all_preds = []
             hidden = None
             memory = None
             total_loss = 0.0
@@ -2213,7 +2284,6 @@ def teacher_forcing_loss_emb(model, x_ids, y_ids_unpadded, criterion, chunk_size
             
             # Process input sequence first
             pos = 0
-            # 1) If it's a Transformer or Mamba => single-pass causal approach
             while pos < Lx:
                 chunk_end = min(pos + chunk_size, Lx)
                 input_chunk = x_emb[:, pos:chunk_end, :]
@@ -2222,7 +2292,8 @@ def teacher_forcing_loss_emb(model, x_ids, y_ids_unpadded, criterion, chunk_size
                 hidden = hidden_new
                 memory = mem_new
                 pos = chunk_end
-        
+
+            
             # Now process target sequence chunk by chunk
             pos = 0
             while pos < Ly - 1:  # -1 because we don't embed the last target token
@@ -2247,13 +2318,22 @@ def teacher_forcing_loss_emb(model, x_ids, y_ids_unpadded, criterion, chunk_size
                     total_predicted_tokens += targets.size(0)
                 
                 pos = chunk_end
+                if return_predictions:
+                    pred_chunk = torch.argmax(out_chunk, dim=-1).reshape(targets.shape).detach()
+                    all_preds.append(pred_chunk)
+    
         
+
             if total_predicted_tokens == 0:
                 pdb.set_trace()
-                return 0.0
-        
-            avg_loss = total_loss / total_predicted_tokens # you have to do the average of averages
-            return avg_loss
+                return 0.0 if not return_predictions else (0.0, None)
+            
+            avg_loss = total_loss / total_predicted_tokens
+            if return_predictions:
+                preds = torch.cat(all_preds, dim=-1).reshape(y_ids_unpadded.size(0), -1)
+                return avg_loss, preds
+            else:
+                return avg_loss
 
     except torch.cuda.OutOfMemoryError as e:
         print(f"OOM in teacher_forcing_loss_emb: {str(e)}")
@@ -3664,6 +3744,8 @@ class MezoAdaptiveSamplingParallel:
         
         if self.adaptive:
             ratio_data = flatten_adam_ratio_data(self.model_main, optimizer)
+            # if fixed_size_perturbation:
+            #         ratio_data = ratio_data / (torch.norm(ratio_data) + 1e-8)
         else:
             ratio_data = 0
         
@@ -5787,7 +5869,7 @@ def profile_mezo(
 ##############################################################################
 def main():
     parser= argparse.ArgumentParser()
-    parser.add_argument("--arch", type=str, default="ntm", choices=["ntm","dnc","tra", "tdnc", "tntm", "simplelstm", "mamba"])
+    parser.add_argument("--arch", type=str, default="ntm", choices=["ntm","dnc","dnc_memory_efficient", "lstm_memory_efficient","tra", "tdnc", "tntm", "simplelstm", "mamba"])
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--task", type=str, default="copy",
                         choices=["copy","repeat_copy","associative_recall","add","sub","mul","div","fib","factorial","owt"])
@@ -5863,6 +5945,13 @@ def main():
     parser.add_argument("--overfit_to_one_batch_flag", action="store_true",
                         help="This will overfit to just one batch in train (not val) and is just to sanity check and ensure no bug, ensure train_loss hits 0 otherwise something is wrong.")
 
+    parser.add_argument("--override_with_interaction_file", action="store_true", help="If true, then we will update the values from the interaction file, if not, we wont.")
+
+    parser.add_argument("--tokenizer", type=str, default="char_level", choices=["hf", "char_level"])
+
+
+    
+
     parser.add_argument(
         "--precision", 
         type=str, 
@@ -5872,8 +5961,19 @@ def main():
     )
     
     args= parser.parse_args()
+    setattr(args, "override_with_interaction_file", False)
 
     print("here1")
+
+    
+    # Define your training interaction file path using a run name (or default).
+    training_interaction_file = f'./training_interaction_file_{args.wandb_run_name}.json'
+    
+    # Write the initial config to the file if it doesn’t exist.
+    if not os.path.exists(training_interaction_file):
+        write_initial_config(args, training_interaction_file)
+
+            
     
     verbose = False 
     torch.backends.cudnn.enabled = False
@@ -5896,30 +5996,40 @@ def main():
         device= torch.device("cpu")
         print("[INFO] Using CPU")
 
-    # build vocab
-    vocab_list, char_to_id, id_to_char = get_char_vocab()
-    vocab_size= len(vocab_list)
+    if args.tokenizer == "hf":
+        from transformers import AutoTokenizer
+        hf_tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        hf_tokenizer.pad_token = hf_tokenizer.eos_token  # avoid pad_token error if needed
+        vocab_size = hf_tokenizer.vocab_size
 
+    else:
+        vocab_list, char_to_id, id_to_char = get_char_vocab()
+        vocab_size = len(vocab_list)
+    
     mezo_flavor = args.mezo_flavor
 
-    vram_stats = calculate_vram_usage_direct(
-        args.arch,
-        args.hidden_size,
-        args.memory_size,
-        args.head_size,
-        args.num_heads,
-        args.input_size,
-        vocab_size,
-        args.micro_batch_size,
-        args.minimum_starting_point_context_length,
-        mezo_flavor,
-        True
-    )
-    total_estimated_vram_gb = vram_stats["total_estimated_gb"]
+    vram_stats = None
+    total_estimated_vram_gb = 0
+    # vram_stats = calculate_vram_usage_direct(
+    #     args.arch,
+    #     args.hidden_size,
+    #     args.memory_size,
+    #     args.head_size,
+    #     args.num_heads,
+    #     args.input_size,
+    #     vocab_size,
+    #     args.micro_batch_size,
+    #     args.minimum_starting_point_context_length,
+    #     mezo_flavor,
+    #     True
+    # )
+    if vram_stats is not None:
+        total_estimated_vram_gb = vram_stats["total_estimated_gb"]
 
     # wandb
     if args.wandb_proj is not None:
         msg = vars(args)
+        
         msg["total_estimated_vram_gb"] = total_estimated_vram_gb
         msg["total_samples_per_iter"] = total_samples_per_iter
         # setattr(args, "total_estimated_vram_gb", total_estimated_vram_gb)
@@ -5932,7 +6042,7 @@ def main():
         #                     name=args.wandb_run_name
         #                 )  # your credentials
         # run["parameters"] = args
-
+    
         # For custom mongo db:
         # run = init_run_mongo(
         #             db_url=db_url,
@@ -5959,13 +6069,17 @@ def main():
 
     print("here2")
 
-    # with torch.inference_mode():
+    # with torch.inference_mode():  
     
     # model
     if args.arch == "ntm":
         model = NTM(args.input_size, vocab_size, args.hidden_size, args.memory_size, args.head_size, args.num_heads, embed).to(device)
     elif args.arch == "dnc":
         model = DNC(args.input_size, vocab_size, args.hidden_size, args.memory_size, args.head_size, args.num_heads, embed, device=device)
+    # elif args.arch == "dnc_memory_efficient":
+    #     model = MemoryEfficientDNC(args.input_size, vocab_size, args.hidden_size, args.memory_size, args.head_size, args.num_heads, embed, device=device)
+    # elif args.arch == "lstm_memory_efficient":
+    #     model = MemoryEfficientLSTM(args.input_size, vocab_size, args.hidden_size, args.memory_size, args.head_size, args.num_heads, embed, device=device)
     elif args.arch == "tdnc":
         # TODO NOT TESTED YET
         model = TransformerMemoryDNC(args.input_size, vocab_size, args.hidden_size, args.memory_size, args.head_size, args.num_heads, embed).to(device)
@@ -5981,6 +6095,11 @@ def main():
         model = Transformer(args.input_size, vocab_size, args.hidden_size, args.memory_size, args.head_size, args.num_heads, embed).to(device) 
 
 
+    if args.precision in ["fp16", "bf16"]:
+        dtype = torch.float16 if args.precision == "fp16" else torch.bfloat16
+        model = model.to(dtype=dtype)
+        embed = embed.to(dtype=dtype)
+    
     num_params = sum(p.numel() for p in model.parameters())
     num_layers = len(list(model.children()))
 
@@ -6008,16 +6127,17 @@ def main():
     if args.cosine_lr:
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_iters, eta_min=args.learning_rate/1000)    
     else: 
-        pass
-        # # default is LR plateau
-        # scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        #             optimizer,
-        #             mode='min',  # Minimize the validation loss
-        #             factor=0.5,  # Reduce the LR by a factor of 0.5
-        #             patience=10000000,  # Number of validation epochs with no improvement
-        #             verbose=True,  # Log the change in LR
-        #             min_lr=1e-8   # Minimum learning rate
-        #         )
+        
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            threshold=0.001,
+            threshold_mode='abs', 
+            mode='min',  # Minimize the validation loss
+            factor=0.5,  # Reduce the LR by a factor of 0.5
+            patience=500,  # Number of validation epochs with no improvement
+            verbose=True,  # Log the change in LR
+            min_lr=1e-9   # Minimum learning rate
+        )
     
     criterion= nn.CrossEntropyLoss(ignore_index=0)
     global_step=0
@@ -6034,7 +6154,6 @@ def main():
     current_max_num= 15 # used only in arithmetic functions
 
     print("here3")
-    
 
     # lets make sure the user knows how the curriculum works
     # assert current_max_num <= args.max_num, "Must have max_num > 15"
@@ -6171,6 +6290,10 @@ def main():
 
     print("here4")
     pdor_schedule_iteration = 0
+
+    # for interaction file
+    manual_lr_mode_flag = False
+    
     if args.tanh_dor_schedule:
         sampler.probe_dropout_rate = 0.
     
@@ -6184,12 +6307,14 @@ def main():
         # we do a curriculum for train
 
         if not overfit_to_one_batch_flag:
-            this_sample_context_length = 1 + np.random.randint( 
-                                                minimum_starting_point_context_length, 
-                                                max(1,current_context_len+1)
-                            ) # always at least generate 1.
+            this_sample_context_length = args.minimum_starting_point_context_length
+            this_sample_max_num = args.max_num
+            # this_sample_context_length = 1 + np.random.randint( 
+            #                                     minimum_starting_point_context_length, 
+            #                                     max(1,current_context_len+1)
+            #                 ) # always at least generate 1.
             
-            this_sample_max_num = 1+np.random.randint(0,max(1,current_max_num)) # always at least generate 1.
+            # this_sample_max_num = 1+np.random.randint(0,max(1,current_max_num)) # always at least generate 1.
             
             x_strs, y_strs= generate_task_data(total_samples_per_iter, args.task,
                                                this_sample_context_length,
@@ -6203,6 +6328,8 @@ def main():
         # model.zero_grad()
 
         micro_loss_sum= 0.0
+
+        
     
 
         # micro/macro approach
@@ -6224,10 +6351,14 @@ def main():
     
 
                 if not overfit_to_one_batch_flag:
-                    
-                    x_ids= str_to_tensor(cur_x, char_to_id).to(device)
-                    y_ids= str_to_tensor(cur_y, char_to_id).to(device)
 
+                    if args.tokenizer == "hf":
+                        x_ids = hf_tokenizer(cur_x, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
+                        y_ids = hf_tokenizer(cur_y, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
+                    else:
+                        x_ids = str_to_tensor(cur_x, char_to_id).to(device)
+                        y_ids = str_to_tensor(cur_y, char_to_id).to(device)
+    
                 # x_emb= embed(x_ids)
                 x_emb =  x_ids # REALLY HACKKY! NEED TO FIX BUT JUST DOING THIS TO MAKE TEACHER FORCING WORK FOR TRANSFORMERS
                 
@@ -6235,7 +6366,7 @@ def main():
 
                 
                 
-                if args.tie_epsilon_to_lr_ratio>-1:
+                if args.tie_epsilon_to_lr_ratio>-1 and not manual_lr_mode_flag:
                     args.epsilon = args.tie_epsilon_to_lr_ratio * optimizer.param_groups[0]['lr']
     
                 
@@ -6468,75 +6599,76 @@ def main():
 
         train_loss = micro_loss_sum / args.macro_batch_size
 
-        # Warmup step, TODO, not sure how much this adds TBH.. should ablate
-        if warmup_counter <= args.warmup_steps:
-            warmup_scheduler.step() # should put counter inside of it. TODO
-            warmup_counter+=1
-        elif scheduler is not None:
-            
-            if args.cosine_lr:
-                # --- In your training loop, for example at the end of each epoch ---
-                if args.cosine_windowing:
-                    # Update the exponential moving average (EMA) for the training loss.
-                    # For the first epoch, initialize ema_loss with the current loss.
-                    if ema_loss is None:
-                        ema_loss = train_loss
-                    else:
-                        ema_loss = alpha * train_loss + (1 - alpha) * ema_loss
+        if not manual_lr_mode_flag: # if we do "change manually" we want to skip automatic schedules
+            # Warmup step, TODO, not sure how much this adds TBH.. should ablate
+            if warmup_counter <= args.warmup_steps:
+                warmup_scheduler.step() # should put counter inside of it. TODO
+                warmup_counter+=1
+            elif scheduler is not None:
                 
-                    # Append the current EMA to the history.
-                    ema_history.append(ema_loss)
-                
-                    # Only start comparing once we have enough history (i.e. after window_size epochs)
-                    if len(ema_history) >= args.schedule_loss_window:
-                        # The past EMA is taken from window_size epochs ago.
-                        ema_past = ema_history[-args.schedule_loss_window]
-                        
-                        print(f"  Current EMA: {ema_loss:.4f}, Past EMA (from {args.schedule_loss_window} epochs ago): {ema_past:.4f}")
-                
-                        # Check for improvement.
-                        # Here we define an improvement as the current EMA being lower than the past EMA by some minimally suff diff (e.g. 1e-8)
-                        if len(ema_history) >= args.reset_solver_after_plateau*args.schedule_loss_window+1:
-                            del ema_history[0] # start deleting because its just too big
-                        
-                        if ema_loss < ema_past - 1e-8:
-                            # Improvement detected: reset the patience counter.
-                            
-                            print("  Improved EMA (current < past). Resetting patience.")
+                if args.cosine_lr:
+                    # --- In your training loop, for example at the end of each epoch ---
+                    if args.cosine_windowing:
+                        # Update the exponential moving average (EMA) for the training loss.
+                        # For the first epoch, initialize ema_loss with the current loss.
+                        if ema_loss is None:
+                            ema_loss = train_loss
                         else:
-                            scheduler.step()
-                            print(f"  Not improving so scheduler stepped!")
-
-                            if len(ema_history) >= args.reset_solver_after_plateau*args.schedule_loss_window:
-                                ema_way_back_past = ema_history[0]
-                                if args.reset_solver_after_plateau>0 and ema_loss < ema_way_back_past - 1e-8:
-                                    # if this happens reset_solver_after_plateau times, then we just reset everything because we are lost.. 
-                                    print("----------")
-                                    print("  Resetting iteration, optim and schedulers because i am lost!")
-                                    print("----------")
-                                    
-                                    
-                                    warmup_counter = 0 #reset the warmup fresh and go again
-                                    raise Exception("should not be here anymore")
-                                    optimizer= optim.Adam(params, 
-                                                          lr=args.learning_rate, 
-                                                          weight_decay=args.weight_decay,  
-                                                          betas=(0.9, 0.999), eps=1e-08, amsgrad=False )
-                                    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer,
-                                                                                     T_max=args.max_iters, 
-                                                                                     eta_min=args.learning_rate/1000) 
-                                    warmup_scheduler = WarmupScheduler(
-                                        optimizer=optimizer,
-                                        warmup_steps= args.warmup_steps,
-                                        base_lr=1e-9,
-                                        final_lr=args.learning_rate
-                                        )
-                         
+                            ema_loss = alpha * train_loss + (1 - alpha) * ema_loss
+                    
+                        # Append the current EMA to the history.
+                        ema_history.append(ema_loss)
+                    
+                        # Only start comparing once we have enough history (i.e. after window_size epochs)
+                        if len(ema_history) >= args.schedule_loss_window:
+                            # The past EMA is taken from window_size epochs ago.
+                            ema_past = ema_history[-args.schedule_loss_window]
+                            
+                            print(f"  Current EMA: {ema_loss:.4f}, Past EMA (from {args.schedule_loss_window} epochs ago): {ema_past:.4f}")
+                    
+                            # Check for improvement.
+                            # Here we define an improvement as the current EMA being lower than the past EMA by some minimally suff diff (e.g. 1e-8)
+                            if len(ema_history) >= args.reset_solver_after_plateau*args.schedule_loss_window+1:
+                                del ema_history[0] # start deleting because its just too big
+                            
+                            if ema_loss < ema_past - 1e-8:
+                                # Improvement detected: reset the patience counter.
+                                
+                                print("  Improved EMA (current < past). Resetting patience.")
+                            else:
+                                scheduler.step()
+                                print(f"  Not improving so scheduler stepped!")
+    
+                                if len(ema_history) >= args.reset_solver_after_plateau*args.schedule_loss_window:
+                                    ema_way_back_past = ema_history[0]
+                                    # if args.reset_solver_after_plateau>0 and ema_loss < ema_way_back_past - 1e-8:
+                                    #     # if this happens reset_solver_after_plateau times, then we just reset everything because we are lost.. 
+                                    #     print("----------")
+                                    #     print("  Resetting iteration, optim and schedulers because i am lost!")
+                                    #     print("----------")
+                                        
+                                        
+                                    #     warmup_counter = 0 #reset the warmup fresh and go again
+                                    #     raise Exception("should not be here anymore")
+                                    #     optimizer= optim.Adam(params, 
+                                    #                           lr=args.learning_rate, 
+                                    #                           weight_decay=args.weight_decay,  
+                                    #                           betas=(0.9, 0.999), eps=1e-08, amsgrad=False )
+                                    #     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer,
+                                    #                                                      T_max=args.max_iters, 
+                                    #                                                      eta_min=args.learning_rate/1000) 
+                                    #     warmup_scheduler = WarmupScheduler(
+                                    #         optimizer=optimizer,
+                                    #         warmup_steps= args.warmup_steps,
+                                    #         base_lr=1e-9,
+                                    #         final_lr=args.learning_rate
+                                    #         )
+                             
+                    else:
+                        scheduler.step()
                 else:
-                    scheduler.step()
-            else:
-                scheduler.step(train_loss)
-                
+                    scheduler.step(train_loss)
+                    
     
         if verbose:
             pdb.set_trace()
@@ -6604,8 +6736,9 @@ def main():
                 # x_ids = str_to_tensor(cur_x, char_to_id, args.max_seq_len).to(device)  # [B, Lx]
                 # y_ids = str_to_tensor(cur_y, char_to_id, args.max_seq_len).to(device)  # [B, Ly]
             
-                x_ids = str_to_tensor(cur_x, char_to_id).to(device)  # [B, Lx]
-                y_ids = str_to_tensor(cur_y, char_to_id).to(device)  # [B, Ly]
+                # x_ids = str_to_tensor(cur_x, char_to_id).to(device)  # [B, Lx]
+                # y_ids = str_to_tensor(cur_y, char_to_id).to(device)  # [B, Ly]
+                
 
                 # iterate on the train just to show accuracy as mezo makes it difficult to get a good gauge on accuracy as the model is not ever truly represented
 
@@ -6648,16 +6781,16 @@ def main():
                 #                         minimum_starting_point_context_length, 
                 #                         max(1,current_context_len+1)
                 #     ) # always at least generate 1.
-                this_sample_context_length_for_val = 10
+                this_sample_context_length_for_val = this_sample_context_length
     
                 ### TURN THIS BACK ON IF YOU WANT TO SAMPLE FULL LENGTH.. BUT ITS SLOW..
                 # this_sample_context_length_for_val = 1+np.random.randint(args.input_sample_length, args.input_sample_length)
     
                 # this_sample_max_num_for_val = 1+np.random.randint(0,max(args.max_num,args.max_num)) # always at least generate 1.
-                this_sample_max_num_for_val = 10
+                this_sample_max_num_for_val = this_sample_max_num
                 
                 # TODO, maybe this should be different? can update later if we want
-                val_samples = 5 # total_samples_per_iter 
+                val_samples = args.micro_batch_size # total_samples_per_iter 
                 
                 # Generate a validation batch (vx, vy)
                 vx, vy= generate_task_data(val_samples, 
@@ -6667,6 +6800,10 @@ def main():
                                                train=False,
                                                ds = ds
                                           )
+
+                # ENSURE it is capped by this_sample_context_length_for_val
+                # vy = [v[:this_sample_context_length_for_val] for v in vy]
+
 
 
                 # if overfit_to_one_batch_flag:
@@ -6678,9 +6815,16 @@ def main():
                 # Convert to tensors
                 # vx_ids= str_to_tensor(vx, char_to_id, args.max_seq_len).to(device)
                 # vy_ids= str_to_tensor(vy, char_to_id, args.max_seq_len).to(device)
-                vx_ids= str_to_tensor(vx, char_to_id).to(device)
-                vy_ids= str_to_tensor(vy, char_to_id).to(device)
-        
+                
+
+                if args.tokenizer == "hf":
+                    vx_ids = hf_tokenizer(vx, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
+                    vy_ids = hf_tokenizer(vy, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
+                else:
+                    vx_ids = str_to_tensor(vx, char_to_id).to(device)
+                    vy_ids = str_to_tensor(vy, char_to_id).to(device)
+
+
                 # --------------------------------------------------------------------
                 # 1) Optionally, do a teacher-forced pass to measure "val_loss"
                 # --------------------------------------------------------------------
@@ -6703,8 +6847,27 @@ def main():
                 #             targets = vy_ids.contiguous().view(-1)  # [batch_size * seq_len]
             
                 #             val_loss= criterion(logits, targets)
-                val_loss = teacher_forcing_loss_emb(model, vx_emb, vy_ids, criterion).item()
 
+                # CAP vy_ids to 
+                val_loss, val_preds = teacher_forcing_loss_emb(model, vx_emb, vy_ids, criterion, return_predictions=True)
+                val_loss = val_loss.item()
+                if args.tokenizer == "hf":
+                    decode_fn = lambda ids: hf_tokenizer.batch_decode(ids, skip_special_tokens=True)
+                else:
+                    decode_fn = lambda ids: ["".join([id_to_char[i.item()] for i in seq if i.item() in id_to_char]) for seq in ids]
+                
+                decoded_preds = decode_fn(val_preds)
+                decoded_targets = decode_fn(vy_ids)
+                decoded_inputs = decode_fn(vx_ids)
+                
+                print("="*30)
+                print("Validation predictions:")
+                for i in range(min(len(decoded_preds), 5)):  # show up to 5 samples
+                    print(f"[Sample {i}] Input:    '{decoded_inputs[i]}'")
+                    print(f"[Sample {i}] Target:   '{decoded_targets[i]}'")
+                    print(f"[Sample {i}] Predicted:'{decoded_preds[i]}'")
+                print("="*30)
+                
             
                 # --------------------------------------------------------------------
                 # 2) Now do an auto-regressive generation pass
@@ -6720,6 +6883,7 @@ def main():
                 #     criterion=criterion,  # we pass it to measure cross-entropy while generating
                 #     y_ids=vy_ids
                 # )
+                
                 generated_strs,generated_strs_with_padding, gen_ids_batch, probs_batch, val_gen_loss, val_gen_acc, val_gen_acc_sample = 0,0,0,0,0,0,0
     
                 # # For debugging, let's print a few val random samples
@@ -6804,6 +6968,43 @@ def main():
                 try:
                     # if wandb
                     wandb.log(msg, step=iteration)
+                    changed = update_args_from_file(args, training_interaction_file)
+                    
+                    if changed:
+                        manual_lr_mode_flag = True # for the rest of training we are in manual mode, good luck!! :) 
+                        
+                        # Update optimizer hyperparameters in-place without resetting state.
+                        # (This assumes that the solver type remains unchanged.)
+                        for param_group in optimizer.param_groups:
+                            param_group['lr'] = args.learning_rate
+                            param_group['weight_decay'] = args.weight_decay
+                    
+                        # Update Adam-specific parameters if using Adam (assuming the solver type has not changed)
+                        if args.solver == "adam":
+                            # Note: Not all optimizer attributes can be safely updated in place.
+                            # Updating betas in this manner should be done with caution.
+                            optimizer.defaults['betas'] = (args.adam_beta1, args.adam_beta2)
+                            for param_group in optimizer.param_groups:
+                                param_group['betas'] = (args.adam_beta1, args.adam_beta2)
+                    
+                    
+                        # Update sampler parameters in place.
+                        sampler.num_perturbations    = args.num_perturbations
+                        sampler.adaptive             = args.adaptive
+                        sampler.eps_schedule_multiplier = args.eps_schedule_multiplier
+                        
+                        # args.epsilon is updated and the tying is turned off
+                        
+                        sampler.variance_reduction   = args.variance_reduction
+                        sampler.probe_dropout_rate   = args.probe_dropout_rate
+                        
+                        # Update any additional dynamic sampling parameters if needed.
+                        this_sample_context_length = args.minimum_starting_point_context_length
+                        this_sample_max_num        = args.max_num
+                        
+
+                                                
+                            
                     if train_loss<0.099:
                         print("FINISHED TRAINING")
                         return
