@@ -13,13 +13,17 @@ import wandb
 import math
 from datasets import load_dataset
 import random
+import numpy as np
 
 CHUNK_SIZE = 1048576
 
+############
+# DNC
+##############
 class DNC(nn.Module):
     def __init__(self, input_size, output_size, hidden_size, memory_size, head_size, num_heads, embed, device=None):
-        super(DNC, self).__init__()
-        with torch.inference_mode():
+            super(DNC, self).__init__()
+            # with torch.inference_mode():
             # Set the device for initialization
             self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             
@@ -60,93 +64,63 @@ class DNC(nn.Module):
     
             # Initialize parameters on GPU
             self.reset_parameters()
-
+    
+    
+    
+    
     def reset_parameters(self):
-        """Initialize parameters directly on the GPU"""
+        """Initialize parameters with appropriate distributions"""
         # Initialize LSTM params
         for name, p in self.controller.named_parameters():
             if 'weight' in name:
-                init_tensor = torch.zeros_like(p, device=self.device)
-                nn.init.orthogonal_(init_tensor)
-                p.data.copy_(init_tensor)
+                nn.init.orthogonal_(p)
             elif 'bias' in name:
-                p.data.zero_()
+                nn.init.constant_(p, 0)
     
-        # Initialize memory operation layers
+        # Initialize memory operation layers (TIGHTER INIT)
         for name, p in self.named_parameters():
             if 'fc_' in name and 'weight' in name:
-                init_tensor = torch.zeros_like(p, device=self.device)
-                nn.init.xavier_uniform_(init_tensor)
-                p.data.copy_(init_tensor)
+                # nn.init.uniform_(p, -0.1, 0.1)  # Original, potentially too wide
+                nn.init.xavier_uniform_(p)  # Or use Xavier initialization
             elif 'fc_' in name and 'bias' in name:
-                p.data.zero_()
-
+                nn.init.constant_(p, 0) # GOOD: Keep bias at 0
+                
     def _read_memory(self, memory, read_keys):
         """Read from memory using normalized attention."""
         # Normalize memory and keys
         memory_normalized = self.memory_norm(memory)
-        read_keys_norm = self.read_keys_norm(read_keys.view(-1, self.head_size)).view(-1, self.num_reads, self.head_size)
+        read_keys = self.read_keys_norm(read_keys.view(-1, self.head_size)).view(-1, self.num_reads, self.head_size)
 
         # Compute attention weights (no scaling, let LayerNorm handle it)
-        read_weights = torch.einsum('bnh,bmh->bnm', read_keys_norm, memory_normalized)
-        read_weights = torch.softmax(read_weights, dim=2)
+        read_weights = torch.softmax(
+            torch.einsum('bnh,bmh->bnm', read_keys, memory_normalized),
+            dim=2
+        )
         read_vectors = torch.einsum('bnm,bmh->bnh', read_weights, memory)
-        
-        # Free temporary tensors immediately
-        del memory_normalized, read_keys_norm, read_weights
-        
         return read_vectors
 
     def _write_memory(self, memory, write_keys, write_str, erase_vec, write_vec):
-        """Write to memory using normalized attention with in-place chunked updates to limit temporary VRAM usage."""
+        """Write to memory using normalized attention."""
         # Normalize memory and keys
         memory_normalized = self.memory_norm(memory)
-        write_keys_norm = self.write_keys_norm(write_keys)
-    
+        write_keys = self.write_keys_norm(write_keys)
+
         # Compute write weights
-        write_scores = torch.einsum('bh,bmh->bm', write_keys_norm, memory_normalized)
-        write_weights = torch.softmax(write_scores, dim=1).unsqueeze(1)  # Shape: [B, 1, memory_size]
-        
-        # Free no-longer-needed tensors
-        del memory_normalized, write_scores, write_keys_norm
-    
-        # Scale write weights by write strength (in-place)
-        write_weights.mul_(write_str.unsqueeze(1))
-        
-        # Compute erase and write contributions
+        write_weights = torch.softmax(
+            torch.einsum('bh,bmh->bm', write_keys, memory_normalized),
+            dim=1
+        ).unsqueeze(1)  # [B, 1, memory_size]
+
+        # Scale by write strength
+        write_weights = write_weights * write_str.unsqueeze(1)
+
+        # Erase and write operations
         erase = torch.einsum('bnm,bh->bmh', write_weights, erase_vec)
         write = torch.einsum('bnm,bh->bmh', write_weights, write_vec)
         
-        # Free write_weights as it's no longer needed
-        del write_weights
-    
-        # Update memory in small chunks along the memory dimension
-        chunk_size = 128  # Adjust based on your memory constraints
-        for i in range(0, memory.size(1), chunk_size):
-            cur_slice = slice(i, i + chunk_size)
-            mem_chunk = memory[:, cur_slice, :]
-            erase_chunk = erase[:, cur_slice, :]
-            write_chunk = write[:, cur_slice, :]
-            
-            # Instead of computing "1 - erase_chunk" over the whole memory,
-            # allocate a small temporary buffer for the current chunk.
-            temp_buf = mem_chunk.new_empty(erase_chunk.size())
-            temp_buf.fill_(1.0)
-            temp_buf.sub_(erase_chunk)  # Now temp_buf = 1 - erase_chunk (in-place)
-            
-            # In-place update of the memory chunk:
-            # mem_chunk = mem_chunk * (1 - erase_chunk) + write_chunk
-            mem_chunk.mul_(temp_buf)
-            mem_chunk.add_(write_chunk)
-            
-            # Free the temporary buffer for this chunk
-            del temp_buf
-    
-        # Clean up intermediate tensors
-        del erase, write
-    
+        # Update memory
+        memory = memory * (1 - erase) + write
         return memory
-
 
     def forward(self, x_emb, hidden=None, memory=None):
         B, L, E = x_emb.size()
@@ -169,26 +143,26 @@ class DNC(nn.Module):
             controller_input = torch.cat([x_emb[:, t, :], read_vec], dim=-1)
             controller_input = self.input_norm(controller_input)
             
-            # Controller forward pass
+            # Controller
             out_ctrl, hidden = self.controller(controller_input.unsqueeze(1), hidden)
             h = self.controller_norm(out_ctrl.squeeze(1))
 
-            # Generate memory parameters
+            # Memory parameters
             read_keys = self.fc_read_keys(h).view(B, self.num_reads, self.head_size)
             write_keys = self.fc_write_keys(h)
             write_str = torch.sigmoid(self.fc_write_strength(h))
             erase_vec = torch.sigmoid(self.fc_erase_vector(h))
             write_vec = torch.tanh(self.fc_add_vector(h))
 
-            # Update memory with in-place write
+            # Memory operations
             memory = self._write_memory(memory, write_keys, write_str, erase_vec, write_vec)
             read_vectors = self._read_memory(memory, read_keys)
             read_vec = read_vectors.reshape(B, -1)
 
-            # Project output directly to logits (vocab size)
+            # Output projection with normalization - project directly to logits
             output = torch.cat([h, read_vec], dim=-1)
             output = self.pre_output_norm(output)
-            logits = self.fc_proj(output)
+            logits = self.fc_proj(output)  # Direct projection to vocab size
             outputs.append(logits.unsqueeze(1))
 
         outputs = torch.cat(outputs, dim=1)
@@ -258,9 +232,9 @@ def reduce_mean_in_group(tensor, dst_rank, group, world_size):
     if rank != 0:          
         # Perform the reduction
         dist.reduce(tensor, dst=1, op=dist.ReduceOp.SUM, group=group)
-        if dist.get_rank() == dst_rank:
-            # dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
-            tensor.div_(group_size)
+        # if dist.get_rank() == dst_rank:
+        #     # dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
+        #     tensor.div_(group_size)
     
     return tensor
 
@@ -303,15 +277,23 @@ class MezoAdaptiveSamplingParallel:
                  probe_dropout_rate=0.99, 
                  epsilon=0.001,
                  beta1=0.9, 
-                 beta2=0.999, 
+                 beta2=0.999,
+                 adaptive=False,
+                 probe_normalization=False,
+                 gradient_normalization=False,
                  meta_perturbations=1,
+                 scatter_batch=False,
                  verbose=True):
         self.learning_rate = learning_rate
         self.probe_dropout_rate = probe_dropout_rate
         self.epsilon = epsilon  # initial; later tied 1:1 with lr
         self.beta1 = beta1
         self.beta2 = beta2
+        self.adaptive = adaptive
+        self.probe_normalization = probe_normalization
+        self.gradient_normalization = gradient_normalization
         self.meta_perturbations = meta_perturbations
+        self.scatter_batch = scatter_batch
         self.verbose = verbose
 
         # On Rank 1 and dirty ranks, model is provided.
@@ -342,7 +324,18 @@ class MezoAdaptiveSamplingParallel:
             elif rank>2: # dirty ranks, hold model + probe
                 self.probe_list = [torch.zeros_like(p, dtype=p.dtype, device=p.device) for p in self.param_list]
 
-    def distributed_step(self, x_ids, y, criterion, iteration, warmup_iters=100):
+
+
+
+
+
+
+
+
+
+
+    
+    def distributed_step(self, x_ids_list, y_list, criterion, iteration):
         
         rank = dist.get_rank()
         world_size = dist.get_world_size()
@@ -368,47 +361,59 @@ class MezoAdaptiveSamplingParallel:
         if self.verbose:
             log_end("Stage 0", rank)
         dist.barrier()
-        
-        # -------------------- Stage 0c: Broadcast x_ids and y from Rank 1 to Dirty Ranks --------------------
-        if self.verbose:
-            log_start("Stage 0c", rank)
-        
-        if rank >= 1:
-            if rank == 1:
-                x_shape = torch.tensor([x_ids.size(0), x_ids.size(1)], device=device, dtype=torch.long)
-                y_shape = torch.tensor([y.size(0), y.size(1)], device=device, dtype=torch.long)
-                x_ids = x_ids.to(device)
-                y = y.to(device)
-                if self.verbose:
-                    log_msg("Stage 0c", rank, f"Broadcasting shapes - x: {x_shape}, y: {y_shape}")
-                    log_msg("Stage 0c", rank, f"Broadcasting data - x: {x_ids.shape}, y: {y.shape}")
-            else:
-                x_shape = torch.zeros(2, device=device, dtype=torch.long)
-                y_shape = torch.zeros(2, device=device, dtype=torch.long)
-        
-            broadcast_in_group(x_shape, src_rank=1, group=self.group_except_zero)
-            broadcast_in_group(y_shape, src_rank=1, group=self.group_except_zero)
-            
-            if rank >= 2:
-                x_ids = torch.zeros((x_shape[0].item(), x_shape[1].item()), device=device, dtype=torch.long)
-                y = torch.zeros((y_shape[0].item(), y_shape[1].item()), device=device, dtype=torch.long)
-                if self.verbose:
-                    log_msg("Stage 0c", rank, f"Created receiving tensors - x: {x_ids.shape}, y: {y.shape}")
-            
-            broadcast_in_group(x_ids, src_rank=1, group=self.group_except_zero)
-            broadcast_in_group(y, src_rank=1, group=self.group_except_zero)
-            
-            if self.verbose:
-                if rank == 1:
-                    log_msg("Stage 0c", rank, f"Broadcast completed - x: {x_ids.shape}, y: {y.shape}")
-                elif rank >= 2:
-                    log_msg("Stage 0c", rank, f"Received data - x: {x_ids.shape}, y: {y.shape}, x[0,0]: {x_ids[0,0]}")
-        
-        dist.barrier()
-        if self.verbose:
-            log_end("Stage 0c", rank)
-    
+
         for meta_pert in range(self.meta_perturbations):
+
+            if rank >= 1:
+                x_ids = x_ids_list[meta_pert]
+                y = y_list[meta_pert]
+            
+            # -------------------- Stage 0c: Broadcast x_ids and y from Rank 1 to Dirty Ranks --------------------
+            # If not scatter_batch, then we overwrite each ranks x_ids and y from rank 1, else skip that step
+            if not self.scatter_batch:
+                if self.verbose:
+                    log_start("Stage 0c", rank)
+                
+                if rank >= 1:
+                    if rank == 1:
+                        # x_ids and y are both lists size meta_perturbations
+                        x_shape = torch.tensor([x_ids.size(0), x_ids.size(1)], device=device, dtype=torch.long)
+                        y_shape = torch.tensor([y.size(0), y.size(1)], device=device, dtype=torch.long)
+                        x_ids = x_ids.to(device)
+                        y = y.to(device)
+                        if self.verbose:
+                            log_msg("Stage 0c", rank, f"Broadcasting shapes - x: {x_shape}, y: {y_shape}")
+                            log_msg("Stage 0c", rank, f"Broadcasting data - x: {x_ids.shape}, y: {y.shape}")
+                    else:
+                        x_shape = torch.zeros(2, device=device, dtype=torch.long)
+                        y_shape = torch.zeros(2, device=device, dtype=torch.long)
+                
+                    broadcast_in_group(x_shape, src_rank=1, group=self.group_except_zero)
+                    broadcast_in_group(y_shape, src_rank=1, group=self.group_except_zero)
+                    
+                    if rank >= 2:
+                        x_ids = torch.zeros((x_shape[0].item(), x_shape[1].item()), device=device, dtype=torch.long)
+                        y = torch.zeros((y_shape[0].item(), y_shape[1].item()), device=device, dtype=torch.long)
+                        if self.verbose:
+                            log_msg("Stage 0c", rank, f"Created receiving tensors - x: {x_ids.shape}, y: {y.shape}")
+                    
+                    broadcast_in_group(x_ids, src_rank=1, group=self.group_except_zero)
+                    broadcast_in_group(y, src_rank=1, group=self.group_except_zero)
+                    
+                    if self.verbose:
+                        if rank == 1:
+                            log_msg("Stage 0c", rank, f"Broadcast completed - x: {x_ids.shape}, y: {y.shape}")
+                        elif rank >= 2:
+                            log_msg("Stage 0c", rank, f"Received data - x: {x_ids.shape}, y: {y.shape}, x[0,0]: {x_ids[0,0]}")
+                
+                dist.barrier()
+                if self.verbose:
+                    log_end("Stage 0c", rank)
+            else:
+                # Skip the broadcast of the rank 1 batch, let each use their own w/ their own random seed.
+                pass
+            
+        
     
             if self.verbose:
                 log_msg(f"Perturbation {meta_pert+1} of {self.meta_perturbations}", rank, "")
@@ -430,6 +435,8 @@ class MezoAdaptiveSamplingParallel:
             dist.barrier()
     
             # Stage 3b: Dirty ranks receive eps * adam_ratio from Rank 0 and add it to probe.
+        
+        
             if self.verbose:
                 log_start("Stage 3b", rank)
             
@@ -459,7 +466,7 @@ class MezoAdaptiveSamplingParallel:
                         temp_v = v_flat[start:end].clone()  # small chunk
                         temp_v.mul_(scaling2)
                         temp_v.sqrt_()
-                        temp_v.add_(1e-8)
+                        temp_v.add_(1e-8) # to prevent div by 0
             
                         # 4) ratio = m_hat / v_hat
                         ratio_buf[:chunk_size].div_(temp_v)
@@ -468,7 +475,7 @@ class MezoAdaptiveSamplingParallel:
                         dist.broadcast(ratio_buf[:chunk_size], src=0, async_op=True)
             
             elif rank == 1:
-                # Instead of allocating a full-size temp, allocate per-chunk (dropped afterwards)
+                # Instead of allocating a full-size temp, allocate per-chunk
                 for idx, p in enumerate(self.adam_ratio_list):
                     p_flat = p.view(-1)
                     for start in range(0, p_flat.numel(), CHUNK_SIZE):
@@ -485,7 +492,8 @@ class MezoAdaptiveSamplingParallel:
                         temp_chunk = p_flat.new_zeros(end - start)
                         dist.broadcast(temp_chunk, src=0, async_op=True)
                         # Add the received chunk (scaled) into the probe
-                        p_flat[start:end].add_(temp_chunk * self.epsilon)
+                        if self.adaptive:
+                            p_flat[start:end].add_(temp_chunk * self.epsilon)
             
             if self.verbose:
                 log_end("Stage 3b", rank)
@@ -510,7 +518,13 @@ class MezoAdaptiveSamplingParallel:
             if self.verbose:
                 log_start("Stage 3d", rank)
             if rank >= 2:
+                if self.probe_normalization:
+                    norm_val = torch.sqrt(sum(torch.sum(p)**2 for p in self.probe_list))
+                    # log_msg("Stage 3d", rank, f"probe norm = {norm_val}")
+                    
                 for param, probe in zip(self.param_list, probe_list):
+                    if self.probe_normalization:
+                        probe.div_(norm_val + 1e-8)
                     param.add_(probe)
             # dist.barrier()
             if self.verbose:
@@ -529,9 +543,19 @@ class MezoAdaptiveSamplingParallel:
                     log_msg("Stage 4", rank, f"Dirty loss = {loss}")
             else:
                 loss = torch.tensor(0.0, device=device)
+
+            # Ensure loss is a tensor
+            loss = torch.as_tensor(loss, device=device)
+            
+            # Sanitize loss: make 0 if NaN or Inf
+            if not torch.isfinite(loss):
+                log_msg("Stage 4", rank, f"Loss was NaN/Inf: {loss}, replacing with 0.")
+                loss = torch.tensor(0.0, device=device)
+
             dist.barrier()
             if self.verbose:
                 log_end("Stage 4", rank)
+                
         
             # -------------------- Stage 5: Gather Losses onto Rank 1 --------------------
             if self.verbose:
@@ -621,6 +645,18 @@ class MezoAdaptiveSamplingParallel:
         if self.verbose:
             log_start("Stage 10a", rank)
         if rank == 1:
+            global_perts = (world_size - 2) * self.meta_perturbations
+            # average over all perturbations
+            for p in self.avg_probe_list:
+                p.div_(global_perts)
+
+            # normalize the gradients if gradient_normalization
+            if self.gradient_normalization:
+                normed_val = torch.sqrt(sum(torch.sum(p)**2 for p in self.avg_probe_list) ) 
+                if normed_val != 0:  # Avoid division by zero
+                    for p in self.avg_probe_list:
+                        p.div_(normed_val)
+                
             for idx, p in enumerate(self.avg_probe_list):
                 p_flat = p.view(-1)
                 for start in range(0, p_flat.numel(), CHUNK_SIZE):
@@ -847,7 +883,7 @@ def generate_openwebtext_task_str(
     max_n=None,   # unused in OWT, but we keep the signature to match the others
     train: bool = True,
     min_total_seq_len=100,
-    vebose=False
+    verbose=False
 ):
     split_name = "train" if train else "validation"
 
@@ -902,7 +938,7 @@ def generate_openwebtext_task_str(
     max_out_len = max(len(i) for i in out_list)
     
 
-    if vebose:
+    if verbose:
         print(f"   Max lengths: max={max_out_len}")
         
         min_in_len = min(len(i) for i in in_list)
@@ -1047,69 +1083,23 @@ def main():
     os.environ["WANDB_API_KEY"] = ""
 
     # # train on real data 
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
-    # parser.add_argument("--mode", type=str, choices=["test", "train"], default="train", help="Run mode: test or train.")
-    # parser.add_argument("--max_iters", type=int, default=1e10, help="Maximum iterations for training.")
-    # parser.add_argument("--schedule_patience", type=int, default=1, help="Maximum iterations for training.")
-    # parser.add_argument("--learning_rate", type=float, default=0.0001, help="Base learning rate (and eps, tied 1:1).")
-    # parser.add_argument("--beta1", type=float, default=0.999, help="Base learning rate (and eps, tied 1:1).")
-    # parser.add_argument("--beta2", type=float, default=0.99999, help="Base learning rate (and eps, tied 1:1).")
-    # parser.add_argument("--epsilon", type=float, default=0.001, help="Perturbation scale epsilon (tied to learning rate).")
-    # parser.add_argument("--probe_dropout_rate", type=float, default=0.999, help="Dropout rate for probe vector.")
-    # parser.add_argument("--wandb_proj", type=str, default="DNC-SINGLE-DISTRIBUTED", help="WandB project name (optional)")
-    # parser.add_argument("--wandb_run", type=str, default="", help="WandB run name (optional)")
-    # parser.add_argument("--warmup_iters", type=int, default=100, help="Warmup iterations.")
-    # parser.add_argument("--cosine_wavelength", type=int, default=1000, help="Cosine LR wavelength, init to very high.")
-    # parser.add_argument("--val_iters", type=int, default=1000, help="Val iters, when we run val and log to wandb, and potentially checkpoint.")
-    # parser.add_argument("--meta_perturbations", type=int, default=1, help="Number of Perturbations for all ranks per step.")
-    # # parser.add_argument("--scatter_batch", type=str, choices=["true", "false"], default="false", help="whether each perturbation should be on a different batch, if true, we sample (world_size-2)*batch_size x_ids and y per iter and scatter it to .")
-    
-    # parser.add_argument(
-    #     "--precision", 
-    #     type=str, 
-    #     choices=["fp32", "fp16", "bf16", "fp8", "int8"], 
-    #     default="fp32", 
-    #     help="Set precision mode: fp32, fp16, bf16, fp8, int8."
-    # )
-    
-    # # New CLI arguments for model configuration
-    # parser.add_argument("--model_scale", type=int, default=1, help="Scaling factor for model dimensions.")
-    # parser.add_argument("--vocab_size", type=int, default=150, help="Vocabulary size.")
-    # parser.add_argument("--num_heads", type=int, default=1, help="# dnc heads.")
-    # parser.add_argument("--memory_size", type=int, default=2900, help="memory_size.")
-    # parser.add_argument("--hidden_size", type=int, default=2900, help="hidden_size.")
-    # parser.add_argument("--input_size", type=int, default=2900, help="Input size.")
-    # parser.add_argument("--head_size", type=int, default=2900, help="head_size .")
-    # parser.add_argument("--batch_size", type=int, default=1, help="Batch size.")
-    # parser.add_argument("--seq_len", type=int, default=1000, help="Sequence length.")
-    # args = parser.parse_args()
-
-
-
-
-
-
-    
-
-    # # TEST OVERFIT FAST DEMO! 
     parser = argparse.ArgumentParser()
     parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
-    parser.add_argument("--mode", type=str, choices=["test", "train"], default="test", help="Run mode: test or train.")
+    parser.add_argument("--mode", type=str, choices=["test", "train"], default="train", help="Run mode: test or train.")
     parser.add_argument("--max_iters", type=int, default=1e10, help="Maximum iterations for training.")
     parser.add_argument("--schedule_patience", type=int, default=1, help="Maximum iterations for training.")
     parser.add_argument("--learning_rate", type=float, default=0.001, help="Base learning rate (and eps, tied 1:1).")
-    parser.add_argument("--beta1", type=float, default=0.9, help="Base learning rate (and eps, tied 1:1).")
-    parser.add_argument("--beta2", type=float, default=0.9, help="Base learning rate (and eps, tied 1:1).")
+    parser.add_argument("--beta1", type=float, default=0.99, help="Base learning rate (and eps, tied 1:1).")
+    parser.add_argument("--beta2", type=float, default=0.999, help="Base learning rate (and eps, tied 1:1).")
     parser.add_argument("--epsilon", type=float, default=0.001, help="Perturbation scale epsilon (tied to learning rate).")
-    parser.add_argument("--probe_dropout_rate", type=float, default=0.99, help="Dropout rate for probe vector.")
-    parser.add_argument("--wandb_proj", type=str, default="ZeroProp_Final_Runs", help="WandB project name (optional)")
+    parser.add_argument("--probe_dropout_rate", type=float, default=0.0, help="Dropout rate for probe vector.")
+    parser.add_argument("--wandb_proj", type=str, default="ZeroProp_Final_Runs_REALDATA", help="WandB project name (optional)")
     parser.add_argument("--wandb_run", type=str, default="", help="WandB run name (optional)")
-    parser.add_argument("--warmup_iters", type=int, default=5, help="Warmup iterations.")
-    parser.add_argument("--cosine_wavelength", type=int, default=100000000, help="Cosine LR wavelength, init to very high.")
+    parser.add_argument("--warmup_iters", type=int, default=1, help="Warmup iterations.")
+    parser.add_argument("--cosine_wavelength", type=int, default=100000, help="Cosine LR wavelength, init to very high.")
     parser.add_argument("--val_iters", type=int, default=10, help="Val iters, when we run val and log to wandb, and potentially checkpoint.")
-    parser.add_argument("--meta_perturbations", type=int, default=1, help="Number of Perturbations for all ranks per step.")
-    
+    parser.add_argument("--meta_perturbations", type=int, default=10, help="Number of Perturbations for all ranks per step.")
+    parser.add_argument("--scatter_batch", type=str, choices=["true", "false"], default="true", help="whether each perturbation should be on a different batch, if true, we sample (world_size-2)*batch_size x_ids and y per iter and scatter it to the appropriate ranks.")
     
     # parser.add_argument(
     #     "--precision", 
@@ -1118,9 +1108,6 @@ def main():
     #     default="fp32", 
     #     help="Set precision mode: fp32, fp16, bf16, fp8, int8."
     # )
-
-    # model_size = 100 == 1,603,290,101 and takes 35GB
-    # model_size = 10 == 16,0329,010 and takes 35GB
     
     # New CLI arguments for model configuration
     parser.add_argument("--model_scale", type=int, default=1, help="Scaling factor for model dimensions.")
@@ -1130,15 +1117,85 @@ def main():
     parser.add_argument("--hidden_size", type=int, default=2900, help="hidden_size.")
     parser.add_argument("--input_size", type=int, default=2900, help="Input size.")
     parser.add_argument("--head_size", type=int, default=2900, help="head_size .")
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size.")
-    parser.add_argument("--seq_len", type=int, default=1000, help="Sequence length.")
-
-
+    parser.add_argument("--batch_size", type=int, default=32*4, help="Batch size.")
+    parser.add_argument("--seq_len", type=int, default=10, help="Sequence length.")
+    parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
+    parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the final gradient before updating the model weights.")
+    parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="false", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
     args = parser.parse_args()
+
+
+
+
+
+
+    
+
+    # # # TEST OVERFIT FAST DEMO! 
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
+    # parser.add_argument("--mode", type=str, choices=["test", "train"], default="test", help="Run mode: test or train.")
+    # parser.add_argument("--max_iters", type=int, default=1e10, help="Maximum iterations for training.")
+    # parser.add_argument("--schedule_patience", type=int, default=1, help="Maximum iterations for training.")
+    # parser.add_argument("--learning_rate", type=float, default=0.001, help="Base learning rate (and eps, tied 1:1).")
+    # parser.add_argument("--beta1", type=float, default=0.9, help="Base learning rate (and eps, tied 1:1).")
+    # parser.add_argument("--beta2", type=float, default=0.9, help="Base learning rate (and eps, tied 1:1).")
+    # parser.add_argument("--epsilon", type=float, default=0.001, help="Perturbation scale epsilon (tied to learning rate).")
+    # parser.add_argument("--probe_dropout_rate", type=float, default=0., help="Dropout rate for probe vector.")
+    # parser.add_argument("--wandb_proj", type=str, default="ZeroProp_Final_Runs2", help="WandB project name (optional)")
+    # parser.add_argument("--wandb_run", type=str, default="", help="WandB run name (optional)")
+    # parser.add_argument("--warmup_iters", type=int, default=1, help="Warmup iterations.")
+    # parser.add_argument("--cosine_wavelength", type=int, default=100000000, help="Cosine LR wavelength, init to very high.")
+    # parser.add_argument("--val_iters", type=int, default=10, help="Val iters, when we run val and log to wandb, and potentially checkpoint.")
+    # parser.add_argument("--meta_perturbations", type=int, default=1, help="Number of Perturbations for all ranks per step.")
+    # parser.add_argument("--scatter_batch", type=str, choices=["true", "false"], default="false", help="whether each perturbation should be on a different batch, if true, we sample (world_size-2)*batch_size x_ids and y per iter and scatter it to the appropriate ranks.")
+    
+    
+    # # parser.add_argument(
+    # #     "--precision", 
+    # #     type=str, 
+    # #     choices=["fp32", "fp16", "bf16", "fp8", "int8"], 
+    # #     default="fp32", 
+    # #     help="Set precision mode: fp32, fp16, bf16, fp8, int8."
+    # # )
+
+    # # model_size = 100 == 1,603,290,101 and takes 35GB
+    # # model_size = 10 == 16,0329,010 and takes 35GB
+    
+    # # New CLI arguments for model configuration
+    # parser.add_argument("--model_scale", type=int, default=1, help="Scaling factor for model dimensions.")
+    # parser.add_argument("--vocab_size", type=int, default=150, help="Vocabulary size.")
+    # parser.add_argument("--num_heads", type=int, default=1, help="# dnc heads.")
+    # parser.add_argument("--memory_size", type=int, default=128, help="memory_size.")
+    # parser.add_argument("--hidden_size", type=int, default=128, help="hidden_size.")
+    # parser.add_argument("--input_size", type=int, default=128, help="Input size.")
+    # parser.add_argument("--head_size", type=int, default=128, help="head_size .")
+    # parser.add_argument("--batch_size", type=int, default=1, help="Batch size.")
+    # parser.add_argument("--seq_len", type=int, default=10, help="Sequence length.")
+
+
+    # parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
+    # parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the final gradient before updating the model weights.")
+    # parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="true", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
+    # args = parser.parse_args()
 
     #####################################################################################
     # SETUP TRAINING
     #####################################################################################
+
+    vocab_list, char_to_id, id_to_char = get_char_vocab()
+    vocab_size = len(vocab_list)
+    
+    args.vocab_size = vocab_size
+
+    # Derived values based on model_scale
+    args.hidden_size = args.hidden_size * args.model_scale
+    args.memory_size = args.memory_size * args.model_scale
+    args.head_size = args.head_size * args.model_scale
+    args.input_size = args.input_size * args.model_scale
+    args.num_heads = args.num_heads * args.model_scale # added recently
+
+
     run_name = f"{args.mode}_lr{args.learning_rate}_scale{args.model_scale}_pdrop{args.probe_dropout_rate}"
     
     # Add model architecture details
@@ -1154,16 +1211,6 @@ def main():
     if args.wandb_run=="":
          args.wandb_run = run_name + model_params + train_params + opt_params
     
-    vocab_list, char_to_id, id_to_char = get_char_vocab()
-    vocab_size = len(vocab_list)
-    
-    args.vocab_size = vocab_size
-
-    # Derived values based on model_scale
-    args.hidden_size = args.hidden_size * args.model_scale
-    args.memory_size = args.memory_size * args.model_scale
-    args.head_size = args.head_size * args.model_scale
-    args.input_size = args.input_size * args.model_scale
 
     # TEMP OVERRIDE FOR NOW SO WE CAN DEBUG
     # args.wandb_proj = None
@@ -1195,11 +1242,21 @@ def main():
         model.eval()
     
     criterion = nn.CrossEntropyLoss().to(device)
+    args.scatter_batch = True if args.scatter_batch == "true" else False 
     
     if rank != 0:
 
-        x_ids = torch.randint(0, args.vocab_size, (args.batch_size, args.seq_len), device=device, dtype=torch.long) # PLACEHOLDER
-        y = torch.randint(0, args.vocab_size, (args.batch_size, args.seq_len), device=device) # PLACEHOLDER
+        x_ids = []
+        y = []
+        
+        for j in range(args.meta_perturbations):
+            if j==0:
+                # if scatter_batch, we want to sample only one batch and use that same batch for all perturbations on each rank each meta_pert. This only is important if args.mode == test really.
+                x_ids_temp = torch.randint(0, args.vocab_size, (args.batch_size, args.seq_len), device=device, dtype=torch.long) # PLACEHOLDER
+                y_temp = torch.randint(0, args.vocab_size, (args.batch_size, args.seq_len), device=device) # PLACEHOLDER
+            x_ids.append(x_ids_temp)
+            y.append(y_temp)
+        
 
         
         if rank == 1:
@@ -1224,7 +1281,11 @@ def main():
         epsilon=args.epsilon,
         beta1=args.beta1,
         beta2=args.beta2,
+        adaptive=args.adaptive=="true",
+        probe_normalization=args.probe_normalization=="true",
+        gradient_normalization=args.gradient_normalization=="true",
         meta_perturbations=args.meta_perturbations,
+        scatter_batch = args.scatter_batch,
         verbose=verbose
     )
     dist.barrier()
@@ -1255,30 +1316,29 @@ def main():
         print("[Rank 1] Initialized wandb logging.")
 
     #####################################################################################
-    # Load the dataset
+    # Load the dataset on all ranks (dont need rank 0, but thats ok)
     #####################################################################################
-    if rank == 1:
-        # generate OWT 
-        ds = None
-        iterr = 0
-        while True:
-            try:
-                ds = load_dataset(
-                    "haritzpuerto/the_pile_00_OpenWebText2",
-                    split="train",
-                    # cache_dir="/hf_cache/",
-                    # use_auth_token=False,  # Disable authentication to avoid API calls
-                    download_mode="reuse_dataset_if_exists"  # Reuse the cached dataset
-                )
-                break
-            except Exception as e:
-                print("Hugging face issue...")
-                print(e)
-                time.sleep(5)
-                iterr+=1
-                if iterr>100:
-                    raise Exception("HUGGING FACE ISSUES AGAIN!")
-        print("Got the OWT dataset!")
+    # generate OWT 
+    ds = None
+    iterr = 0
+    while True:
+        try:
+            ds = load_dataset(
+                "haritzpuerto/the_pile_00_OpenWebText2",
+                split="train",
+                # cache_dir="/hf_cache/",
+                # use_auth_token=False,  # Disable authentication to avoid API calls
+                download_mode="reuse_dataset_if_exists"  # Reuse the cached dataset
+            )
+            break
+        except Exception as e:
+            print("Hugging face issue...")
+            print(e)
+            time.sleep(5)
+            iterr+=1
+            if iterr>100:
+                raise Exception("HUGGING FACE ISSUES AGAIN!")
+    print("Got the OWT dataset!")
                 
     #####################################################################################
     # START TRAINING
@@ -1291,30 +1351,36 @@ def main():
             #####################################################################################
             # Sample x_ids,y from dataset
             #####################################################################################
-            if rank == 1 and args.mode == "train":
+            
+            if args.mode == "train":
+                x_ids = []
+                y = []
 
-                # GENERATE TRAIN BATCH
-                x_strs, y_strs = generate_openwebtext_task_str(
-                                            args.batch_size,
-                                            1,
-                                            ds,
-                                            train = True,
-                                            min_total_seq_len=args.seq_len,
-                                            vebose = False
-                                        )  
-                
-                x_ids = str_to_tensor(x_strs, char_to_id).to(device)
-                y = str_to_tensor(y_strs, char_to_id).to(device)
-
-                if verbose:
-                    print(f" x_ids {x_ids.shape} y {y.shape}" )
+                for j in range(args.meta_perturbations):
+                    # GENERATE TRAIN BATCH
+                    x_strs, y_strs = generate_openwebtext_task_str(
+                                                args.batch_size,
+                                                1,
+                                                ds,
+                                                train = True,
+                                                min_total_seq_len=args.seq_len,
+                                                verbose = False
+                                            )  
+                    
+                    x_ids_temp = str_to_tensor(x_strs, char_to_id).to(device)
+                    y_temp = str_to_tensor(y_strs, char_to_id).to(device)
+                    x_ids.append(x_ids_temp)
+                    y.append(y_temp)
+    
+                    if verbose:
+                        print(f" x_ids {x_ids_temp.shape} y {y_temp.shape}" )
                     
             dist.barrier()
                     
             #####################################################################################
             # TRAIN THE MODEL
             #####################################################################################
-            train_loss = distributed_adaptive.distributed_step(x_ids, y, criterion, iteration=i, warmup_iters=args.warmup_iters)
+            train_loss = distributed_adaptive.distributed_step(x_ids, y, criterion, iteration=i)
 
 
             #####################################################################################
@@ -1386,7 +1452,7 @@ def main():
                                                     ds,
                                                     train = False,
                                                     min_total_seq_len=args.seq_len,
-                                                    vebose = False
+                                                    verbose = False
                                                 )  
                         
                         x_ids = str_to_tensor(x_strs, char_to_id).to(device)
