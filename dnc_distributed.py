@@ -278,6 +278,7 @@ class MezoAdaptiveSamplingParallel:
                  epsilon=0.001,
                  beta1=0.9, 
                  beta2=0.999,
+                 adam=True,
                  adaptive=False,
                  probe_normalization=False,
                  gradient_normalization=False,
@@ -289,6 +290,7 @@ class MezoAdaptiveSamplingParallel:
         self.epsilon = epsilon  # initial; later tied 1:1 with lr
         self.beta1 = beta1
         self.beta2 = beta2
+        self.adam = adam
         self.adaptive = adaptive
         self.probe_normalization = probe_normalization
         self.gradient_normalization = gradient_normalization
@@ -310,6 +312,9 @@ class MezoAdaptiveSamplingParallel:
         self.adam_ratio_list = None # this will exist only on rank 1
         self.probe_list = None  # this will exist only on rank 2+
 
+        # if self.adam:
+        self.clean_rank = 1
+
         # Create a persistent group for all ranks except rank 0.
         if rank == 0: # adam rank, hold both adam moments
             self.group_except_zero = None
@@ -318,6 +323,7 @@ class MezoAdaptiveSamplingParallel:
             self.param_list = None
             self.adam_v = [torch.zeros_like(p) for p in self.adam_m]
         else:
+            
             self.group_except_zero = create_group_except_rank0()
             if rank == 1: # clean rank, hold model + adam_ratio
                 self.adam_ratio_list = [torch.zeros_like(p, dtype=p.dtype, device=p.device) for p in self.param_list]
@@ -325,17 +331,279 @@ class MezoAdaptiveSamplingParallel:
                 self.probe_list = [torch.zeros_like(p, dtype=p.dtype, device=p.device) for p in self.param_list]
 
 
-
-
-
-
+        # else:
+        #     self.clean_rank = 0
+        #     # we have no adam_m or adam_v to concern ourselves with. 
+        #     # so lets use ranks 1-n for perturbations and rank 0 for clean and model update.
+        #     self.group_all = dist.new_group(list(range(dist.get_world_size())))
+            
+        #     # Rank 0 holds clean model and estimated gradient
+        #     if rank == 0:
+        #         self.avg_probe_list = [torch.zeros_like(p, dtype=p.dtype, device=p.device) for p in self.param_list]
+        #     # Ranks 1+ hold dirty models and probes
+        #     else:
+        #         self.probe_list = [torch.zeros_like(p, dtype=p.dtype, device=p.device) for p in self.param_list]
 
 
 
 
 
     
-    def distributed_step(self, x_ids_list, y_list, criterion, iteration):
+    def distributed_step_SPSA(self, x_ids_list, y_list, criterion, iteration):
+        
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        device = self.param_list[0].device if self.param_list is not None else torch.device(f"cuda:{rank}")
+        
+        current_lr = self.learning_rate 
+        self.epsilon = current_lr  # Tie epsilon to learning rate
+        
+        dist.barrier()
+    
+        # -------------------- Stage 0: Broadcast Clean theta_t from Rank 0 to Dirty Ranks --------------------
+        if self.verbose:
+            log_start("Stage 0", rank)
+        for p in self.param_list:
+            dist.broadcast(p, src=0, group=self.group_all)
+        if self.verbose:
+            weight_decay_loss = 0.0
+            for param in self.model.parameters():
+                weight_decay_loss += torch.sum(param)
+            log_msg("Stage 0: weight_decay_loss: ", rank, f"{weight_decay_loss}.")
+            log_end("Stage 0", rank)
+        dist.barrier()
+    
+        for meta_pert in range(self.meta_perturbations):
+            if self.verbose:
+                log_msg(f"Perturbation {meta_pert+1} of {self.meta_perturbations}", rank, "")
+            
+            # -------------------- Stage 0c: Broadcast x_ids and y from Rank 1 to All Ranks --------------------
+            if not self.scatter_batch:
+                if self.verbose:
+                    log_start("Stage 0c", rank)
+                    
+                # Select data based on perturbation index
+                if rank == 0:  # First dirty rank has the data
+                    x_ids = x_ids_list[meta_pert] if isinstance(x_ids_list, list) else x_ids_list
+                    y = y_list[meta_pert] if isinstance(y_list, list) else y_list
+                    
+                    # Prepare shapes for broadcasting
+                    x_shape = torch.tensor([x_ids.size(0), x_ids.size(1)], device=device, dtype=torch.long)
+                    y_shape = torch.tensor([y.size(0), y.size(1)], device=device, dtype=torch.long)
+                    
+                    if self.verbose:
+                        log_msg("Stage 0c", rank, f"Broadcasting shapes - x: {x_shape}, y: {y_shape}")
+                        log_msg("Stage 0c", rank, f"Broadcasting data - x: {x_ids.shape}, y: {y.shape}")
+                else:
+                    x_shape = torch.zeros(2, device=device, dtype=torch.long)
+                    y_shape = torch.zeros(2, device=device, dtype=torch.long)
+                
+                # Broadcast shapes from rank 1 to other dirty ranks
+                dist.broadcast(x_shape, src=0, group=self.group_all)
+                dist.broadcast(y_shape, src=0, group=self.group_all)
+                
+                # Create receiving tensors on other dirty ranks
+                if rank >= 1:
+                    x_ids = torch.zeros((x_shape[0].item(), x_shape[1].item()), device=device, dtype=torch.long)
+                    y = torch.zeros((y_shape[0].item(), y_shape[1].item()), device=device, dtype=torch.long)
+                    
+                    if self.verbose:
+                        log_msg("Stage 0c", rank, f"Created receiving tensors - x: {x_ids.shape}, y: {y.shape}")
+                
+                dist.broadcast(x_ids, src=0, group=self.group_all)
+                dist.broadcast(y, src=0, group=self.group_all)
+                
+                
+                if self.verbose:
+                    log_end("Stage 0c", rank)
+                
+            dist.barrier()
+            
+                
+            
+            # -------------------- Stage 1: Dirty Ranks Generate Probes --------------------
+            if self.verbose:
+                log_start("Stage 1", rank)
+            
+            if rank >= 1:  # All ranks except 0 are dirty
+                # Generate probes:  self.probe_list = probe * eps
+                for i, p in enumerate(self.param_list):
+                    probe = torch.zeros_like(p)
+                    probe.normal_(mean=0, std=1)
+                    ## NOTE mul by self.epsilon was here before
+                    probe.mul_(self.epsilon)
+                    self.probe_list[i] = probe
+                
+                # Apply dropout to probes if needed
+                if self.probe_dropout_rate > 0:
+                    for probe in self.probe_list:
+                        mask = (torch.rand_like(probe) > self.probe_dropout_rate).float()
+                        probe.mul_(mask)
+                
+                # Normalize probes if requested
+                if self.probe_normalization:
+                    norm_val = torch.sqrt(sum(torch.sum(p**2) for p in self.probe_list))
+                    if norm_val > 1e-8:
+                        for probe in self.probe_list:
+                            probe.div_(norm_val)
+                
+                    # now apply eps again
+                    for probe in self.probe_list:
+                        probe.mul_(self.epsilon)
+                
+                # Apply probes to create dirty model
+                for param, probe in zip(self.param_list, self.probe_list):
+                    param.add_(probe)
+                    probe.div_(self.epsilon) # need to take epsilon out of the probe bc its eps * probe right now
+                    
+
+
+                if self.verbose:
+                    log_msg("Stage 1", rank, f"Generated and applied probe to parameters")
+            
+            if self.verbose:
+                log_end("Stage 1", rank)
+            
+            dist.barrier()
+            
+            # -------------------- Stage 2: Compute Loss on All Ranks --------------------
+            if self.verbose:
+                log_start("Stage 2", rank)
+            
+            # All ranks compute loss
+            loss = teacher_forcing_loss_emb_parallel(self.model, x_ids, y, criterion)
+            
+            # Ensure loss is a tensor and sanitize
+            loss = torch.as_tensor(loss, device=device)
+            if not torch.isfinite(loss):
+                log_msg("Stage 2", rank, f"Loss was NaN/Inf: {loss}, replacing with 0.")
+                loss = torch.tensor(0.0, device=device)
+            
+            if self.verbose:
+                if rank == 0:
+                    log_msg("Stage 2", rank, f"Clean loss = {loss}")
+                else:
+                    log_msg("Stage 2", rank, f"Dirty loss = {loss}")
+            
+            if self.verbose:
+                log_end("Stage 2", rank)
+            
+            dist.barrier()
+            
+            # -------------------- Stage 3: Broadcast Clean Loss and Compute Gradient Estimates --------------------
+            if self.verbose:
+                log_start("Stage 3", rank)
+            
+            # Broadcast clean loss from rank 0 to all ranks
+            clean_loss = loss if rank == 0 else torch.tensor(0.0, device=device)
+            dist.broadcast(clean_loss, src=0, group=self.group_all)
+            
+            # All ranks compute their own gradient estimate
+            if rank >= 1:
+                grad_est = (loss - clean_loss) / (self.epsilon)
+                
+                # Scale probes by gradient estimate
+                for probe in self.probe_list:
+                    probe.mul_(grad_est)
+                
+                if self.verbose:
+                    log_msg("Stage 3", rank, f"Computed grad_est={grad_est} and scaled probe")
+            
+            if self.verbose:
+                log_end("Stage 3", rank)
+            
+            dist.barrier()
+            
+            # -------------------- Stage 4: Reduce Scaled Probes to Rank 0 --------------------
+            if self.verbose:
+                log_start("Stage 4", rank)
+            
+            # Initialize/reset avg_probe_list for first perturbation
+            if rank == 0: 
+                if meta_pert == 0:
+                    for probe in self.avg_probe_list:
+                        probe.zero_()
+
+
+            for param_idx in range(len(self.param_list) if rank >= 1 else len(self.avg_probe_list)):
+                    
+                if rank == 0:
+                    probe = self.avg_probe_list[param_idx]
+                else:
+                    probe = self.probe_list[param_idx]
+
+                # this keeps a rolling sum of the probe since it includes probe on rank 1 in the sum, doesn't overwrite
+                dist.reduce(probe, dst=0, op=dist.ReduceOp.SUM, group=self.group_all)
+                
+                # DO NOT THINK I NEED THIS?
+                if rank == 0:
+                    self.avg_probe_list[param_idx] = probe
+                else:
+                    self.probe_list[param_idx] = probe
+                    
+            if self.verbose:
+                log_end("Stage 4", rank)
+            
+            dist.barrier()
+            
+            # -------------------- Stage 5: Clean up for next perturbation --------------------
+            if meta_pert < self.meta_perturbations - 1:
+                if self.verbose:
+                    log_start("Stage 5", rank)
+                
+                if rank >= 1:
+                    # Remove perturbation from model parameters
+                    for param, probe in zip(self.param_list, self.probe_list):
+                        # Unscale the probe (probe*est right now) and remove it from parameters
+                        if grad_est> 1e-8:
+                            probe.div_(grad_est)
+                        # probe.mul_(self.epsilon)
+                        param.sub_(probe)
+                        # now we should be back to original param
+                    
+                    if self.verbose:
+                        log_msg("Stage 5", rank, "Reset parameters for next perturbation")
+                
+                if self.verbose:
+                    log_end("Stage 5", rank)
+                
+            dist.barrier()
+            
+        # -------------------- Stage 6: Apply Final Gradient Update on Rank 0 --------------------
+        if self.verbose:
+            log_start("Stage 6", rank)
+        
+        if rank == 0:
+            # Average over meta-perturbations if more than one
+            for probe in self.avg_probe_list:
+                probe.div_(self.meta_perturbations * (world_size-1))
+                
+            # Normalize gradient if requested
+            if self.gradient_normalization:
+                norm_val = torch.sqrt(sum(torch.sum(p**2) for p in self.avg_probe_list))
+                if norm_val > 0:
+                    for probe in self.avg_probe_list:
+                        probe.div_(norm_val)
+            
+            # Apply gradient update
+            for param, probe in zip(self.param_list, self.avg_probe_list):
+                param.sub_(probe, alpha=current_lr)
+            
+            if self.verbose:
+                log_msg("Stage 6", rank, f"Updated parameters with learning rate {current_lr:.6f}")
+            
+            if self.verbose:
+                log_end("Stage 6", rank)
+            
+        dist.barrier()
+        
+        # Return the clean loss
+        return clean_loss 
+            
+
+
+    
+    def distributed_step_adaptive(self, x_ids_list, y_list, criterion, iteration):
         
         rank = dist.get_rank()
         world_size = dist.get_world_size()
@@ -434,9 +702,7 @@ class MezoAdaptiveSamplingParallel:
                 log_end("Stage 3a", rank)
             dist.barrier()
     
-            # Stage 3b: Dirty ranks receive eps * adam_ratio from Rank 0 and add it to probe.
-        
-        
+            # Stage 3b: Dirty ranks receive eps * adam_ratio from Rank 0 and add it to probe if self.adaptive.
             if self.verbose:
                 log_start("Stage 3b", rank)
             
@@ -493,7 +759,8 @@ class MezoAdaptiveSamplingParallel:
                         dist.broadcast(temp_chunk, src=0, async_op=True)
                         # Add the received chunk (scaled) into the probe
                         if self.adaptive:
-                            p_flat[start:end].add_(temp_chunk * self.epsilon)
+                            p_flat[start:end].sub_(temp_chunk * self.epsilon)
+                            # p_flat[start:end].add_(temp_chunk * self.epsilon)
             
             if self.verbose:
                 log_end("Stage 3b", rank)
@@ -514,7 +781,7 @@ class MezoAdaptiveSamplingParallel:
             if self.verbose:
                 log_end("Stage 3c", rank)
         
-            # Stage 3d: Dirty theta_t = clean theta_t + modified probe.
+            # Stage 3d: on rank 2+ normalize the probe, then apply to theta to make dirty_theta = clean theta_t + probe.
             if self.verbose:
                 log_start("Stage 3d", rank)
             if rank >= 2:
@@ -574,7 +841,7 @@ class MezoAdaptiveSamplingParallel:
             if self.verbose:
                 log_end("Stage 5", rank)
         
-            # -------------------- Stage 6: Compute grad_est per Dirty Rank and Scatter --------------------
+            # -------------------- Stage 6: Compute grad_est per Dirty Rank and Scatter each grad_est to each node to scale each ranks probe --------------------
             if self.verbose:
                 log_start("Stage 6", rank)
             if rank == 1:
@@ -582,9 +849,9 @@ class MezoAdaptiveSamplingParallel:
                 grad_est_dict = {}
                 for r in range(2, world_size):
                     grad_est = (gathered_losses[r] - clean_loss) / (self.epsilon + 1e-8)
-                    grad_est_dict[r] = grad_est/(self.epsilon + 1e-8)
+                    grad_est_dict[r] = grad_est/(self.epsilon + 1e-8) # this looks strange but its correct.
                 for r, ge in grad_est_dict.items():
-                    dist.send(ge, dst=r)
+                    dist.send(ge, dst=r) # note, its ok to send to yourself e.g. rank 1 to rank 1
                 self.grad_est_dict = grad_est_dict
                 if self.verbose:
                     log_msg("Stage 6", rank, f"Computed grad_est per dirty rank: {grad_est_dict}")
@@ -618,10 +885,19 @@ class MezoAdaptiveSamplingParallel:
                     reduce_mean_in_group(probe, dst_rank=1, group=self.group_except_zero, world_size=world_size)
             if rank == 1:
                 for i, probe in enumerate(self.adam_ratio_list):
+                    # YOU WOULD THINK I WOULD NEED TO DO SOMETHING LIKE THIS, BUT I DO NOT! 
+                    # if meta_pert == 0:
+                    #     self.adam_ratio_list[i].zero_()
+                    # reduced_probe = reduce_mean_in_group(probe.clone(), dst_rank=1, group=self.group_except_zero, world_size=world_size)
+                    # # accumulate, don’t overwrite
+                    # self.adam_ratio_list[i].add_( reduced_probe )
+                    
                     if meta_pert == 0:
                         probe.zero_()
+                    # this keeps a rolling sum of the probe since it includes probe on rank 1 in the sum, doesn't overwrite
                     reduced_probe = reduce_mean_in_group(probe.clone(), dst_rank=1, group=self.group_except_zero, world_size=world_size)
                     self.adam_ratio_list[i] = reduced_probe
+                
                 self.avg_probe_list = self.adam_ratio_list
                 if self.verbose:
                     log_msg("Stage 9", rank, "Averaged scaled probes from dirty ranks.")
@@ -681,55 +957,58 @@ class MezoAdaptiveSamplingParallel:
         
 
         # -------------------- Stage 10b: Stream adam_ratio from rank 0 to rank 1 --------------------
-        if self.verbose:
-            log_start("Stage 10b", rank)
-        if rank == 0:
-            # Precompute scaling factors in-place (they're scalars)
-            scaling1 = 1.0 / (1 - self.beta1 ** (iteration + 1))
-            scaling2 = 1.0 / (1 - self.beta2 ** (iteration + 1))
-            for idx, p in enumerate(self.adam_m):
-                # Flatten the parameter tensors for easier chunk processing.
-                m_flat = p.view(-1)
-                v_flat = self.adam_v[idx].view(-1)
-                # Preallocate a buffer for the ratio chunk of size CHUNK_SIZE.
-                ratio_buf = m_flat.new_empty(CHUNK_SIZE)
-                # Process tensor in chunks.
-                for start in range(0, m_flat.numel(), CHUNK_SIZE):
-                    end = min(m_flat.numel(), start + CHUNK_SIZE)
-                    chunk_size = end - start
-                    # Copy the current m chunk into the buffer.
-                    ratio_buf[:chunk_size].copy_(m_flat[start:end])
-                    # In-place scale: m_hat_chunk = m_chunk * scaling1
-                    ratio_buf[:chunk_size].mul_(scaling1)
-                    # Process the corresponding v chunk:
-                    # Compute v_hat_chunk = (v_chunk * scaling2).sqrt() + epsilon
-                    # We allocate a temporary buffer for the v chunk; since it's small, this overhead is minimal.
-                    temp = v_flat[start:end].clone()
-                    temp.mul_(scaling2)
-                    temp.sqrt_()
-                    temp.add_(1e-8)
-                    # In-place compute the ratio for the chunk: ratio = m_hat_chunk / v_hat_chunk
-                    ratio_buf[:chunk_size].div_(temp)
-                    # Send the computed chunk.
-                    dist.send(ratio_buf[:chunk_size], dst=1)
+        if self.adam:
+            # if not adam, we don't need to do this, adam_ratio_list holds the avg_probe_list, and we want to update with that.        
             if self.verbose:
-                log_msg("Stage 10b", rank, "Streamed adam_ratio chunks to Rank 1.")
-        elif rank == 1:
-            for idx, p in enumerate(self.adam_ratio_list):
-                p_flat = p.view(-1)
-                for start in range(0, p_flat.numel(), CHUNK_SIZE):
-                    end = min(p_flat.numel(), start + CHUNK_SIZE)
-                    chunk_size = end - start
-                    # Allocate a small buffer for receiving the chunk.
-                    temp_chunk = p_flat.new_empty(chunk_size)
-                    dist.recv(temp_chunk, src=0)
-                    # In-place copy into the correct segment.
-                    p_flat[start:end].copy_(temp_chunk)
+                log_start("Stage 10b", rank)
+            if rank == 0:
+                # Precompute scaling factors in-place (they're scalars)
+                scaling1 = 1.0 / (1 - self.beta1 ** (iteration + 1))
+                scaling2 = 1.0 / (1 - self.beta2 ** (iteration + 1))
+                for idx, p in enumerate(self.adam_m):
+                    # Flatten the parameter tensors for easier chunk processing.
+                    m_flat = p.view(-1)
+                    v_flat = self.adam_v[idx].view(-1)
+                    # Preallocate a buffer for the ratio chunk of size CHUNK_SIZE.
+                    ratio_buf = m_flat.new_empty(CHUNK_SIZE)
+                    # Process tensor in chunks.
+                    for start in range(0, m_flat.numel(), CHUNK_SIZE):
+                        end = min(m_flat.numel(), start + CHUNK_SIZE)
+                        chunk_size = end - start
+                        # Copy the current m chunk into the buffer.
+                        ratio_buf[:chunk_size].copy_(m_flat[start:end])
+                        # In-place scale: m_hat_chunk = m_chunk * scaling1
+                        ratio_buf[:chunk_size].mul_(scaling1)
+                        # Process the corresponding v chunk:
+                        # Compute v_hat_chunk = (v_chunk * scaling2).sqrt() + epsilon
+                        # We allocate a temporary buffer for the v chunk; since it's small, this overhead is minimal.
+                        temp = v_flat[start:end].clone()
+                        temp.mul_(scaling2)
+                        temp.sqrt_()
+                        temp.add_(1e-8)
+                        # In-place compute the ratio for the chunk: ratio = m_hat_chunk / v_hat_chunk
+                        ratio_buf[:chunk_size].div_(temp)
+                        # Send the computed chunk.
+                        dist.send(ratio_buf[:chunk_size], dst=1)
+                if self.verbose:
+                    log_msg("Stage 10b", rank, "Streamed adam_ratio chunks to Rank 1.")
+            elif rank == 1:
+                for idx, p in enumerate(self.adam_ratio_list):
+                    p_flat = p.view(-1)
+                    for start in range(0, p_flat.numel(), CHUNK_SIZE):
+                        end = min(p_flat.numel(), start + CHUNK_SIZE)
+                        chunk_size = end - start
+                        # Allocate a small buffer for receiving the chunk.
+                        temp_chunk = p_flat.new_empty(chunk_size)
+                        dist.recv(temp_chunk, src=0)
+                        # In-place copy into the correct segment.
+                        p_flat[start:end].copy_(temp_chunk)
+                        
+                if self.verbose:
+                    log_msg("Stage 10b", rank, "Reconstructed adam_ratio from received chunks.")
+            dist.barrier()
             if self.verbose:
-                log_msg("Stage 10b", rank, "Reconstructed adam_ratio from received chunks.")
-        dist.barrier()
-        if self.verbose:
-            log_end("Stage 10b", rank)
+                log_end("Stage 10b", rank)
 
 
         # -------------------- Stage 11: On Rank 1, Update theta_t with New adam_ratio --------------------
@@ -1083,73 +1362,23 @@ def main():
     os.environ["WANDB_API_KEY"] = ""
 
     # # train on real data 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
-    parser.add_argument("--mode", type=str, choices=["test", "train"], default="train", help="Run mode: test or train.")
-    parser.add_argument("--max_iters", type=int, default=1e10, help="Maximum iterations for training.")
-    parser.add_argument("--schedule_patience", type=int, default=1, help="Maximum iterations for training.")
-    parser.add_argument("--learning_rate", type=float, default=0.001, help="Base learning rate (and eps, tied 1:1).")
-    parser.add_argument("--beta1", type=float, default=0.99, help="Base learning rate (and eps, tied 1:1).")
-    parser.add_argument("--beta2", type=float, default=0.999, help="Base learning rate (and eps, tied 1:1).")
-    parser.add_argument("--epsilon", type=float, default=0.001, help="Perturbation scale epsilon (tied to learning rate).")
-    parser.add_argument("--probe_dropout_rate", type=float, default=0.0, help="Dropout rate for probe vector.")
-    parser.add_argument("--wandb_proj", type=str, default="ZeroProp_Final_Runs_REALDATA", help="WandB project name (optional)")
-    parser.add_argument("--wandb_run", type=str, default="", help="WandB run name (optional)")
-    parser.add_argument("--warmup_iters", type=int, default=1, help="Warmup iterations.")
-    parser.add_argument("--cosine_wavelength", type=int, default=100000, help="Cosine LR wavelength, init to very high.")
-    parser.add_argument("--val_iters", type=int, default=10, help="Val iters, when we run val and log to wandb, and potentially checkpoint.")
-    parser.add_argument("--meta_perturbations", type=int, default=10, help="Number of Perturbations for all ranks per step.")
-    parser.add_argument("--scatter_batch", type=str, choices=["true", "false"], default="true", help="whether each perturbation should be on a different batch, if true, we sample (world_size-2)*batch_size x_ids and y per iter and scatter it to the appropriate ranks.")
-    
-    # parser.add_argument(
-    #     "--precision", 
-    #     type=str, 
-    #     choices=["fp32", "fp16", "bf16", "fp8", "int8"], 
-    #     default="fp32", 
-    #     help="Set precision mode: fp32, fp16, bf16, fp8, int8."
-    # )
-    
-    # New CLI arguments for model configuration
-    parser.add_argument("--model_scale", type=int, default=1, help="Scaling factor for model dimensions.")
-    parser.add_argument("--vocab_size", type=int, default=150, help="Vocabulary size.")
-    parser.add_argument("--num_heads", type=int, default=1, help="# dnc heads.")
-    parser.add_argument("--memory_size", type=int, default=2900, help="memory_size.")
-    parser.add_argument("--hidden_size", type=int, default=2900, help="hidden_size.")
-    parser.add_argument("--input_size", type=int, default=2900, help="Input size.")
-    parser.add_argument("--head_size", type=int, default=2900, help="head_size .")
-    parser.add_argument("--batch_size", type=int, default=32*4, help="Batch size.")
-    parser.add_argument("--seq_len", type=int, default=10, help="Sequence length.")
-    parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
-    parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the final gradient before updating the model weights.")
-    parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="false", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
-    args = parser.parse_args()
-
-
-
-
-
-
-    
-
-    # # # TEST OVERFIT FAST DEMO! 
     # parser = argparse.ArgumentParser()
     # parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
-    # parser.add_argument("--mode", type=str, choices=["test", "train"], default="test", help="Run mode: test or train.")
+    # parser.add_argument("--mode", type=str, choices=["test", "train"], default="train", help="Run mode: test or train.")
     # parser.add_argument("--max_iters", type=int, default=1e10, help="Maximum iterations for training.")
     # parser.add_argument("--schedule_patience", type=int, default=1, help="Maximum iterations for training.")
     # parser.add_argument("--learning_rate", type=float, default=0.001, help="Base learning rate (and eps, tied 1:1).")
-    # parser.add_argument("--beta1", type=float, default=0.9, help="Base learning rate (and eps, tied 1:1).")
-    # parser.add_argument("--beta2", type=float, default=0.9, help="Base learning rate (and eps, tied 1:1).")
+    # parser.add_argument("--beta1", type=float, default=0.99, help="Base learning rate (and eps, tied 1:1).")
+    # parser.add_argument("--beta2", type=float, default=0.999, help="Base learning rate (and eps, tied 1:1).")
     # parser.add_argument("--epsilon", type=float, default=0.001, help="Perturbation scale epsilon (tied to learning rate).")
-    # parser.add_argument("--probe_dropout_rate", type=float, default=0., help="Dropout rate for probe vector.")
-    # parser.add_argument("--wandb_proj", type=str, default="ZeroProp_Final_Runs2", help="WandB project name (optional)")
+    # parser.add_argument("--probe_dropout_rate", type=float, default=0.0, help="Dropout rate for probe vector.")
+    # parser.add_argument("--wandb_proj", type=str, default="ZeroProp_Final_Runs_REALDATA", help="WandB project name (optional)")
     # parser.add_argument("--wandb_run", type=str, default="", help="WandB run name (optional)")
     # parser.add_argument("--warmup_iters", type=int, default=1, help="Warmup iterations.")
-    # parser.add_argument("--cosine_wavelength", type=int, default=100000000, help="Cosine LR wavelength, init to very high.")
+    # parser.add_argument("--cosine_wavelength", type=int, default=100000, help="Cosine LR wavelength, init to very high.")
     # parser.add_argument("--val_iters", type=int, default=10, help="Val iters, when we run val and log to wandb, and potentially checkpoint.")
-    # parser.add_argument("--meta_perturbations", type=int, default=1, help="Number of Perturbations for all ranks per step.")
+    # parser.add_argument("--meta_perturbations", type=int, default=10, help="Number of Perturbations for all ranks per step.")
     # parser.add_argument("--scatter_batch", type=str, choices=["true", "false"], default="false", help="whether each perturbation should be on a different batch, if true, we sample (world_size-2)*batch_size x_ids and y per iter and scatter it to the appropriate ranks.")
-    
     
     # # parser.add_argument(
     # #     "--precision", 
@@ -1158,33 +1387,99 @@ def main():
     # #     default="fp32", 
     # #     help="Set precision mode: fp32, fp16, bf16, fp8, int8."
     # # )
-
-    # # model_size = 100 == 1,603,290,101 and takes 35GB
-    # # model_size = 10 == 16,0329,010 and takes 35GB
     
     # # New CLI arguments for model configuration
     # parser.add_argument("--model_scale", type=int, default=1, help="Scaling factor for model dimensions.")
     # parser.add_argument("--vocab_size", type=int, default=150, help="Vocabulary size.")
     # parser.add_argument("--num_heads", type=int, default=1, help="# dnc heads.")
-    # parser.add_argument("--memory_size", type=int, default=128, help="memory_size.")
-    # parser.add_argument("--hidden_size", type=int, default=128, help="hidden_size.")
-    # parser.add_argument("--input_size", type=int, default=128, help="Input size.")
-    # parser.add_argument("--head_size", type=int, default=128, help="head_size .")
-    # parser.add_argument("--batch_size", type=int, default=1, help="Batch size.")
-    # parser.add_argument("--seq_len", type=int, default=10, help="Sequence length.")
-
-
+    # parser.add_argument("--memory_size", type=int, default=2900, help="memory_size.")
+    # parser.add_argument("--hidden_size", type=int, default=2900, help="hidden_size.")
+    # parser.add_argument("--input_size", type=int, default=2900, help="Input size.")
+    # parser.add_argument("--head_size", type=int, default=2900, help="head_size .")
+    # parser.add_argument("--batch_size", type=int, default=32*4, help="Batch size.")
+    # parser.add_argument("--seq_len", type=int, default=100, help="Sequence length.")
     # parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
     # parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the final gradient before updating the model weights.")
-    # parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="true", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
+    # parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="false", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
+    # parser.add_argument("--adam", type=str, choices=["true", "false"], default="false", help="if true use adam, else use vanilla sgd.")
     # args = parser.parse_args()
+
+
+
+
+
+
+    
+
+    # TEST OVERFIT FAST DEMO! 
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
+    parser.add_argument("--mode", type=str, choices=["test", "train"], default="test", help="Run mode: test or train.")
+    parser.add_argument("--max_iters", type=int, default=1e10, help="Maximum iterations for training.")
+    parser.add_argument("--schedule_patience", type=int, default=1, help="Maximum iterations for training.")
+    parser.add_argument("--learning_rate", type=float, default=0.0001, help="Base learning rate (and eps, tied 1:1).")
+    parser.add_argument("--beta1", type=float, default=0.9, help="Base learning rate (and eps, tied 1:1).")
+    parser.add_argument("--beta2", type=float, default=0.9, help="Base learning rate (and eps, tied 1:1).")
+    parser.add_argument("--epsilon", type=float, default=0.001, help="Perturbation scale epsilon (tied to learning rate).")
+    parser.add_argument("--probe_dropout_rate", type=float, default=0., help="Dropout rate for probe vector.")
+    parser.add_argument("--wandb_proj", type=str, default="ZeroProp_Final_Runs2", help="WandB project name (optional)")
+    parser.add_argument("--wandb_run", type=str, default="", help="WandB run name (optional)")
+    parser.add_argument("--warmup_iters", type=int, default=1, help="Warmup iterations.")
+    parser.add_argument("--cosine_wavelength", type=int, default=100000000, help="Cosine LR wavelength, init to very high.")
+    parser.add_argument("--val_iters", type=int, default=10, help="Val iters, when we run val and log to wandb, and potentially checkpoint.")
+    parser.add_argument("--meta_perturbations", type=int, default=1, help="Number of Perturbations for all ranks per step.")
+    parser.add_argument("--scatter_batch", type=str, choices=["true", "false"], default="false", help="whether each perturbation should be on a different batch, if true, we sample (world_size-2)*batch_size x_ids and y per iter and scatter it to the appropriate ranks.")
+    
+    
+    # parser.add_argument(
+    #     "--precision", 
+    #     type=str, 
+    #     choices=["fp32", "fp16", "bf16", "fp8", "int8"], _spsa
+    #     default="fp32", 
+    #     help="Set precision mode: fp32, fp16, bf16, fp8, int8."
+    # )
+
+    # model_size = 100 == 1,603,290,101 and takes 35GB
+    # model_size = 10 == 16,0329,010 and takes 35GB
+    
+    # New CLI arguments for model configuration
+    parser.add_argument("--model_scale", type=int, default=1, help="Scaling factor for model dimensions.")
+    parser.add_argument("--vocab_size", type=int, default=150, help="Vocabulary size.")
+    parser.add_argument("--num_heads", type=int, default=1, help="# dnc heads.")
+    parser.add_argument("--memory_size", type=int, default=4900, help="memory_size.")
+    parser.add_argument("--hidden_size", type=int, default=4900, help="hidden_size.")
+    parser.add_argument("--input_size", type=int, default=4900, help="Input size.")
+    parser.add_argument("--head_size", type=int, default=4900, help="head_size .")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size.")
+    parser.add_argument("--seq_len", type=int, default=10, help="Sequence length.")
+    parser.add_argument("--tokenizer", type=str, default="hf", choices=["hf", None], 
+                    help="Tokenizer to use. If 'hf', will use HuggingFace tokenizer. If None, will use character tokenizer.")
+
+
+
+    parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
+    parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="false", help="normalizes the final gradient before updating the model weights.")
+    parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="false", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
+    parser.add_argument("--adam", type=str, choices=["true", "false"], default="false", help="if true use adam, else use vanilla sgd.")
+    args = parser.parse_args()
+
+    # torch.backends.cudnn.enabled = False
 
     #####################################################################################
     # SETUP TRAINING
     #####################################################################################
 
-    vocab_list, char_to_id, id_to_char = get_char_vocab()
-    vocab_size = len(vocab_list)
+    if args.tokenizer == "hf":
+        from transformers import AutoTokenizer
+        hf_tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        hf_tokenizer.pad_token = hf_tokenizer.eos_token  # avoid pad_token error if needed
+        vocab_size = hf_tokenizer.vocab_size
+    else:
+        vocab_list, char_to_id, id_to_char = get_char_vocab()
+        vocab_size = len(vocab_list)
+        
+    # vocab_list, char_to_id, id_to_char = get_char_vocab()
+    # vocab_size = len(vocab_list)
     
     args.vocab_size = vocab_size
 
@@ -1243,37 +1538,7 @@ def main():
     
     criterion = nn.CrossEntropyLoss().to(device)
     args.scatter_batch = True if args.scatter_batch == "true" else False 
-    
-    if rank != 0:
 
-        x_ids = []
-        y = []
-        
-        for j in range(args.meta_perturbations):
-            if j==0:
-                # if scatter_batch, we want to sample only one batch and use that same batch for all perturbations on each rank each meta_pert. This only is important if args.mode == test really.
-                x_ids_temp = torch.randint(0, args.vocab_size, (args.batch_size, args.seq_len), device=device, dtype=torch.long) # PLACEHOLDER
-                y_temp = torch.randint(0, args.vocab_size, (args.batch_size, args.seq_len), device=device) # PLACEHOLDER
-            x_ids.append(x_ids_temp)
-            y.append(y_temp)
-        
-
-        
-        if rank == 1:
-            num_params = sum(p.numel() for p in model.parameters())
-            num_layers = len(list(model.children()))
-            print(f"[Init] Model has {num_params} parameters across {num_layers} layers.")
-            
-
-    
-
-    elif rank == 0:
-        x_ids, y = None,  None
-        pass
-        
-    dist.barrier()
-    log_end("INIT MODEL", rank)
-    
     distributed_adaptive = MezoAdaptiveSamplingParallel(
         model=model,
         learning_rate=args.learning_rate,
@@ -1281,6 +1546,7 @@ def main():
         epsilon=args.epsilon,
         beta1=args.beta1,
         beta2=args.beta2,
+        adam=args.adam=="true",
         adaptive=args.adaptive=="true",
         probe_normalization=args.probe_normalization=="true",
         gradient_normalization=args.gradient_normalization=="true",
@@ -1290,7 +1556,46 @@ def main():
     )
     dist.barrier()
     
-    if rank == 1:
+    
+    # if rank != 0:
+
+    #     x_ids = []
+    #     y = []
+        
+    #     for j in range(args.meta_perturbations):
+    #         if j==0:
+    #             # if scatter_batch, we want to sample only one batch and use that same batch for all perturbations on each rank each meta_pert. This only is important if args.mode == test really.
+    #             x_ids_temp = torch.randint(0, args.vocab_size, (args.batch_size, args.seq_len), device=device, dtype=torch.long) # PLACEHOLDER
+    #             y_temp = torch.randint(0, args.vocab_size, (args.batch_size, args.seq_len), device=device) # PLACEHOLDER
+    #         x_ids.append(x_ids_temp)
+    #         y.append(y_temp)
+        
+
+        
+    #     if rank == 1:
+    #         num_params = sum(p.numel() for p in model.parameters())
+    #         num_layers = len(list(model.children()))
+    #         print(f"[Init] Model has {num_params} parameters across {num_layers} layers.")
+            
+
+    
+
+    # elif rank == 0:
+    #     x_ids, y = None,  None
+    #     pass
+
+    
+    num_params = sum(p.numel() for p in model.parameters())
+    num_layers = len(list(model.children()))
+    print(f"[Init] Model has {num_params} parameters across {num_layers} layers.")
+    
+    dist.barrier()
+    log_end("INIT MODEL", rank)
+    
+    
+
+    
+    if rank == distributed_adaptive.clean_rank:
         # Loss EMA tracking - one fast, one slow
         loss_ema_fast = None
         loss_ema_slow = None
@@ -1308,7 +1613,7 @@ def main():
         prev_loss = float('inf')
         
     
-    if rank == 1 and args.wandb_proj is not None and wandb is not None:
+    if rank == distributed_adaptive.clean_rank and args.wandb_proj is not None and wandb is not None:
         # wandb.init(project=args.wandb_proj, name=args.wandb_run)
         wandb.init(project=args.wandb_proj,name=args.wandb_run)
         wandb.config.update( vars(args) )
@@ -1352,7 +1657,7 @@ def main():
             # Sample x_ids,y from dataset
             #####################################################################################
             
-            if args.mode == "train":
+            if args.mode == "train" or (args.mode == "test"  and i==0):
                 x_ids = []
                 y = []
 
@@ -1366,22 +1671,31 @@ def main():
                                                 min_total_seq_len=args.seq_len,
                                                 verbose = False
                                             )  
-                    
-                    x_ids_temp = str_to_tensor(x_strs, char_to_id).to(device)
-                    y_temp = str_to_tensor(y_strs, char_to_id).to(device)
+                    if args.tokenizer == "hf":
+                        x_ids_temp = hf_tokenizer(x_strs, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
+                        y_temp = hf_tokenizer(y_strs, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
+                    else:
+                        x_ids_temp = str_to_tensor(x_strs, char_to_id).to(device)
+                        y_temp = str_to_tensor(y_strs, char_to_id).to(device)
+                        
                     x_ids.append(x_ids_temp)
                     y.append(y_temp)
     
                     if verbose:
-                        print(f" x_ids {x_ids_temp.shape} y {y_temp.shape}" )
+                        print(f" x_ids {x_ids_temp.shape} y {y_temp.shape} x_ids dtype {x_ids_temp.dtype} y dtype {y_temp.dtype}" )
+            
                     
             dist.barrier()
                     
             #####################################################################################
             # TRAIN THE MODEL
             #####################################################################################
-            train_loss = distributed_adaptive.distributed_step(x_ids, y, criterion, iteration=i)
+            # if distributed_adaptive.adam:
+            train_loss = distributed_adaptive.distributed_step_adaptive(x_ids, y, criterion, iteration=i)
+            # else:
+            #     train_loss = distributed_adaptive.distributed_step_SPSA(x_ids, y, criterion, iteration=i)
 
+            
 
             #####################################################################################
             # CHECKPOINT THE MODEL RARELY
@@ -1399,7 +1713,7 @@ def main():
             #####################################################################################
             # UPDATE THE LEARNING RATE WITH OUR FAST/SLOW EMA COSINE LR SCHEDULE
             #####################################################################################
-            if rank == 1:
+            if rank == distributed_adaptive.clean_rank:
                 if loss_ema_fast is None:
                     # Initialize both EMAs with the current loss value
                     loss_ema_fast = train_loss
@@ -1441,7 +1755,7 @@ def main():
                 #####################################################################################
                 # RUN VALIDATION
                 #####################################################################################
-                if rank == 1 and (i+1) % args.val_iters == 0:
+                if rank == distributed_adaptive.clean_rank and (i+1) % args.val_iters == 0:
 
                     if args.mode == "train":
         
@@ -1454,9 +1768,12 @@ def main():
                                                     min_total_seq_len=args.seq_len,
                                                     verbose = False
                                                 )  
-                        
-                        x_ids = str_to_tensor(x_strs, char_to_id).to(device)
-                        y = str_to_tensor(y_strs, char_to_id).to(device)
+                        if args.tokenizer == "hf":
+                            x_ids = hf_tokenizer(x_strs, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
+                            y = hf_tokenizer(y_strs, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
+                        else:
+                            x_ids = str_to_tensor(x_strs, char_to_id).to(device)
+                            y = str_to_tensor(y_strs, char_to_id).to(device)
                         val_loss = teacher_forcing_loss_emb_parallel(model, x_ids, y, criterion)
                     
                     #####################################################################################
@@ -1495,7 +1812,7 @@ def main():
                
 
             dist.barrier()
-            if rank==1:
+            if rank == distributed_adaptive.clean_rank:
                 if train_loss < 0.1:
 
                     end_time = datetime.datetime.now()
