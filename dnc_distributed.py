@@ -205,38 +205,31 @@ def broadcast_in_group(tensor, src_rank, group):
 # =============================================================================
 # Helper: Reduce Mean within a group
 # =============================================================================
-def reduce_mean_in_group(tensor, dst_rank, group):
-    dist.reduce(tensor, dst=dst_rank, op=dist.ReduceOp.SUM, group=group)
-    if dist.get_rank() == dst_rank:
-        tensor.div_(len(group.ranks))
-    dist.barrier()
-    return tensor
 
-
-def reduce_mean_in_group(tensor, dst_rank, group, world_size):
-    """
-    Reduce mean across a specific process group
+# def reduce_mean_in_group(tensor, dst_rank, group, world_size):
+#     """
+#     Reduce mean across a specific process group
     
-    Args:
-        tensor: The tensor to reduce
-        dst_rank: Destination rank (global rank numbering)
-        group: Process group to use
-        world_size: Total world size
-    """
-    # Get current rank
-    rank = dist.get_rank()
+#     Args:
+#         tensor: The tensor to reduce
+#         dst_rank: Destination rank (global rank numbering)
+#         group: Process group to use
+#         world_size: Total world size
+#     """
+#     # Get current rank
+#     rank = dist.get_rank()
     
-    group_size = world_size - 2  # For a group excluding rank 0 and rank 1 which is clean
+#     group_size = world_size - 2  # For a group excluding rank 0 and rank 1 which is clean
     
-    # Only participate if you're in the group
-    if rank != 0:          
-        # Perform the reduction
-        dist.reduce(tensor, dst=1, op=dist.ReduceOp.SUM, group=group)
-        # if dist.get_rank() == dst_rank:
-        #     # dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
-        #     tensor.div_(group_size)
+#     # Only participate if you're in the group
+#     if rank != 0:          
+#         # Perform the reduction
+#         dist.reduce(tensor, dst=1, op=dist.ReduceOp.SUM, group=group)
+#         # if dist.get_rank() == dst_rank:
+#         #     # dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
+#         #     tensor.div_(group_size)
     
-    return tensor
+#     return tensor
 
 # =============================================================================
 # List-Level In-Place Operations (on lists of tensors)
@@ -291,6 +284,9 @@ class MezoAdaptiveSamplingParallel:
         self.beta1 = beta1
         self.beta2 = beta2
         self.adam = adam
+        if not adam:
+            self.beta1 = 0.
+            self.beta2 = 0.
         self.adaptive = adaptive
         self.probe_normalization = probe_normalization
         self.gradient_normalization = gradient_normalization
@@ -314,6 +310,7 @@ class MezoAdaptiveSamplingParallel:
 
         # if self.adam:
         self.clean_rank = 1
+        
 
         # Create a persistent group for all ranks except rank 0.
         if rank == 0: # adam rank, hold both adam moments
@@ -327,10 +324,9 @@ class MezoAdaptiveSamplingParallel:
             self.group_except_zero = create_group_except_rank0()
             if rank == 1: # clean rank, hold model + adam_ratio
                 self.adam_ratio_list = [torch.zeros_like(p, dtype=p.dtype, device=p.device) for p in self.param_list]
-            elif rank>2: # dirty ranks, hold model + probe
+            elif rank>=2: # dirty ranks, hold model + probe
                 self.probe_list = [torch.zeros_like(p, dtype=p.dtype, device=p.device) for p in self.param_list]
-
-
+        
         # else:
         #     self.clean_rank = 0
         #     # we have no adam_m or adam_v to concern ourselves with. 
@@ -347,262 +343,6 @@ class MezoAdaptiveSamplingParallel:
 
 
 
-
-    
-    def distributed_step_SPSA(self, x_ids_list, y_list, criterion, iteration):
-        
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        device = self.param_list[0].device if self.param_list is not None else torch.device(f"cuda:{rank}")
-        
-        current_lr = self.learning_rate 
-        self.epsilon = current_lr  # Tie epsilon to learning rate
-        
-        dist.barrier()
-    
-        # -------------------- Stage 0: Broadcast Clean theta_t from Rank 0 to Dirty Ranks --------------------
-        if self.verbose:
-            log_start("Stage 0", rank)
-        for p in self.param_list:
-            dist.broadcast(p, src=0, group=self.group_all)
-        if self.verbose:
-            weight_decay_loss = 0.0
-            for param in self.model.parameters():
-                weight_decay_loss += torch.sum(param)
-            log_msg("Stage 0: weight_decay_loss: ", rank, f"{weight_decay_loss}.")
-            log_end("Stage 0", rank)
-        dist.barrier()
-    
-        for meta_pert in range(self.meta_perturbations):
-            if self.verbose:
-                log_msg(f"Perturbation {meta_pert+1} of {self.meta_perturbations}", rank, "")
-            
-            # -------------------- Stage 0c: Broadcast x_ids and y from Rank 1 to All Ranks --------------------
-            if not self.scatter_batch:
-                if self.verbose:
-                    log_start("Stage 0c", rank)
-                    
-                # Select data based on perturbation index
-                if rank == 0:  # First dirty rank has the data
-                    x_ids = x_ids_list[meta_pert] if isinstance(x_ids_list, list) else x_ids_list
-                    y = y_list[meta_pert] if isinstance(y_list, list) else y_list
-                    
-                    # Prepare shapes for broadcasting
-                    x_shape = torch.tensor([x_ids.size(0), x_ids.size(1)], device=device, dtype=torch.long)
-                    y_shape = torch.tensor([y.size(0), y.size(1)], device=device, dtype=torch.long)
-                    
-                    if self.verbose:
-                        log_msg("Stage 0c", rank, f"Broadcasting shapes - x: {x_shape}, y: {y_shape}")
-                        log_msg("Stage 0c", rank, f"Broadcasting data - x: {x_ids.shape}, y: {y.shape}")
-                else:
-                    x_shape = torch.zeros(2, device=device, dtype=torch.long)
-                    y_shape = torch.zeros(2, device=device, dtype=torch.long)
-                
-                # Broadcast shapes from rank 1 to other dirty ranks
-                dist.broadcast(x_shape, src=0, group=self.group_all)
-                dist.broadcast(y_shape, src=0, group=self.group_all)
-                
-                # Create receiving tensors on other dirty ranks
-                if rank >= 1:
-                    x_ids = torch.zeros((x_shape[0].item(), x_shape[1].item()), device=device, dtype=torch.long)
-                    y = torch.zeros((y_shape[0].item(), y_shape[1].item()), device=device, dtype=torch.long)
-                    
-                    if self.verbose:
-                        log_msg("Stage 0c", rank, f"Created receiving tensors - x: {x_ids.shape}, y: {y.shape}")
-                
-                dist.broadcast(x_ids, src=0, group=self.group_all)
-                dist.broadcast(y, src=0, group=self.group_all)
-                
-                
-                if self.verbose:
-                    log_end("Stage 0c", rank)
-                
-            dist.barrier()
-            
-                
-            
-            # -------------------- Stage 1: Dirty Ranks Generate Probes --------------------
-            if self.verbose:
-                log_start("Stage 1", rank)
-            
-            if rank >= 1:  # All ranks except 0 are dirty
-                # Generate probes:  self.probe_list = probe * eps
-                for i, p in enumerate(self.param_list):
-                    probe = torch.zeros_like(p)
-                    probe.normal_(mean=0, std=1)
-                    ## NOTE mul by self.epsilon was here before
-                    probe.mul_(self.epsilon)
-                    self.probe_list[i] = probe
-                
-                # Apply dropout to probes if needed
-                if self.probe_dropout_rate > 0:
-                    for probe in self.probe_list:
-                        mask = (torch.rand_like(probe) > self.probe_dropout_rate).float()
-                        probe.mul_(mask)
-                
-                # Normalize probes if requested
-                if self.probe_normalization:
-                    norm_val = torch.sqrt(sum(torch.sum(p**2) for p in self.probe_list))
-                    if norm_val > 1e-8:
-                        for probe in self.probe_list:
-                            probe.div_(norm_val)
-                
-                    # now apply eps again
-                    for probe in self.probe_list:
-                        probe.mul_(self.epsilon)
-                
-                # Apply probes to create dirty model
-                for param, probe in zip(self.param_list, self.probe_list):
-                    param.add_(probe)
-                    probe.div_(self.epsilon) # need to take epsilon out of the probe bc its eps * probe right now
-                    
-
-
-                if self.verbose:
-                    log_msg("Stage 1", rank, f"Generated and applied probe to parameters")
-            
-            if self.verbose:
-                log_end("Stage 1", rank)
-            
-            dist.barrier()
-            
-            # -------------------- Stage 2: Compute Loss on All Ranks --------------------
-            if self.verbose:
-                log_start("Stage 2", rank)
-            
-            # All ranks compute loss
-            loss = teacher_forcing_loss_emb_parallel(self.model, x_ids, y, criterion)
-            
-            # Ensure loss is a tensor and sanitize
-            loss = torch.as_tensor(loss, device=device)
-            if not torch.isfinite(loss):
-                log_msg("Stage 2", rank, f"Loss was NaN/Inf: {loss}, replacing with 0.")
-                loss = torch.tensor(0.0, device=device)
-            
-            if self.verbose:
-                if rank == 0:
-                    log_msg("Stage 2", rank, f"Clean loss = {loss}")
-                else:
-                    log_msg("Stage 2", rank, f"Dirty loss = {loss}")
-            
-            if self.verbose:
-                log_end("Stage 2", rank)
-            
-            dist.barrier()
-            
-            # -------------------- Stage 3: Broadcast Clean Loss and Compute Gradient Estimates --------------------
-            if self.verbose:
-                log_start("Stage 3", rank)
-            
-            # Broadcast clean loss from rank 0 to all ranks
-            clean_loss = loss if rank == 0 else torch.tensor(0.0, device=device)
-            dist.broadcast(clean_loss, src=0, group=self.group_all)
-            
-            # All ranks compute their own gradient estimate
-            if rank >= 1:
-                grad_est = (loss - clean_loss) / (self.epsilon)
-                
-                # Scale probes by gradient estimate
-                for probe in self.probe_list:
-                    probe.mul_(grad_est)
-                
-                if self.verbose:
-                    log_msg("Stage 3", rank, f"Computed grad_est={grad_est} and scaled probe")
-            
-            if self.verbose:
-                log_end("Stage 3", rank)
-            
-            dist.barrier()
-            
-            # -------------------- Stage 4: Reduce Scaled Probes to Rank 0 --------------------
-            if self.verbose:
-                log_start("Stage 4", rank)
-            
-            # Initialize/reset avg_probe_list for first perturbation
-            if rank == 0: 
-                if meta_pert == 0:
-                    for probe in self.avg_probe_list:
-                        probe.zero_()
-
-
-            for param_idx in range(len(self.param_list) if rank >= 1 else len(self.avg_probe_list)):
-                    
-                if rank == 0:
-                    probe = self.avg_probe_list[param_idx]
-                else:
-                    probe = self.probe_list[param_idx]
-
-                # this keeps a rolling sum of the probe since it includes probe on rank 1 in the sum, doesn't overwrite
-                dist.reduce(probe, dst=0, op=dist.ReduceOp.SUM, group=self.group_all)
-                
-                # DO NOT THINK I NEED THIS?
-                if rank == 0:
-                    self.avg_probe_list[param_idx] = probe
-                else:
-                    self.probe_list[param_idx] = probe
-                    
-            if self.verbose:
-                log_end("Stage 4", rank)
-            
-            dist.barrier()
-            
-            # -------------------- Stage 5: Clean up for next perturbation --------------------
-            if meta_pert < self.meta_perturbations - 1:
-                if self.verbose:
-                    log_start("Stage 5", rank)
-                
-                if rank >= 1:
-                    # Remove perturbation from model parameters
-                    for param, probe in zip(self.param_list, self.probe_list):
-                        # Unscale the probe (probe*est right now) and remove it from parameters
-                        if grad_est> 1e-8:
-                            probe.div_(grad_est)
-                        # probe.mul_(self.epsilon)
-                        param.sub_(probe)
-                        # now we should be back to original param
-                    
-                    if self.verbose:
-                        log_msg("Stage 5", rank, "Reset parameters for next perturbation")
-                
-                if self.verbose:
-                    log_end("Stage 5", rank)
-                
-            dist.barrier()
-            
-        # -------------------- Stage 6: Apply Final Gradient Update on Rank 0 --------------------
-        if self.verbose:
-            log_start("Stage 6", rank)
-        
-        if rank == 0:
-            # Average over meta-perturbations if more than one
-            for probe in self.avg_probe_list:
-                probe.div_(self.meta_perturbations * (world_size-1))
-                
-            # Normalize gradient if requested
-            if self.gradient_normalization:
-                norm_val = torch.sqrt(sum(torch.sum(p**2) for p in self.avg_probe_list))
-                if norm_val > 0:
-                    for probe in self.avg_probe_list:
-                        probe.div_(norm_val)
-            
-            # Apply gradient update
-            for param, probe in zip(self.param_list, self.avg_probe_list):
-                param.sub_(probe, alpha=current_lr)
-            
-            if self.verbose:
-                log_msg("Stage 6", rank, f"Updated parameters with learning rate {current_lr:.6f}")
-            
-            if self.verbose:
-                log_end("Stage 6", rank)
-            
-        dist.barrier()
-        
-        # Return the clean loss
-        return clean_loss 
-            
-
-
-    
     def distributed_step_adaptive(self, x_ids_list, y_list, criterion, iteration):
         
         rank = dist.get_rank()
@@ -610,16 +350,67 @@ class MezoAdaptiveSamplingParallel:
         device = self.param_list[0].device if self.param_list is not None else torch.device(f"cuda:{rank}")
         
         current_lr = self.learning_rate 
-        self.epsilon = current_lr
+        self.epsilon = current_lr # NOTE, we tie the 2 together here
         
         dist.barrier()
+
+        if rank == 0:
+                ############
+                # FOR DEBUG (DELETE ME AFTER)
+                ############
+                if self.verbose:
+                    norm = sum(torch.norm(p).item() for i, p in enumerate(self.adam_m))
+                    print(f"[Rank {rank}] BEFORE STAGE 0 | adam_m | L2 norm: {norm:.6f}")
+                ########################
+                ########################
+                
+                ############
+                # FOR DEBUG (DELETE ME AFTER)
+                ############
+                if self.verbose:
+                    norm = sum(torch.norm(p).item() for i, p in enumerate(self.adam_v))
+                    print(f"[Rank {rank}] BEFORE STAGE 0 | adam_v | L2 norm: {norm:.6f}")
+                ########################
+                ########################
+        if rank == 1: # clean rank, hold model + empty initially then will hold rolling sum of gradient
+            # TODO handle macro_batch case properly
+            self.adam_ratio_list = [torch.zeros_like(p, dtype=p.dtype, device=p.device) for p in self.param_list]
+            
+            ############
+            # FOR DEBUG (DELETE ME AFTER)
+            ############
+            if self.verbose:
+                norm = sum(torch.norm(p).item() for i, p in enumerate(self.adam_ratio_list))
+                print(f"[Rank {rank}] BEFORE STAGE 0 | adam_ratio_list | L2 norm: {norm:.6f}")
+            ########################
+            ########################
     
         # -------------------- Stage 0: Broadcast Clean theta_t from Rank 1 to Dirty Ranks --------------------
         if self.verbose:
             log_start("Stage 0", rank)
         if rank >= 1:
+
+            ############
+            # FOR DEBUG (DELETE ME AFTER)
+            ############
+            if self.verbose and self.param_list is not None:
+                norm = sum(torch.norm(p).item() for i, p in enumerate(self.param_list))
+                print(f"[Rank {rank}] BEFORE STAGE 0 | param_list | L2 norm: {norm:.6f}")
+            ########################
+            ########################
+            
             for p in self.param_list:
                 broadcast_in_group(p, src_rank=1, group=self.group_except_zero)
+            
+            ############
+            # FOR DEBUG (DELETE ME AFTER)
+            ############
+            if self.verbose and self.param_list is not None:
+                norm = sum(torch.norm(p).item() for i, p in enumerate(self.param_list))
+                print(f"[Rank {rank}] AFTER STAGE 0 | param_list | L2 norm: {norm:.6f}")
+            ########################
+            ########################
+        
         if self.verbose:
             if rank >= 1:
                 weight_decay_loss = 0.0
@@ -633,6 +424,7 @@ class MezoAdaptiveSamplingParallel:
         for meta_pert in range(self.meta_perturbations):
 
             if rank >= 1:
+
                 x_ids = x_ids_list[meta_pert]
                 y = y_list[meta_pert]
             
@@ -674,35 +466,55 @@ class MezoAdaptiveSamplingParallel:
                         elif rank >= 2:
                             log_msg("Stage 0c", rank, f"Received data - x: {x_ids.shape}, y: {y.shape}, x[0,0]: {x_ids[0,0]}")
                 
-                dist.barrier()
-                if self.verbose:
-                    log_end("Stage 0c", rank)
+                    if self.verbose:
+                        log_end("Stage 0c", rank)
+
+                
+                    ############
+                    # FOR DEBUG (DELETE ME AFTER)
+                    ############
+                    if self.verbose:
+                        print(f"[Rank {rank}] AFTER STAGE 0 | x_ids+y | L2 norm: {torch.norm(x_ids.float()) + torch.norm(y.float()):.6f}")
+                    ########################
+                    ########################
             else:
                 # Skip the broadcast of the rank 1 batch, let each use their own w/ their own random seed.
                 pass
             
-        
+
     
             if self.verbose:
                 log_msg(f"Perturbation {meta_pert+1} of {self.meta_perturbations}", rank, "")
     
             # -------------------- Stage 3: Dirty Ranks Compute Their Dirty theta_t --------------------
-            # Stage 3a: Each dirty rank samples its own probe = eps * N(0,1).
+            # Stage 3a: Each dirty rank samples its own probe = N(0,1).
             if self.verbose:
                 log_start("Stage 3a", rank)
             if rank >= 2:
-                probe_list = []
+                self.probe_list = []
+                
                 for p in self.param_list:
                     probe = torch.zeros_like(p)
                     probe.normal_(mean=0, std=1)
-                    probe.mul_(self.epsilon)
-                    probe_list.append(probe)
-                self.probe_list = probe_list
+                    # probe.mul_(self.epsilon)
+                    self.probe_list.append(probe)
+
+                ############
+                # FOR DEBUG (DELETE ME AFTER)
+                ############
+                if self.verbose:
+                    norm = sum(torch.norm(p).item() for i, p in enumerate(self.probe_list))
+                    print(f"[Rank {rank}] AFTER STAGE 3 | probe_list | L2 norm: {norm:.6f}")
+                ########################
+                ########################
             if self.verbose:
                 log_end("Stage 3a", rank)
             dist.barrier()
-    
-            # Stage 3b: Dirty ranks receive eps * adam_ratio from Rank 0 and add it to probe if self.adaptive.
+
+
+
+            
+            # Stage 3b: Dirty ranks receive adam_ratio from Rank 0 and add it to probe if self.adaptive.
             if self.verbose:
                 log_start("Stage 3b", rank)
             
@@ -738,34 +550,55 @@ class MezoAdaptiveSamplingParallel:
                         ratio_buf[:chunk_size].div_(temp_v)
             
                         # Broadcast the ratio chunk to other ranks
-                        dist.broadcast(ratio_buf[:chunk_size], src=0, async_op=True)
+                        dist.broadcast(ratio_buf[:chunk_size], src=0, async_op=False)
             
             elif rank == 1:
                 # Instead of allocating a full-size temp, allocate per-chunk
+                # print(f" 1 SUM adam_ratio_list should be 0 :{sum(torch.sum(p*p) for p in self.adam_ratio_list)}" )
                 for idx, p in enumerate(self.adam_ratio_list):
                     p_flat = p.view(-1)
                     for start in range(0, p_flat.numel(), CHUNK_SIZE):
                         end = min(p_flat.numel(), start + CHUNK_SIZE)
-                        temp_chunk = p_flat.new_zeros(end - start)
-                        dist.broadcast(temp_chunk, src=0, async_op=True)
+                        
+                        temp_chunk = torch.zeros_like(p_flat[start:end])
+                        dist.broadcast(temp_chunk, src=0, async_op=False)
                         # The received data is intentionally dropped 
-            
+
+                # print(f" 2 SUM adam_ratio_list shouldnt change :{sum(torch.sum(p*p) for p in self.adam_ratio_list)}" )
+                ############
+                # FOR DEBUG (DELETE ME AFTER)
+                ############
+                if self.verbose:
+                    norm = sum(torch.norm(p).item() for i, p in enumerate(self.adam_ratio_list))
+                    print(f"[Rank {rank}] AFTER STAGE 3b | adam_ratio_list | L2 norm: {norm:.6f}")
+                ########################
+                ########################
             elif rank >= 2:
                 for idx, p in enumerate(self.probe_list):
                     p_flat = p.view(-1)
                     for start in range(0, p_flat.numel(), CHUNK_SIZE):
                         end = min(p_flat.numel(), start + CHUNK_SIZE)
                         temp_chunk = p_flat.new_zeros(end - start)
-                        dist.broadcast(temp_chunk, src=0, async_op=True)
+                        dist.broadcast(temp_chunk, src=0, async_op=False)
                         # Add the received chunk (scaled) into the probe
                         if self.adaptive:
-                            p_flat[start:end].sub_(temp_chunk * self.epsilon)
+                            p_flat[start:end].sub_(temp_chunk)
                             # p_flat[start:end].add_(temp_chunk * self.epsilon)
+
+                ############
+                # FOR DEBUG (DELETE ME AFTER)
+                ############
+                if self.verbose:
+                    norm = sum(torch.norm(p).item() for i, p in enumerate(self.probe_list))
+                    print(f"[Rank {rank}] AFTER STAGE 3b | probe_list | L2 norm: {norm:.6f}")
+                ########################
+                ########################
             
             if self.verbose:
                 log_end("Stage 3b", rank)
             # dist.barrier()
 
+            
             
         
             # Stage 3c: Dirty ranks apply a random dropout mask to their probe.
@@ -778,21 +611,48 @@ class MezoAdaptiveSamplingParallel:
                         probe.mul_(mask)
                         del mask
             # dist.barrier()
+                
+                ############
+                # FOR DEBUG (DELETE ME AFTER)
+                ############
+                if self.verbose:
+                    norm = sum(torch.norm(p).item() for i, p in enumerate(self.probe_list))
+                    print(f"[Rank {rank}] AFTER STAGE 3b | probe_list | L2 norm: {norm:.6f}")
+                ########################
+                ########################
             if self.verbose:
                 log_end("Stage 3c", rank)
         
-            # Stage 3d: on rank 2+ normalize the probe, then apply to theta to make dirty_theta = clean theta_t + probe.
+            # Stage 3d: on rank 2+ normalize the probe, then apply to theta += eps*(N(0,1) - ratio_data) to make dirty_theta
             if self.verbose:
                 log_start("Stage 3d", rank)
             if rank >= 2:
                 if self.probe_normalization:
-                    norm_val = torch.sqrt(sum(torch.sum(p)**2 for p in self.probe_list))
-                    # log_msg("Stage 3d", rank, f"probe norm = {norm_val}")
+                    norm_val = torch.sqrt(sum(torch.sum(p*p) for p in self.probe_list))
+                    log_msg("Stage 3d", rank, f"probe norm = {norm_val}")
                     
-                for param, probe in zip(self.param_list, probe_list):
+                    
+                for param, probe in zip(self.param_list, self.probe_list):
                     if self.probe_normalization:
                         probe.div_(norm_val + 1e-8)
-                    param.add_(probe)
+                    param.add_(probe, alpha=self.epsilon)
+                    
+                ############
+                # FOR DEBUG (DELETE ME AFTER)
+                ############
+                if self.verbose:
+                    norm = sum(torch.norm(p).item() for i, p in enumerate(self.probe_list))
+                    print(f"[Rank {rank}] AFTER STAGE 3d | probe_list | L2 norm: {norm:.6f}")
+                ########################
+                ########################
+                ############
+                # FOR DEBUG (DELETE ME AFTER)
+                ############
+                if self.verbose:
+                    norm = sum(torch.norm(p).item() for i, p in enumerate(self.param_list))
+                    print(f"[Rank {rank}] AFTER STAGE 3d | param | L2 norm: {norm:.6f}")
+                ########################
+                ########################
             # dist.barrier()
             if self.verbose:
                 log_end("Stage 3d", rank)
@@ -848,8 +708,8 @@ class MezoAdaptiveSamplingParallel:
                 clean_loss = gathered_losses[1]
                 grad_est_dict = {}
                 for r in range(2, world_size):
-                    grad_est = (gathered_losses[r] - clean_loss) / (self.epsilon + 1e-8)
-                    grad_est_dict[r] = grad_est/(self.epsilon + 1e-8) # this looks strange but its correct.
+                    grad_est = (gathered_losses[r] - clean_loss) / (self.epsilon)
+                    grad_est_dict[r] = grad_est #/(self.epsilon + 1e-8) # this looks strange but its correct.
                 for r, ge in grad_est_dict.items():
                     dist.send(ge, dst=r) # note, its ok to send to yourself e.g. rank 1 to rank 1
                 self.grad_est_dict = grad_est_dict
@@ -873,6 +733,20 @@ class MezoAdaptiveSamplingParallel:
                     probe.mul_(self.grad_est)
                 if self.verbose:
                     log_msg("Stage 8", rank, "Scaled probe by grad_est in place.")
+            
+                
+                
+                ############
+                # FOR DEBUG (DELETE ME AFTER)
+                ############
+                if self.verbose:
+                    norm = sum(torch.norm(p).item() for i, p in enumerate(self.probe_list))
+                    print(f"[Rank {rank}] AFTER STAGE 8 | probe_list | L2 norm: {norm:.6f}")
+                ########################
+                ########################
+
+
+            
             dist.barrier()
             if self.verbose:
                 log_end("Stage 8", rank)
@@ -882,21 +756,32 @@ class MezoAdaptiveSamplingParallel:
                 log_start("Stage 9", rank)
             if rank >= 2:
                 for probe in self.probe_list:
-                    reduce_mean_in_group(probe, dst_rank=1, group=self.group_except_zero, world_size=world_size)
+                    dist.reduce(probe, dst=1, op=dist.ReduceOp.SUM, group=self.group_except_zero)
+
+                ############
+                # FOR DEBUG (DELETE ME AFTER)
+                ############
+                if self.verbose:
+                    norm = sum(torch.norm(p).item() for i, p in enumerate(self.probe_list))
+                    print(f"[Rank {rank}] AFTER STAGE 9 | probe_list | L2 norm: {norm:.6f}")
+                ########################
+                ########################
             if rank == 1:
+                # print(f" 3 SUM adam_ratio_list shouldnt change :{sum(torch.sum(p*p) for p in self.adam_ratio_list)}" )
+
+                # grad_magnitude = sum(torch.sum(p*p) for p in self.adam_ratio_list)
+                # print(f"BEFORE: Meta pert {meta_pert+1}, grad magnitude: {grad_magnitude}")
                 for i, probe in enumerate(self.adam_ratio_list):
-                    # YOU WOULD THINK I WOULD NEED TO DO SOMETHING LIKE THIS, BUT I DO NOT! 
-                    # if meta_pert == 0:
-                    #     self.adam_ratio_list[i].zero_()
-                    # reduced_probe = reduce_mean_in_group(probe.clone(), dst_rank=1, group=self.group_except_zero, world_size=world_size)
-                    # # accumulate, don’t overwrite
-                    # self.adam_ratio_list[i].add_( reduced_probe )
-                    
+
                     if meta_pert == 0:
                         probe.zero_()
-                    # this keeps a rolling sum of the probe since it includes probe on rank 1 in the sum, doesn't overwrite
-                    reduced_probe = reduce_mean_in_group(probe.clone(), dst_rank=1, group=self.group_except_zero, world_size=world_size)
-                    self.adam_ratio_list[i] = reduced_probe
+                    temp = torch.zeros_like(probe)
+                    dist.reduce(temp, dst=1, op=dist.ReduceOp.SUM, group=self.group_except_zero)
+                    probe.add_(temp)
+
+                # print(f" 4 SUM adam_ratio_list SHOULD change :{sum(torch.sum(p*p) for p in self.adam_ratio_list)}" )
+                # grad_magnitude = sum(torch.sum(p*p) for p in self.adam_ratio_list)
+                # print(f"AFTER: Meta pert {meta_pert+1}, grad magnitude: {grad_magnitude}")
                 
                 self.avg_probe_list = self.adam_ratio_list
                 if self.verbose:
@@ -906,17 +791,43 @@ class MezoAdaptiveSamplingParallel:
                 log_end("Stage 9", rank)
                 
             # -------------------- Stage 9b: Prep for another meta-perturbation --------------------
-            if self.meta_perturbations - meta_pert - 1 > 0:
+            if meta_pert < self.meta_perturbations - 1:
+
+                # if self.verbose:
+                #     log_start("Stage 9b", rank)
+                # if rank >= 1:
+                #     for p in self.param_list:
+                #         broadcast_in_group(p, src_rank=1, group=self.group_except_zero)
+                #     ############
+                #     # FOR DEBUG (DELETE ME AFTER)
+                #     ############
+                #     if self.verbose:
+                #         norm = sum(torch.norm(p).item() for i, p in enumerate(self.param_list))
+                #         print(f"[Rank {rank}] AFTER STAGE 9b | param_list | L2 norm: {norm:.6f}")
+                #     ########################
+                #     ########################
+                # if self.verbose:
+                #     log_end("Stage 0", rank)
+                # dist.barrier()
+                
+
+
+
+
+
+
+
+                # this is me trying to be too cute
                 if self.verbose:
                     log_start("Stage 9b", rank)
                 if rank >= 2:
-                    for param, probe in zip(self.param_list, probe_list):
-                        probe.div_(grad_est + 1e-8)
-                        param.sub_(probe)
+                    for param, probe in zip(self.param_list, self.probe_list):
+                        param.sub_(probe, alpha=1./(grad_est+1e-8 ) )
                 dist.barrier()
                 if self.verbose:
                     log_end("Stage 9b", rank)
-        
+
+        dist.barrier()
         # -------------------- Stage 10: Rank 1 Streams Averaged Probe to Rank 0; Rank 0 Updates Adam State --------------------
         if self.verbose:
             log_start("Stage 10a", rank)
@@ -926,13 +837,34 @@ class MezoAdaptiveSamplingParallel:
             for p in self.avg_probe_list:
                 p.div_(global_perts)
 
+            ############
+            # FOR DEBUG (DELETE ME AFTER)
+            ############
+            if self.verbose:
+                norm = sum(torch.norm(p).item() for i, p in enumerate(self.avg_probe_list))
+                print(f"[Rank {rank}] AFTER STAGE 10 | avg_probe_list | L2 norm: {norm:.6f}")
+            ########################
+            ########################
+            
+            log_msg("Stage 10a", rank, f"sum squares of avg_probe_list {(sum(torch.sum(p*p) for p in self.avg_probe_list) )}")
             # normalize the gradients if gradient_normalization
             if self.gradient_normalization:
-                normed_val = torch.sqrt(sum(torch.sum(p)**2 for p in self.avg_probe_list) ) 
+                normed_val = torch.sqrt(sum(torch.sum(p*p) for p in self.avg_probe_list) ) 
+                log_msg("Stage 10a", rank, f"normed_val {normed_val}")
                 if normed_val != 0:  # Avoid division by zero
                     for p in self.avg_probe_list:
-                        p.div_(normed_val)
-                
+                        p.div_(normed_val + 1e-8)
+
+            ############
+            # FOR DEBUG (DELETE ME AFTER)
+            ############
+            if self.verbose:
+                norm = sum(torch.norm(p).item() for i, p in enumerate(self.avg_probe_list))
+                print(f"[Rank {rank}] AFTER STAGE 10 gn | avg_probe_list | L2 norm: {norm:.6f}")
+            ########################
+            ########################
+            
+            # print(f" 5 SUM adam_ratio_list should divide by {global_perts} global_perts :{sum(torch.sum(p*p) for p in self.adam_ratio_list)}" )
             for idx, p in enumerate(self.avg_probe_list):
                 p_flat = p.view(-1)
                 for start in range(0, p_flat.numel(), CHUNK_SIZE):
@@ -940,6 +872,7 @@ class MezoAdaptiveSamplingParallel:
                     # Clone the chunk to ensure a contiguous block is sent
                     temp_chunk = p_flat[start:end].clone()
                     dist.send(temp_chunk, dst=0)
+                    
             if self.verbose:
                 log_msg("Stage 10a", rank, "Streamed averaged probe to Rank 0.")
         elif rank == 0:
@@ -954,11 +887,29 @@ class MezoAdaptiveSamplingParallel:
                     v_flat[start:end].mul_(self.beta2).addcmul_(temp_chunk, temp_chunk, value=1 - self.beta2)
             if self.verbose:
                 log_msg("Stage 10a", rank, "Updated adam_v and adam_m")
-        
 
+            ############
+            # FOR DEBUG (DELETE ME AFTER)
+            ############
+            if self.verbose:
+                norm = sum(torch.norm(p).item() for i, p in enumerate(self.adam_m))
+                print(f"[Rank {rank}] AFTER STAGE 10 | adam_m | L2 norm: {norm:.6f}")
+            ########################
+            ########################
+            ############
+            # FOR DEBUG (DELETE ME AFTER)
+            ############
+            if self.verbose:
+                norm = sum(torch.norm(p).item() for i, p in enumerate(self.adam_v))
+                print(f"[Rank {rank}] AFTER STAGE 10 | adam_v | L2 norm: {norm:.6f}")
+            ########################
+            ########################
+
+        dist.barrier()
         # -------------------- Stage 10b: Stream adam_ratio from rank 0 to rank 1 --------------------
         if self.adam:
-            # if not adam, we don't need to do this, adam_ratio_list holds the avg_probe_list, and we want to update with that.        
+            # if not adam, we don't need to do this, adam_ratio_list holds the avg_probe_list, 
+            # and we want to update with that anyway.        
             if self.verbose:
                 log_start("Stage 10b", rank)
             if rank == 0:
@@ -988,6 +939,10 @@ class MezoAdaptiveSamplingParallel:
                         temp.add_(1e-8)
                         # In-place compute the ratio for the chunk: ratio = m_hat_chunk / v_hat_chunk
                         ratio_buf[:chunk_size].div_(temp)
+                        
+                        # print(f"[DEBUG][3b][rank0][idx={idx} start={start}:{end}] "
+                        #       f"ratio_buf stats: min={ratio_buf[:chunk_size].min().item():.6g}, "
+                        #       f"max={ratio_buf[:chunk_size].max().item():.6g}")
                         # Send the computed chunk.
                         dist.send(ratio_buf[:chunk_size], dst=1)
                 if self.verbose:
@@ -1006,20 +961,38 @@ class MezoAdaptiveSamplingParallel:
                         
                 if self.verbose:
                     log_msg("Stage 10b", rank, "Reconstructed adam_ratio from received chunks.")
-            dist.barrier()
+            
             if self.verbose:
                 log_end("Stage 10b", rank)
 
 
+        dist.barrier()
         # -------------------- Stage 11: On Rank 1, Update theta_t with New adam_ratio --------------------
         if self.verbose:
             log_start("Stage 11", rank)
         if rank == 1:
-            list_inplace_sub(self.param_list, self.adam_ratio_list, alpha=current_lr)
+            # print(f" 6 SUM adam_ratio_listshouldnt change :{sum(torch.sum(p*p) for p in self.adam_ratio_list)}" )
+            for p, a in zip(self.param_list, self.adam_ratio_list):
+                d = p.numel()
+                p_view = p.view(-1)
+                a_view = a.view(-1)
+                for start in range(0, d, CHUNK_SIZE):
+                    end = min(d, start+CHUNK_SIZE)
+                    p_view[start:end].sub_(a_view[start:end], alpha=current_lr)
+                    
+            # list_inplace_sub(self.param_list, self.adam_ratio_list, alpha=current_lr)
             if self.verbose:
                 log_msg("Stage 11", rank, f"Updated theta_t with learning rate {current_lr:.6f} in place.")
             log_msg(" ", rank, f"gathered_losses {gathered_losses}.")
             log_msg(" ", rank, f"grad_est_dict {grad_est_dict}.")
+            ############
+            # FOR DEBUG (DELETE ME AFTER)
+            ############
+            if self.verbose:
+                norm = sum(torch.norm(p).item() for i, p in enumerate(self.param_list))
+                print(f"[Rank {rank}] AFTER STAGE 11 | param_list | L2 norm: {norm:.6f}")
+            ########################
+            ########################
         dist.barrier()
         if self.verbose:
             log_end("Stage 11", rank)
@@ -1028,6 +1001,262 @@ class MezoAdaptiveSamplingParallel:
             return loss
         else:
             return None
+
+
+    
+    # def distributed_step_SPSA(self, x_ids_list, y_list, criterion, iteration):
+        
+    #     rank = dist.get_rank()
+    #     world_size = dist.get_world_size()
+    #     device = self.param_list[0].device if self.param_list is not None else torch.device(f"cuda:{rank}")
+        
+    #     current_lr = self.learning_rate 
+    #     self.epsilon = current_lr  # Tie epsilon to learning rate
+        
+    #     dist.barrier()
+    
+    #     # -------------------- Stage 0: Broadcast Clean theta_t from Rank 0 to Dirty Ranks --------------------
+    #     if self.verbose:
+    #         log_start("Stage 0", rank)
+    #     for p in self.param_list:
+    #         dist.broadcast(p, src=0, group=self.group_all)
+    #     if self.verbose:
+    #         weight_decay_loss = 0.0
+    #         for param in self.model.parameters():
+    #             weight_decay_loss += torch.sum(param)
+    #         log_msg("Stage 0: weight_decay_loss: ", rank, f"{weight_decay_loss}.")
+    #         log_end("Stage 0", rank)
+    #     dist.barrier()
+    
+    #     for meta_pert in range(self.meta_perturbations):
+    #         if self.verbose:
+    #             log_msg(f"Perturbation {meta_pert+1} of {self.meta_perturbations}", rank, "")
+            
+    #         # -------------------- Stage 0c: Broadcast x_ids and y from Rank 1 to All Ranks --------------------
+    #         if not self.scatter_batch:
+    #             if self.verbose:
+    #                 log_start("Stage 0c", rank)
+                    
+    #             # Select data based on perturbation index
+    #             if rank == 0:  # First dirty rank has the data
+    #                 x_ids = x_ids_list[meta_pert] if isinstance(x_ids_list, list) else x_ids_list
+    #                 y = y_list[meta_pert] if isinstance(y_list, list) else y_list
+                    
+    #                 # Prepare shapes for broadcasting
+    #                 x_shape = torch.tensor([x_ids.size(0), x_ids.size(1)], device=device, dtype=torch.long)
+    #                 y_shape = torch.tensor([y.size(0), y.size(1)], device=device, dtype=torch.long)
+                    
+    #                 if self.verbose:
+    #                     log_msg("Stage 0c", rank, f"Broadcasting shapes - x: {x_shape}, y: {y_shape}")
+    #                     log_msg("Stage 0c", rank, f"Broadcasting data - x: {x_ids.shape}, y: {y.shape}")
+    #             else:
+    #                 x_shape = torch.zeros(2, device=device, dtype=torch.long)
+    #                 y_shape = torch.zeros(2, device=device, dtype=torch.long)
+                
+    #             # Broadcast shapes from rank 1 to other dirty ranks
+    #             dist.broadcast(x_shape, src=0, group=self.group_all)
+    #             dist.broadcast(y_shape, src=0, group=self.group_all)
+                
+    #             # Create receiving tensors on other dirty ranks
+    #             if rank >= 1:
+    #                 x_ids = torch.zeros((x_shape[0].item(), x_shape[1].item()), device=device, dtype=torch.long)
+    #                 y = torch.zeros((y_shape[0].item(), y_shape[1].item()), device=device, dtype=torch.long)
+                    
+    #                 if self.verbose:
+    #                     log_msg("Stage 0c", rank, f"Created receiving tensors - x: {x_ids.shape}, y: {y.shape}")
+                
+    #             dist.broadcast(x_ids, src=0, group=self.group_all)
+    #             dist.broadcast(y, src=0, group=self.group_all)
+                
+                
+    #             if self.verbose:
+    #                 log_end("Stage 0c", rank)
+                
+    #         dist.barrier()
+            
+                
+            
+    #         # -------------------- Stage 1: Dirty Ranks Generate Probes --------------------
+    #         if self.verbose:
+    #             log_start("Stage 1", rank)
+            
+    #         if rank >= 1:  # All ranks except 0 are dirty
+    #             # Generate probes:  self.probe_list = probe * eps
+    #             for i, p in enumerate(self.param_list):
+    #                 probe = torch.zeros_like(p)
+    #                 probe.normal_(mean=0, std=1)
+    #                 ## NOTE mul by self.epsilon was here before
+    #                 probe.mul_(self.epsilon)
+    #                 self.probe_list[i] = probe
+                
+    #             # Apply dropout to probes if needed
+    #             if self.probe_dropout_rate > 0:
+    #                 for probe in self.probe_list:
+    #                     mask = (torch.rand_like(probe) > self.probe_dropout_rate).float()
+    #                     probe.mul_(mask)
+                
+    #             # Normalize probes if requested
+    #             if self.probe_normalization:
+    #                 norm_val = torch.sqrt(sum(torch.sum(p**2) for p in self.probe_list))
+    #                 if norm_val > 1e-8:
+    #                     for probe in self.probe_list:
+    #                         probe.div_(norm_val)
+                
+    #                 # now apply eps again
+    #                 for probe in self.probe_list:
+    #                     probe.mul_(self.epsilon)
+                
+    #             # Apply probes to create dirty model
+    #             for param, probe in zip(self.param_list, self.probe_list):
+    #                 param.add_(probe)
+    #                 probe.div_(self.epsilon) # need to take epsilon out of the probe bc its eps * probe right now
+                    
+
+
+    #             if self.verbose:
+    #                 log_msg("Stage 1", rank, f"Generated and applied probe to parameters")
+            
+    #         if self.verbose:
+    #             log_end("Stage 1", rank)
+            
+    #         dist.barrier()
+            
+    #         # -------------------- Stage 2: Compute Loss on All Ranks --------------------
+    #         if self.verbose:
+    #             log_start("Stage 2", rank)
+            
+    #         # All ranks compute loss
+    #         loss = teacher_forcing_loss_emb_parallel(self.model, x_ids, y, criterion)
+            
+    #         # Ensure loss is a tensor and sanitize
+    #         loss = torch.as_tensor(loss, device=device)
+    #         if not torch.isfinite(loss):
+    #             log_msg("Stage 2", rank, f"Loss was NaN/Inf: {loss}, replacing with 0.")
+    #             loss = torch.tensor(0.0, device=device)
+            
+    #         if self.verbose:
+    #             if rank == 0:
+    #                 log_msg("Stage 2", rank, f"Clean loss = {loss}")
+    #             else:
+    #                 log_msg("Stage 2", rank, f"Dirty loss = {loss}")
+            
+    #         if self.verbose:
+    #             log_end("Stage 2", rank)
+            
+    #         dist.barrier()
+            
+    #         # -------------------- Stage 3: Broadcast Clean Loss and Compute Gradient Estimates --------------------
+    #         if self.verbose:
+    #             log_start("Stage 3", rank)
+            
+    #         # Broadcast clean loss from rank 0 to all ranks
+    #         clean_loss = loss if rank == 0 else torch.tensor(0.0, device=device)
+    #         dist.broadcast(clean_loss, src=0, group=self.group_all)
+            
+    #         # All ranks compute their own gradient estimate
+    #         if rank >= 1:
+    #             grad_est = (loss - clean_loss) / (self.epsilon)
+                
+    #             # Scale probes by gradient estimate
+    #             for probe in self.probe_list:
+    #                 probe.mul_(grad_est)
+                
+    #             if self.verbose:
+    #                 log_msg("Stage 3", rank, f"Computed grad_est={grad_est} and scaled probe")
+            
+    #         if self.verbose:
+    #             log_end("Stage 3", rank)
+            
+    #         dist.barrier()
+            
+    #         # -------------------- Stage 4: Reduce Scaled Probes to Rank 0 --------------------
+    #         if self.verbose:
+    #             log_start("Stage 4", rank)
+            
+    #         # Initialize/reset avg_probe_list for first perturbation
+    #         if rank == 0: 
+    #             if meta_pert == 0:
+    #                 for probe in self.avg_probe_list:
+    #                     probe.zero_()
+
+
+    #         for param_idx in range(len(self.param_list) if rank >= 1 else len(self.avg_probe_list)):
+                    
+    #             if rank == 0:
+    #                 probe = self.avg_probe_list[param_idx]
+    #             else:
+    #                 probe = self.probe_list[param_idx]
+
+    #             # this keeps a rolling sum of the probe since it includes probe on rank 1 in the sum, doesn't overwrite
+    #             dist.reduce(probe, dst=0, op=dist.ReduceOp.SUM, group=self.group_all)
+                
+    #             # DO NOT THINK I NEED THIS?
+    #             if rank == 0:
+    #                 self.avg_probe_list[param_idx] = probe
+    #             else:
+    #                 self.probe_list[param_idx] = probe
+                    
+    #         if self.verbose:
+    #             log_end("Stage 4", rank)
+            
+    #         dist.barrier()
+            
+    #         # -------------------- Stage 5: Clean up for next perturbation --------------------
+    #         if meta_pert < self.meta_perturbations - 1:
+    #             if self.verbose:
+    #                 log_start("Stage 5", rank)
+                
+    #             if rank >= 1:
+    #                 # Remove perturbation from model parameters
+    #                 for param, probe in zip(self.param_list, self.probe_list):
+    #                     # Unscale the probe (probe*est right now) and remove it from parameters
+    #                     if grad_est> 1e-8:
+    #                         probe.div_(grad_est)
+    #                     # probe.mul_(self.epsilon)
+    #                     param.sub_(probe)
+    #                     # now we should be back to original param
+                    
+    #                 if self.verbose:
+    #                     log_msg("Stage 5", rank, "Reset parameters for next perturbation")
+                
+    #             if self.verbose:
+    #                 log_end("Stage 5", rank)
+                
+    #         dist.barrier()
+            
+    #     # -------------------- Stage 6: Apply Final Gradient Update on Rank 0 --------------------
+    #     if self.verbose:
+    #         log_start("Stage 6", rank)
+        
+    #     if rank == 0:
+    #         # Average over meta-perturbations if more than one
+    #         for probe in self.avg_probe_list:
+    #             probe.div_(self.meta_perturbations * (world_size-1))
+                
+    #         # Normalize gradient if requested
+    #         if self.gradient_normalization:
+    #             norm_val = torch.sqrt(sum(torch.sum(p**2) for p in self.avg_probe_list))
+    #             if norm_val > 0:
+    #                 for probe in self.avg_probe_list:
+    #                     probe.div_(norm_val)
+            
+    #         # Apply gradient update
+    #         for param, probe in zip(self.param_list, self.avg_probe_list):
+    #             param.sub_(probe, alpha=current_lr)
+            
+    #         if self.verbose:
+    #             log_msg("Stage 6", rank, f"Updated parameters with learning rate {current_lr:.6f}")
+            
+    #         if self.verbose:
+    #             log_end("Stage 6", rank)
+            
+    #     dist.barrier()
+        
+    #     # Return the clean loss
+    #     return clean_loss 
+            
+
+
 
 
 
@@ -1362,106 +1591,78 @@ def main():
     os.environ["WANDB_API_KEY"] = ""
 
     # # train on real data 
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
-    # parser.add_argument("--mode", type=str, choices=["test", "train"], default="train", help="Run mode: test or train.")
-    # parser.add_argument("--max_iters", type=int, default=1e10, help="Maximum iterations for training.")
-    # parser.add_argument("--schedule_patience", type=int, default=1, help="Maximum iterations for training.")
-    # parser.add_argument("--learning_rate", type=float, default=0.001, help="Base learning rate (and eps, tied 1:1).")
-    # parser.add_argument("--beta1", type=float, default=0.99, help="Base learning rate (and eps, tied 1:1).")
-    # parser.add_argument("--beta2", type=float, default=0.999, help="Base learning rate (and eps, tied 1:1).")
-    # parser.add_argument("--epsilon", type=float, default=0.001, help="Perturbation scale epsilon (tied to learning rate).")
-    # parser.add_argument("--probe_dropout_rate", type=float, default=0.0, help="Dropout rate for probe vector.")
-    # parser.add_argument("--wandb_proj", type=str, default="ZeroProp_Final_Runs_REALDATA", help="WandB project name (optional)")
-    # parser.add_argument("--wandb_run", type=str, default="", help="WandB run name (optional)")
-    # parser.add_argument("--warmup_iters", type=int, default=1, help="Warmup iterations.")
-    # parser.add_argument("--cosine_wavelength", type=int, default=100000, help="Cosine LR wavelength, init to very high.")
-    # parser.add_argument("--val_iters", type=int, default=10, help="Val iters, when we run val and log to wandb, and potentially checkpoint.")
-    # parser.add_argument("--meta_perturbations", type=int, default=10, help="Number of Perturbations for all ranks per step.")
-    # parser.add_argument("--scatter_batch", type=str, choices=["true", "false"], default="false", help="whether each perturbation should be on a different batch, if true, we sample (world_size-2)*batch_size x_ids and y per iter and scatter it to the appropriate ranks.")
-    
-    # # parser.add_argument(
-    # #     "--precision", 
-    # #     type=str, 
-    # #     choices=["fp32", "fp16", "bf16", "fp8", "int8"], 
-    # #     default="fp32", 
-    # #     help="Set precision mode: fp32, fp16, bf16, fp8, int8."
-    # # )
-    
-    # # New CLI arguments for model configuration
-    # parser.add_argument("--model_scale", type=int, default=1, help="Scaling factor for model dimensions.")
-    # parser.add_argument("--vocab_size", type=int, default=150, help="Vocabulary size.")
-    # parser.add_argument("--num_heads", type=int, default=1, help="# dnc heads.")
-    # parser.add_argument("--memory_size", type=int, default=2900, help="memory_size.")
-    # parser.add_argument("--hidden_size", type=int, default=2900, help="hidden_size.")
-    # parser.add_argument("--input_size", type=int, default=2900, help="Input size.")
-    # parser.add_argument("--head_size", type=int, default=2900, help="head_size .")
-    # parser.add_argument("--batch_size", type=int, default=32*4, help="Batch size.")
-    # parser.add_argument("--seq_len", type=int, default=100, help="Sequence length.")
-    # parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
-    # parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the final gradient before updating the model weights.")
-    # parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="false", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
-    # parser.add_argument("--adam", type=str, choices=["true", "false"], default="false", help="if true use adam, else use vanilla sgd.")
-    # args = parser.parse_args()
-
-
-
-
-
-
-    
-
-    # TEST OVERFIT FAST DEMO! 
     parser = argparse.ArgumentParser()
     parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
-    parser.add_argument("--mode", type=str, choices=["test", "train"], default="test", help="Run mode: test or train.")
+    parser.add_argument("--mode", type=str, choices=["test", "train"], default="train", help="Run mode: test or train.")
     parser.add_argument("--max_iters", type=int, default=1e10, help="Maximum iterations for training.")
     parser.add_argument("--schedule_patience", type=int, default=1, help="Maximum iterations for training.")
-    parser.add_argument("--learning_rate", type=float, default=0.0001, help="Base learning rate (and eps, tied 1:1).")
-    parser.add_argument("--beta1", type=float, default=0.9, help="Base learning rate (and eps, tied 1:1).")
-    parser.add_argument("--beta2", type=float, default=0.9, help="Base learning rate (and eps, tied 1:1).")
+    parser.add_argument("--learning_rate", type=float, default=0.001, help="Base learning rate (and eps, tied 1:1).")
+    parser.add_argument("--beta1", type=float, default=0.99, help="Base learning rate (and eps, tied 1:1).")
+    parser.add_argument("--beta2", type=float, default=0.999, help="Base learning rate (and eps, tied 1:1).")
     parser.add_argument("--epsilon", type=float, default=0.001, help="Perturbation scale epsilon (tied to learning rate).")
-    parser.add_argument("--probe_dropout_rate", type=float, default=0., help="Dropout rate for probe vector.")
-    parser.add_argument("--wandb_proj", type=str, default="ZeroProp_Final_Runs2", help="WandB project name (optional)")
+    parser.add_argument("--probe_dropout_rate", type=float, default=0.0, help="Dropout rate for probe vector.")
+    parser.add_argument("--wandb_proj", type=str, default="ZeroProp_Final_Runs_REALDATA", help="WandB project name (optional)")
     parser.add_argument("--wandb_run", type=str, default="", help="WandB run name (optional)")
-    parser.add_argument("--warmup_iters", type=int, default=1, help="Warmup iterations.")
-    parser.add_argument("--cosine_wavelength", type=int, default=100000000, help="Cosine LR wavelength, init to very high.")
+    parser.add_argument("--warmup_iters", type=int, default=1000, help="Warmup iterations.")
+    parser.add_argument("--cosine_wavelength", type=int, default=100000, help="Cosine LR wavelength, init to very high.")
     parser.add_argument("--val_iters", type=int, default=10, help="Val iters, when we run val and log to wandb, and potentially checkpoint.")
     parser.add_argument("--meta_perturbations", type=int, default=1, help="Number of Perturbations for all ranks per step.")
     parser.add_argument("--scatter_batch", type=str, choices=["true", "false"], default="false", help="whether each perturbation should be on a different batch, if true, we sample (world_size-2)*batch_size x_ids and y per iter and scatter it to the appropriate ranks.")
-    
-    
-    # parser.add_argument(
-    #     "--precision", 
-    #     type=str, 
-    #     choices=["fp32", "fp16", "bf16", "fp8", "int8"], _spsa
-    #     default="fp32", 
-    #     help="Set precision mode: fp32, fp16, bf16, fp8, int8."
-    # )
-
-    # model_size = 100 == 1,603,290,101 and takes 35GB
-    # model_size = 10 == 16,0329,010 and takes 35GB
     
     # New CLI arguments for model configuration
     parser.add_argument("--model_scale", type=int, default=1, help="Scaling factor for model dimensions.")
     parser.add_argument("--vocab_size", type=int, default=150, help="Vocabulary size.")
     parser.add_argument("--num_heads", type=int, default=1, help="# dnc heads.")
-    parser.add_argument("--memory_size", type=int, default=4900, help="memory_size.")
-    parser.add_argument("--hidden_size", type=int, default=4900, help="hidden_size.")
-    parser.add_argument("--input_size", type=int, default=4900, help="Input size.")
-    parser.add_argument("--head_size", type=int, default=4900, help="head_size .")
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size.")
-    parser.add_argument("--seq_len", type=int, default=10, help="Sequence length.")
+    parser.add_argument("--memory_size", type=int, default=2900, help="memory_size.")
+    parser.add_argument("--hidden_size", type=int, default=2900, help="hidden_size.")
+    parser.add_argument("--input_size", type=int, default=2900, help="Input size.")
+    parser.add_argument("--head_size", type=int, default=2900, help="head_size .")
+    parser.add_argument("--batch_size", type=int, default=32*4, help="Batch size.")
+    parser.add_argument("--seq_len", type=int, default=100, help="Sequence length.")
     parser.add_argument("--tokenizer", type=str, default="hf", choices=["hf", None], 
                     help="Tokenizer to use. If 'hf', will use HuggingFace tokenizer. If None, will use character tokenizer.")
-
-
-
     parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
-    parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="false", help="normalizes the final gradient before updating the model weights.")
-    parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="false", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
-    parser.add_argument("--adam", type=str, choices=["true", "false"], default="false", help="if true use adam, else use vanilla sgd.")
+    parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the final gradient before updating the model weights.")
+    parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="true", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
+    parser.add_argument("--adam", type=str, choices=["true", "false"], default="true", help="if true use adam, else use vanilla sgd.")
     args = parser.parse_args()
+    
+
+    # TEST OVERFIT FAST DEMO! 
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
+    # parser.add_argument("--mode", type=str, choices=["test", "train"], default="test", help="Run mode: test or train.")
+    # parser.add_argument("--max_iters", type=int, default=1e10, help="Maximum iterations for training.")
+    # parser.add_argument("--schedule_patience", type=int, default=1, help="Maximum iterations for training.")
+    # parser.add_argument("--learning_rate", type=float, default=0.00001, help="Base learning rate (and eps, tied 1:1).")
+    # parser.add_argument("--beta1", type=float, default=0.9, help="Base learning rate (and eps, tied 1:1).")
+    # parser.add_argument("--beta2", type=float, default=0.9, help="Base learning rate (and eps, tied 1:1).")
+    # parser.add_argument("--epsilon", type=float, default=0.001, help="Perturbation scale epsilon (tied to learning rate).")
+    # parser.add_argument("--probe_dropout_rate", type=float, default=0., help="Dropout rate for probe vector.")
+    # parser.add_argument("--wandb_proj", type=str, default="ZeroProp_Final_Runs2", help="WandB project name (optional)")
+    # parser.add_argument("--wandb_run", type=str, default="", help="WandB run name (optional)")
+    # parser.add_argument("--warmup_iters", type=int, default=0, help="Warmup iterations.")
+    # parser.add_argument("--cosine_wavelength", type=int, default=100000000, help="Cosine LR wavelength, init to very high.")
+    # parser.add_argument("--val_iters", type=int, default=10, help="Val iters, when we run val and log to wandb, and potentially checkpoint.")
+    # parser.add_argument("--meta_perturbations", type=int, default=10, help="Number of Perturbations for all ranks per step.")
+    # parser.add_argument("--scatter_batch", type=str, choices=["true", "false"], default="false", help="whether each perturbation should be on a different batch, if true, we sample (world_size-2)*batch_size x_ids and y per iter and scatter it to the appropriate ranks.")
+
+    # parser.add_argument("--model_scale", type=int, default=16, help="Scaling factor for model dimensions.")
+    # parser.add_argument("--vocab_size", type=int, default=150, help="Vocabulary size.")
+    # parser.add_argument("--num_heads", type=int, default=1, help="# dnc heads.")
+    # parser.add_argument("--memory_size", type=int, default=128, help="memory_size.")
+    # parser.add_argument("--hidden_size", type=int, default=128, help="hidden_size.")
+    # parser.add_argument("--input_size", type=int, default=128, help="Input size.")
+    # parser.add_argument("--head_size", type=int, default=128, help="head_size .")
+    # parser.add_argument("--batch_size", type=int, default=1, help="Batch size.")
+    # parser.add_argument("--seq_len", type=int, default=10, help="Sequence length.")
+    # parser.add_argument("--tokenizer", type=str, default="hf", choices=["hf", None], 
+    #                 help="Tokenizer to use. If 'hf', will use HuggingFace tokenizer. If None, will use character tokenizer.")
+    # parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="false", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
+    # parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="false", help="normalizes the final gradient before updating the model weights.")
+    # parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="false", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
+    # parser.add_argument("--adam", type=str, choices=["true", "false"], default="false", help="if true use adam, else use vanilla sgd.")
+    # args = parser.parse_args()
 
     # torch.backends.cudnn.enabled = False
 
@@ -1662,24 +1863,29 @@ def main():
                 y = []
 
                 for j in range(args.meta_perturbations):
-                    # GENERATE TRAIN BATCH
-                    x_strs, y_strs = generate_openwebtext_task_str(
-                                                args.batch_size,
-                                                1,
-                                                ds,
-                                                train = True,
-                                                min_total_seq_len=args.seq_len,
-                                                verbose = False
-                                            )  
-                    if args.tokenizer == "hf":
-                        x_ids_temp = hf_tokenizer(x_strs, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
-                        y_temp = hf_tokenizer(y_strs, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
-                    else:
-                        x_ids_temp = str_to_tensor(x_strs, char_to_id).to(device)
-                        y_temp = str_to_tensor(y_strs, char_to_id).to(device)
+
+                    if args.mode == "train" or (args.mode == "test" and j==0):
+                        # GENERATE TRAIN BATCH
+                        x_strs, y_strs = generate_openwebtext_task_str(
+                                                    args.batch_size,
+                                                    1,
+                                                    ds,
+                                                    train = True,
+                                                    min_total_seq_len=args.seq_len,
+                                                    verbose = False
+                                                )  
+                        if args.tokenizer == "hf":
+                            x_ids_temp = hf_tokenizer(x_strs, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
+                            y_temp = hf_tokenizer(y_strs, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
+                        else:
+                            x_ids_temp = str_to_tensor(x_strs, char_to_id).to(device)
+                            y_temp = str_to_tensor(y_strs, char_to_id).to(device)
+
+                    
                         
-                    x_ids.append(x_ids_temp)
-                    y.append(y_temp)
+                        
+                    x_ids.append(x_ids_temp.clone())
+                    y.append(y_temp.clone())
     
                     if verbose:
                         print(f" x_ids {x_ids_temp.shape} y {y_temp.shape} x_ids dtype {x_ids_temp.dtype} y dtype {y_temp.dtype}" )
@@ -1726,6 +1932,7 @@ def main():
                 if i < args.warmup_iters:
                     # Linear warmup
                     distributed_adaptive.learning_rate = base_lr * (i / args.warmup_iters)
+                    distributed_adaptive.learning_rate = max(1e-8,distributed_adaptive.learning_rate)
                 else:
                     
                     # Check if the fast EMA is higher than the slow EMA (by a small threshold)
