@@ -7,7 +7,6 @@ import string
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from ntm_with_modern_training_runs import teacher_forcing_loss_emb_parallel
 import datetime
 import wandb
 import math
@@ -15,7 +14,188 @@ from datasets import load_dataset
 import random
 import numpy as np
 
-CHUNK_SIZE = 1048576
+CHUNK_SIZE = 1048576 
+
+
+def teacher_forcing_loss_emb_parallel(model, x_ids, y_ids_unpadded, criterion, chunk_size=32, x_emb=None, return_predictions=False):
+
+    try:
+        
+        if x_emb == None:
+            x_emb = model.embed(x_ids)
+            
+        if x_emb.dtype != next(model.parameters()).dtype:
+            x_emb = x_emb.to(dtype=next(model.parameters()).dtype)
+            
+        B, Lx, E = x_emb.shape
+        Ly = y_ids_unpadded.shape[1]
+    
+        if return_predictions:
+            all_preds = []
+        hidden = None
+        memory = None
+        total_loss = 0.0
+        total_predicted_tokens = 0
+        
+        # Process input sequence first
+        pos = 0
+        while pos < Lx:
+            chunk_end = min(pos + chunk_size, Lx)
+            input_chunk = x_emb[:, pos:chunk_end, :]
+            
+            out_chunk, mem_new, hidden_new = model(input_chunk, hidden=hidden, memory=memory)
+            hidden = hidden_new
+            memory = mem_new
+            pos = chunk_end
+
+        
+        # Now process target sequence chunk by chunk
+        pos = 0
+        while pos < Ly - 1:  # -1 because we don't embed the last target token
+            chunk_end = min(pos + chunk_size, Ly - 1)
+            # Only embed the current chunk of target sequence
+            y_chunk = y_ids_unpadded[:, pos:chunk_end]
+            y_emb_chunk = model.embed(y_chunk)
+            
+            out_chunk, mem_new, hidden_new = model(y_emb_chunk, hidden=hidden, memory=memory)
+            
+            # Update states
+            hidden = hidden_new
+            memory = mem_new
+    
+            # Compute loss for this chunk
+            out_chunk = out_chunk.reshape(-1, out_chunk.size(-1))
+            targets = y_ids_unpadded[:, pos+1:chunk_end+1].reshape(-1)  # shift by 1 for next-token prediction
+            
+            if targets.size(0) > 0:  # ensure we have targets
+                chunk_loss = criterion(out_chunk, targets)
+                total_loss += chunk_loss * targets.size(0)
+                total_predicted_tokens += targets.size(0)
+            
+            pos = chunk_end
+            if return_predictions:
+                pred_chunk = torch.argmax(out_chunk, dim=-1).reshape(targets.shape).detach()
+                all_preds.append(pred_chunk)
+
+    
+
+        if total_predicted_tokens == 0:
+            import pdb
+            pdb.set_trace()
+            return 0.0 if not return_predictions else (0.0, None)
+        
+        avg_loss = total_loss / total_predicted_tokens
+        if return_predictions:
+            preds = torch.cat(all_preds, dim=-1).reshape(y_ids_unpadded.size(0), -1)
+            return avg_loss, preds
+        else:
+            return avg_loss
+
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"OOM in teacher_forcing_loss_emb: {str(e)}")
+        torch.cuda.empty_cache()
+        raise  # Re-raise to be caught by train_micro_batch
+
+    except Exception as e:
+        print(f"Error in teacher_forcing_loss_emb: {str(e)}")
+        torch.cuda.empty_cache()
+        raise  # Re-raise to be caught by train_micro_batch
+
+
+
+def generate_openwebtext_task_unified(
+    num_samples: int,
+    ds,
+    tokenizer,
+    min_tokens: int = 10,
+    max_tokens: int = 2048,
+    char_tokenizer: bool = False,
+    char_to_id=None,
+    str_to_tensor=None,
+    return_strings: bool = False,
+    train: bool = True,
+    device="cuda",
+    verbose: bool = False,
+):
+    input_token_list = []
+    target_token_list = []
+    input_str_list = []
+    target_str_list = []
+
+    size_of_ds = len(ds)
+
+    while len(input_token_list) < num_samples:
+        doc_idx = random.randint(0, size_of_ds - 1)
+        text = ds[doc_idx].get("text", "") or ""
+
+        if char_tokenizer:
+            total_len = len(text)
+        else:
+            tokens = tokenizer.encode(text, add_special_tokens=True)
+            total_len = len(tokens)
+            
+
+        if total_len < min_tokens:
+            continue
+
+        if total_len > max_tokens:
+            # Uniform sample a substring in range [min_tokens, max_tokens]
+            sub_len = random.randint(min_tokens, max_tokens)
+            start = random.randint(0, total_len - sub_len)
+            if char_tokenizer:
+                text = text[start:start + sub_len]
+            else:
+                tokens = tokens[start:start + sub_len]
+
+        # If char tokenizer, split on characters
+        if char_tokenizer:
+            split_point = 1
+            x_str = "<bos>" + text[:split_point]
+            y_str = text[split_point:] + "<eos>"
+
+            x_ids = str_to_tensor([x_str], char_to_id).to(device)
+            y = str_to_tensor([y_str], char_to_id).to(device)
+
+            input_token_list.append(x_ids[0])
+            target_token_list.append(y[0])
+
+            if return_strings:
+                input_str_list.append(x_str)
+                target_str_list.append(y_str)
+
+        else:
+            # For HF tokenizer: work directly with tokens
+            split_point = 1
+
+            input_tokens = [tokenizer.bos_token_id] + tokens[:split_point]
+            target_tokens = tokens[split_point:] + [tokenizer.eos_token_id]
+
+            # input_tokens = tokens[:split_point]
+            # target_tokens = tokens[split_point:]
+
+            input_token_list.append(torch.tensor(input_tokens, device=device))
+            target_token_list.append(torch.tensor(target_tokens, device=device))
+
+            if return_strings:
+                input_str_list.append(tokenizer.decode(input_tokens, skip_special_tokens=False))
+                target_str_list.append(tokenizer.decode(target_tokens, skip_special_tokens=False))
+
+    # Pad and stack
+    x_ids = torch.nn.utils.rnn.pad_sequence(input_token_list, batch_first=True, padding_value=tokenizer.pad_token_id)
+    y = torch.nn.utils.rnn.pad_sequence(target_token_list, batch_first=True, padding_value=tokenizer.pad_token_id)
+
+    # print("="*50)
+    # print(f" x_ids: {x_ids}")
+    # print(f" y: {y}")
+    # print(f" input_str_list: {input_str_list}")
+    # print(f" target_str_list: {target_str_list}")
+    # print("="*50)
+    # import pdb
+    # pdb.set_trace()
+    if return_strings:
+        return x_ids, y, input_str_list, target_str_list
+    return x_ids, y
+
 
 ############
 # DNC
@@ -268,7 +448,7 @@ class MezoAdaptiveSamplingParallel:
                  model, 
                  learning_rate=0.001, 
                  probe_dropout_rate=0.99, 
-                 epsilon=0.001,
+                 epsilon_tying_ratio=1.0,
                  beta1=0.9, 
                  beta2=0.999,
                  adam=True,
@@ -276,14 +456,16 @@ class MezoAdaptiveSamplingParallel:
                  probe_normalization=False,
                  gradient_normalization=False,
                  meta_perturbations=1,
+                 weight_decay=0.0,
                  scatter_batch=False,
                  verbose=True):
         self.learning_rate = learning_rate
         self.probe_dropout_rate = probe_dropout_rate
-        self.epsilon = epsilon  # initial; later tied 1:1 with lr
+        self.epsilon_tying_ratio = epsilon_tying_ratio  # initial; later tied 1:1 with lr
         self.beta1 = beta1
         self.beta2 = beta2
         self.adam = adam
+        self.weight_decay = weight_decay
         if not adam:
             self.beta1 = 0.
             self.beta2 = 0.
@@ -350,7 +532,7 @@ class MezoAdaptiveSamplingParallel:
         device = self.param_list[0].device if self.param_list is not None else torch.device(f"cuda:{rank}")
         
         current_lr = self.learning_rate 
-        self.epsilon = current_lr # NOTE, we tie the 2 together here
+        self.epsilon = self.epsilon_tying_ratio * current_lr # NOTE, we tie the 2 together here
         
         dist.barrier()
 
@@ -411,15 +593,15 @@ class MezoAdaptiveSamplingParallel:
             ########################
             ########################
         
-        if self.verbose:
-            if rank >= 1:
-                weight_decay_loss = 0.0
-                for param in self.model.parameters():
-                    weight_decay_loss += torch.sum(param )  # using 1e-2 as dummy weight_decay
-                log_msg("Stage 0: weight_decay_loss: ", rank, f"{weight_decay_loss}.")
-        if self.verbose:
-            log_end("Stage 0", rank)
-        dist.barrier()
+        # if self.verbose:
+        #     if rank >= 1:
+        #         weight_decay_loss = 0.0
+        #         for param in self.model.parameters():
+        #             weight_decay_loss += torch.sum(param )  # using 1e-2 as dummy weight_decay
+        #         log_msg("Stage 0: weight_decay_loss: ", rank, f"{weight_decay_loss}.")
+        # if self.verbose:
+        #     log_end("Stage 0", rank)
+        # dist.barrier()
 
         for meta_pert in range(self.meta_perturbations):
 
@@ -509,6 +691,7 @@ class MezoAdaptiveSamplingParallel:
                 ########################
             if self.verbose:
                 log_end("Stage 3a", rank)
+                
             dist.barrier()
 
 
@@ -629,6 +812,8 @@ class MezoAdaptiveSamplingParallel:
             if rank >= 2:
                 if self.probe_normalization:
                     norm_val = torch.sqrt(sum(torch.sum(p*p) for p in self.probe_list))
+                    
+                    # if self.verbose:
                     log_msg("Stage 3d", rank, f"probe norm = {norm_val}")
                     
                     
@@ -726,37 +911,38 @@ class MezoAdaptiveSamplingParallel:
                 log_end("Stage 6", rank)
         
             # -------------------- Stage 8: On Dirty Ranks, Scale Their Probe with grad_est and take eps out of it --------------------
-            if self.verbose:
-                log_start("Stage 8", rank)
-            if rank >= 2:
-                for probe in self.probe_list:
-                    probe.mul_(self.grad_est)
-                if self.verbose:
-                    log_msg("Stage 8", rank, "Scaled probe by grad_est in place.")
+            # if self.verbose:
+            #     log_start("Stage 8", rank)
+            # if rank >= 2:
+            #     for probe in self.probe_list:
+            #         probe.mul_(self.grad_est)
+            #     if self.verbose:
+            #         log_msg("Stage 8", rank, "Scaled probe by grad_est in place.")
             
                 
                 
-                ############
-                # FOR DEBUG (DELETE ME AFTER)
-                ############
-                if self.verbose:
-                    norm = sum(torch.norm(p).item() for i, p in enumerate(self.probe_list))
-                    print(f"[Rank {rank}] AFTER STAGE 8 | probe_list | L2 norm: {norm:.6f}")
-                ########################
-                ########################
+            #     ############
+            #     # FOR DEBUG (DELETE ME AFTER)
+            #     ############
+            #     if self.verbose:
+            #         norm = sum(torch.norm(p).item() for i, p in enumerate(self.probe_list))
+            #         print(f"[Rank {rank}] AFTER STAGE 8 | probe_list | L2 norm: {norm:.6f}")
+            #     ########################
+            #     ########################
 
 
             
-            dist.barrier()
-            if self.verbose:
-                log_end("Stage 8", rank)
+            # dist.barrier()
+            # if self.verbose:
+            #     log_end("Stage 8", rank)
         
             # -------------------- Stage 9: Reduce Scaled Probes from Dirty Ranks to Rank 1 --------------------
             if self.verbose:
                 log_start("Stage 9", rank)
             if rank >= 2:
                 for probe in self.probe_list:
-                    dist.reduce(probe, dst=1, op=dist.ReduceOp.SUM, group=self.group_except_zero)
+                    temp = probe * self.grad_est
+                    dist.reduce(temp, dst=1, op=dist.ReduceOp.SUM, group=self.group_except_zero)
 
                 ############
                 # FOR DEBUG (DELETE ME AFTER)
@@ -775,9 +961,9 @@ class MezoAdaptiveSamplingParallel:
 
                     if meta_pert == 0:
                         probe.zero_()
-                    temp = torch.zeros_like(probe)
-                    dist.reduce(temp, dst=1, op=dist.ReduceOp.SUM, group=self.group_except_zero)
-                    probe.add_(temp)
+                    # temp = torch.zeros_like(probe)
+                    dist.reduce(probe, dst=1, op=dist.ReduceOp.SUM, group=self.group_except_zero)
+                    # probe.add_(temp)
 
                 # print(f" 4 SUM adam_ratio_list SHOULD change :{sum(torch.sum(p*p) for p in self.adam_ratio_list)}" )
                 # grad_magnitude = sum(torch.sum(p*p) for p in self.adam_ratio_list)
@@ -812,20 +998,20 @@ class MezoAdaptiveSamplingParallel:
                 
 
 
-
-
-
-
-
                 # this is me trying to be too cute
                 if self.verbose:
                     log_start("Stage 9b", rank)
                 if rank >= 2:
                     for param, probe in zip(self.param_list, self.probe_list):
-                        param.sub_(probe, alpha=1./(grad_est+1e-8 ) )
+                        # param.sub_(probe, alpha=1./(grad_est+1e-8 ) )
+                        param.sub_(probe, alpha=self.epsilon)
+                        
                 dist.barrier()
                 if self.verbose:
                     log_end("Stage 9b", rank)
+                
+                if rank == 1:
+                    log_msg("Stage 9b", rank, f"Finished Meta-Perturbation {meta_pert}.")
 
         dist.barrier()
         # -------------------- Stage 10: Rank 1 Streams Averaged Probe to Rank 0; Rank 0 Updates Adam State --------------------
@@ -985,6 +1171,12 @@ class MezoAdaptiveSamplingParallel:
                 log_msg("Stage 11", rank, f"Updated theta_t with learning rate {current_lr:.6f} in place.")
             log_msg(" ", rank, f"gathered_losses {gathered_losses}.")
             log_msg(" ", rank, f"grad_est_dict {grad_est_dict}.")
+            
+            # After Stage 11 param update on Rank 1, apply weight decay
+            if self.weight_decay > 0.0:
+                for p in self.param_list:
+                    p.mul_(1.0 - current_lr * self.weight_decay)  # θ ← θ  –  η λ θ
+        
             ############
             # FOR DEBUG (DELETE ME AFTER)
             ############
@@ -1390,7 +1582,7 @@ def generate_openwebtext_task_str(
     ds,
     max_n=None,   # unused in OWT, but we keep the signature to match the others
     train: bool = True,
-    min_total_seq_len=100,
+    total_seq_len=100,
     verbose=False
 ):
     split_name = "train" if train else "validation"
@@ -1413,9 +1605,9 @@ def generate_openwebtext_task_str(
             # Calculate total sequence length including special tokens
             # Length will be: len(<bos> + prefix) + len(remainder + <eos>)
             # = 5 + len(text) [5 comes from <bos> and <eos>]
-            total_seq_len = len(text) + 5  # +5 for <bos> and <eos>
+            this_total_seq_len = len(text) + 5  # +5 for <bos> and <eos>
             
-            if total_seq_len >= min_total_seq_len and total_seq_len<20000: # crazy large number
+            if this_total_seq_len >= total_seq_len and this_total_seq_len<20000: # crazy large number
                 valid_doc = True
             else:
                 tries += 1
@@ -1423,7 +1615,7 @@ def generate_openwebtext_task_str(
         # If we couldn't find a long enough doc after max_tries,
         # pad the last one we found
         if not valid_doc:
-            needed = min_total_seq_len - total_seq_len
+            needed = total_seq_len - this_total_seq_len
             text = text + (" " * needed)
             
         # Now ensure text is at least context_length
@@ -1433,7 +1625,7 @@ def generate_openwebtext_task_str(
             
         # Split into prefix and remainder
         prefix = text[:context_length]
-        remainder = text[context_length:min_total_seq_len] # HACKY! TODO TO CLEAN UP BUT ONLY THING I CAN DO TO MAKE NTM AND DNC FASTER
+        remainder = text[context_length:total_seq_len] # HACKY! TODO TO CLEAN UP BUT ONLY THING I CAN DO TO MAKE NTM AND DNC FASTER
         
         # Create input and target strings
         input_str = f"<bos>{prefix}"
@@ -1461,6 +1653,7 @@ def generate_openwebtext_task_str(
 
    
     return in_list, out_list
+
 
 
 
@@ -1590,20 +1783,20 @@ def main():
     import os
     os.environ["WANDB_API_KEY"] = ""
 
-    # # train on real data 
+    # train on real data 
     parser = argparse.ArgumentParser()
     parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
     parser.add_argument("--mode", type=str, choices=["test", "train"], default="train", help="Run mode: test or train.")
     parser.add_argument("--max_iters", type=int, default=1e10, help="Maximum iterations for training.")
-    parser.add_argument("--schedule_patience", type=int, default=1, help="Maximum iterations for training.")
     parser.add_argument("--learning_rate", type=float, default=0.001, help="Base learning rate (and eps, tied 1:1).")
+    parser.add_argument("--weight_decay", type=float, default=0.001, help="Standard weight decay.")
     parser.add_argument("--beta1", type=float, default=0.99, help="Base learning rate (and eps, tied 1:1).")
     parser.add_argument("--beta2", type=float, default=0.999, help="Base learning rate (and eps, tied 1:1).")
-    parser.add_argument("--epsilon", type=float, default=0.001, help="Perturbation scale epsilon (tied to learning rate).")
+    parser.add_argument("--epsilon_tying_ratio", type=float, default=1.0, help="Perturbation scale epsilon (tied to learning rate).")
     parser.add_argument("--probe_dropout_rate", type=float, default=0.0, help="Dropout rate for probe vector.")
     parser.add_argument("--wandb_proj", type=str, default="ZeroProp_Final_Runs_REALDATA", help="WandB project name (optional)")
     parser.add_argument("--wandb_run", type=str, default="", help="WandB run name (optional)")
-    parser.add_argument("--warmup_iters", type=int, default=1000, help="Warmup iterations.")
+    parser.add_argument("--warmup_iters", type=int, default=100, help="Warmup iterations.")
     parser.add_argument("--cosine_wavelength", type=int, default=100000, help="Cosine LR wavelength, init to very high.")
     parser.add_argument("--val_iters", type=int, default=10, help="Val iters, when we run val and log to wandb, and potentially checkpoint.")
     parser.add_argument("--meta_perturbations", type=int, default=1, help="Number of Perturbations for all ranks per step.")
@@ -1611,14 +1804,18 @@ def main():
     
     # New CLI arguments for model configuration
     parser.add_argument("--model_scale", type=int, default=1, help="Scaling factor for model dimensions.")
-    parser.add_argument("--vocab_size", type=int, default=150, help="Vocabulary size.")
     parser.add_argument("--num_heads", type=int, default=1, help="# dnc heads.")
-    parser.add_argument("--memory_size", type=int, default=2900, help="memory_size.")
-    parser.add_argument("--hidden_size", type=int, default=2900, help="hidden_size.")
-    parser.add_argument("--input_size", type=int, default=2900, help="Input size.")
-    parser.add_argument("--head_size", type=int, default=2900, help="head_size .")
-    parser.add_argument("--batch_size", type=int, default=32*4, help="Batch size.")
-    parser.add_argument("--seq_len", type=int, default=100, help="Sequence length.")
+    parser.add_argument("--memory_size", type=int, default=1024, help="memory_size.")
+    parser.add_argument("--hidden_size", type=int, default=1024, help="hidden_size.")
+    parser.add_argument("--input_size", type=int, default=1024, help="Input size.")
+    parser.add_argument("--head_size", type=int, default=1024, help="head_size .")
+    
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size. BE SURE TO REDUCE LR AS YOU INCREASE BATCH SIZE BY SQRT(BATCHSIZE) as stability increases the exp delta loss decreases. So needs lower LR.")
+    parser.add_argument("--min_seq_len", type=int, default=10, help="Min sequence length.")
+    parser.add_argument("--max_seq_len", type=int, default=100000, help="Max sequence length.")
+    parser.add_argument("--step_seq_len", type=int, default=10, help="How much to step the sequence length.")
+    parser.add_argument("--step_seq_len_loss_thresh", type=float, default=3.0, help="At what threshold to check the loss to step sequence length.")
+    parser.add_argument("--patience_seq_len", type=int, default=100, help="How patient to be before stepping sequence length.")
     parser.add_argument("--tokenizer", type=str, default="hf", choices=["hf", None], 
                     help="Tokenizer to use. If 'hf', will use HuggingFace tokenizer. If None, will use character tokenizer.")
     parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
@@ -1628,40 +1825,43 @@ def main():
     args = parser.parse_args()
     
 
-    # TEST OVERFIT FAST DEMO! 
+    # # TEST OVERFIT FAST DEMO! 
     # parser = argparse.ArgumentParser()
     # parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
     # parser.add_argument("--mode", type=str, choices=["test", "train"], default="test", help="Run mode: test or train.")
     # parser.add_argument("--max_iters", type=int, default=1e10, help="Maximum iterations for training.")
-    # parser.add_argument("--schedule_patience", type=int, default=1, help="Maximum iterations for training.")
-    # parser.add_argument("--learning_rate", type=float, default=0.00001, help="Base learning rate (and eps, tied 1:1).")
+    # parser.add_argument("--learning_rate", type=float, default=0.001, help="Base learning rate (and eps, tied 1:1).")
     # parser.add_argument("--beta1", type=float, default=0.9, help="Base learning rate (and eps, tied 1:1).")
     # parser.add_argument("--beta2", type=float, default=0.9, help="Base learning rate (and eps, tied 1:1).")
-    # parser.add_argument("--epsilon", type=float, default=0.001, help="Perturbation scale epsilon (tied to learning rate).")
+    # parser.add_argument("--epsilon_tying_ratio", type=float, default=1.0, help="Perturbation scale epsilon (tied to learning rate).")
+    # parser.add_argument("--weight_decay", type=float, default=0.01, help="Standard weight decay.")
     # parser.add_argument("--probe_dropout_rate", type=float, default=0., help="Dropout rate for probe vector.")
     # parser.add_argument("--wandb_proj", type=str, default="ZeroProp_Final_Runs2", help="WandB project name (optional)")
     # parser.add_argument("--wandb_run", type=str, default="", help="WandB run name (optional)")
     # parser.add_argument("--warmup_iters", type=int, default=0, help="Warmup iterations.")
     # parser.add_argument("--cosine_wavelength", type=int, default=100000000, help="Cosine LR wavelength, init to very high.")
     # parser.add_argument("--val_iters", type=int, default=10, help="Val iters, when we run val and log to wandb, and potentially checkpoint.")
-    # parser.add_argument("--meta_perturbations", type=int, default=10, help="Number of Perturbations for all ranks per step.")
+    # parser.add_argument("--meta_perturbations", type=int, default=1, help="Number of Perturbations for all ranks per step.")
     # parser.add_argument("--scatter_batch", type=str, choices=["true", "false"], default="false", help="whether each perturbation should be on a different batch, if true, we sample (world_size-2)*batch_size x_ids and y per iter and scatter it to the appropriate ranks.")
 
-    # parser.add_argument("--model_scale", type=int, default=16, help="Scaling factor for model dimensions.")
-    # parser.add_argument("--vocab_size", type=int, default=150, help="Vocabulary size.")
-    # parser.add_argument("--num_heads", type=int, default=1, help="# dnc heads.")
-    # parser.add_argument("--memory_size", type=int, default=128, help="memory_size.")
-    # parser.add_argument("--hidden_size", type=int, default=128, help="hidden_size.")
-    # parser.add_argument("--input_size", type=int, default=128, help="Input size.")
-    # parser.add_argument("--head_size", type=int, default=128, help="head_size .")
-    # parser.add_argument("--batch_size", type=int, default=1, help="Batch size.")
-    # parser.add_argument("--seq_len", type=int, default=10, help="Sequence length.")
+    # parser.add_argument("--model_scale", type=int, default=1, help="Scaling factor for model dimensions.")
+    # parser.add_argument("--num_heads", type=int, default=16, help="# dnc heads.")
+    # parser.add_argument("--memory_size", type=int, default=1024, help="memory_size.")
+    # parser.add_argument("--hidden_size", type=int, default=1024, help="hidden_size.")
+    # parser.add_argument("--input_size", type=int, default=1024, help="Input size.")
+    # parser.add_argument("--head_size", type=int, default=1024, help="head_size .")
+    # parser.add_argument("--batch_size", type=int, default=1, help="Batch size. BE SURE TO REDUCE LR AS YOU INCREASE BATCH SIZE BY SQRT(BATCHSIZE) as stability increases the exp delta loss decreases. So needs lower LR.")
+    # parser.add_argument("--min_seq_len", type=int, default=10, help="Min sequence length.")
+    # parser.add_argument("--max_seq_len", type=int, default=10, help="Max sequence length.")
+    # parser.add_argument("--step_seq_len", type=int, default=10, help="How much to step the sequence length.")
+    # parser.add_argument("--step_seq_len_loss_thresh", type=float, default=3.0, help="At what threshold to check the loss to step sequence length.")
+    # parser.add_argument("--patience_seq_len", type=int, default=100, help="How patient to be before stepping sequence length.")    
     # parser.add_argument("--tokenizer", type=str, default="hf", choices=["hf", None], 
     #                 help="Tokenizer to use. If 'hf', will use HuggingFace tokenizer. If None, will use character tokenizer.")
-    # parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="false", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
-    # parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="false", help="normalizes the final gradient before updating the model weights.")
-    # parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="false", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
-    # parser.add_argument("--adam", type=str, choices=["true", "false"], default="false", help="if true use adam, else use vanilla sgd.")
+    # parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
+    # parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the final gradient before updating the model weights.")
+    # parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="true", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
+    # parser.add_argument("--adam", type=str, choices=["true", "false"], default="true", help="if true use adam, else use vanilla sgd.")
     # args = parser.parse_args()
 
     # torch.backends.cudnn.enabled = False
@@ -1670,14 +1870,42 @@ def main():
     # SETUP TRAINING
     #####################################################################################
 
+    torch.cuda.set_device(args.local_rank)
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device(f"cuda:{args.local_rank}")
+
+    assert torch.cuda.is_available(), f"Rank {rank}: CUDA not available!"
+    print(f"Rank {rank} using device {torch.cuda.current_device()}")
+
+    # set the random seed differently per rank
+    torch.manual_seed(torch.initial_seed() + rank) 
+
     if args.tokenizer == "hf":
         from transformers import AutoTokenizer
         hf_tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        hf_tokenizer.pad_token = hf_tokenizer.eos_token  # avoid pad_token error if needed
-        vocab_size = hf_tokenizer.vocab_size
+        hf_tokenizer.model_max_length = int(1e10)
+        special_tokens_dict = {
+            'bos_token': '<bos>',
+            'eos_token': '<eos>',
+            'pad_token': '<pad>'  # optional but good to have
+        }
+        
+        hf_tokenizer.add_special_tokens(special_tokens_dict)
+        vocab_size = len(hf_tokenizer)
+        char_to_id = None
+        id_to_char = None
+        print("BOS ID:", hf_tokenizer.bos_token_id, hf_tokenizer.bos_token)
+        print("EOS ID:", hf_tokenizer.eos_token_id, hf_tokenizer.eos_token)
+        
+        print("Decode BOS:", hf_tokenizer.decode([hf_tokenizer.bos_token_id]))
+        print("Decode EOS:", hf_tokenizer.decode([hf_tokenizer.eos_token_id]))
+        criterion = nn.CrossEntropyLoss(ignore_index=hf_tokenizer.pad_token_id).to(device)
     else:
         vocab_list, char_to_id, id_to_char = get_char_vocab()
         vocab_size = len(vocab_list)
+        criterion = nn.CrossEntropyLoss().to(device)
         
     # vocab_list, char_to_id, id_to_char = get_char_vocab()
     # vocab_size = len(vocab_list)
@@ -1698,10 +1926,10 @@ def main():
     model_params = f"_h{args.hidden_size}"
     
     # Add training configuration
-    train_params = f"_bs{args.batch_size}_seq{args.seq_len}_b1_{args.beta1}_b2_{args.beta2}"
+    train_params = f"_bs{args.batch_size}_seq{args.min_seq_len}_seq{args.max_seq_len}_b1_{args.beta1}_b2_{args.beta2}"
     
     # Add optimization details
-    opt_params = f"_coswav_{args.cosine_wavelength}_wu{args.warmup_iters}_mp{args.meta_perturbations}_pat{args.schedule_patience}"
+    opt_params = f"_coswav_{args.cosine_wavelength}_wu{args.warmup_iters}_mp{args.meta_perturbations}"
     
     # Combine all parts
     if args.wandb_run=="":
@@ -1712,18 +1940,7 @@ def main():
     # args.wandb_proj = None
     verbose = False
     
-    torch.cuda.set_device(args.local_rank)
-    dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    device = torch.device(f"cuda:{args.local_rank}")
-
-    assert torch.cuda.is_available(), f"Rank {rank}: CUDA not available!"
-    print(f"Rank {rank} using device {torch.cuda.current_device()}")
-
-    # set the random seed differently per rank
-    torch.manual_seed(torch.initial_seed() + rank) 
-
+    
     log_msg("Trying first dist.barrier(), if hanging here, no infiniband likely on node, need to turn off p2p",rank,"if so, run export NCCL_P2P_DISABLE=1")
     dist.barrier()
     
@@ -1737,18 +1954,19 @@ def main():
         # model.controller.flatten_parameters()
         model.eval()
     
-    criterion = nn.CrossEntropyLoss().to(device)
+    
     args.scatter_batch = True if args.scatter_batch == "true" else False 
 
     distributed_adaptive = MezoAdaptiveSamplingParallel(
         model=model,
         learning_rate=args.learning_rate,
         probe_dropout_rate=args.probe_dropout_rate,
-        epsilon=args.epsilon,
+        epsilon_tying_ratio=args.epsilon_tying_ratio,
         beta1=args.beta1,
         beta2=args.beta2,
         adam=args.adam=="true",
         adaptive=args.adaptive=="true",
+        weight_decay=args.weight_decay,
         probe_normalization=args.probe_normalization=="true",
         gradient_normalization=args.gradient_normalization=="true",
         meta_perturbations=args.meta_perturbations,
@@ -1787,8 +2005,10 @@ def main():
 
     
     num_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
     num_layers = len(list(model.children()))
-    print(f"[Init] Model has {num_params} parameters across {num_layers} layers.")
+    print(f"[Init] Model has {num_params} parameters (trainable=={trainable_params} across {num_layers} layers.")
     
     dist.barrier()
     log_end("INIT MODEL", rank)
@@ -1850,6 +2070,11 @@ def main():
     # START TRAINING
     #####################################################################################
     val_loss = 1e4 # placeholder value
+    
+    # Initialize seq_len scheduler variables
+    current_max_seq_len = args.min_seq_len
+    steps_below_thresh = 0
+
     start_time = datetime.datetime.now()
     with torch.inference_mode():
         
@@ -1865,30 +2090,55 @@ def main():
                 for j in range(args.meta_perturbations):
 
                     if args.mode == "train" or (args.mode == "test" and j==0):
-                        # GENERATE TRAIN BATCH
-                        x_strs, y_strs = generate_openwebtext_task_str(
-                                                    args.batch_size,
-                                                    1,
-                                                    ds,
-                                                    train = True,
-                                                    min_total_seq_len=args.seq_len,
-                                                    verbose = False
-                                                )  
-                        if args.tokenizer == "hf":
-                            x_ids_temp = hf_tokenizer(x_strs, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
-                            y_temp = hf_tokenizer(y_strs, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
-                        else:
-                            x_ids_temp = str_to_tensor(x_strs, char_to_id).to(device)
-                            y_temp = str_to_tensor(y_strs, char_to_id).to(device)
+                        # Incorporate these here now:
+                        # parser.add_argument("--min_seq_len", type=int, default=10, help="Min sequence length.")
+                        # parser.add_argument("--max_seq_len", type=int, default=100000, help="Max sequence length.")
+                        # parser.add_argument("--step_seq_len", type=int, default=10, help="How much to step the sequence length.")
+                        # parser.add_argument("--step_seq_len_loss_thresh", type=float, default=3.0, help="At what threshold to check the loss to step sequence length.")
+                        # parser.add_argument("--patience_seq_len", type=int, default=100, help="How patient to be before stepping sequence length.")
 
-                    
                         
+                        # # GENERATE TRAIN BATCH
+                        # x_strs, y_strs = generate_openwebtext_task_str(
+                        #                             args.batch_size,
+                        #                             1,
+                        #                             ds,
+                        #                             train = True,
+                        #                             total_seq_len=seq_len,
+                        #                             verbose = False
+                        #                         )  
+                        # if args.tokenizer == "hf":
+                        #     x_ids_temp = hf_tokenizer(x_strs, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
+                        #     y_temp = hf_tokenizer(y_strs, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
+                        # else:
+                        #     x_ids_temp = str_to_tensor(x_strs, char_to_id).to(device)
+                        #     y_temp = str_to_tensor(y_strs, char_to_id).to(device)
+
                         
+                        sampled_seq_len = random.randint(args.min_seq_len, current_max_seq_len)
+
+                        
+                        x_ids_temp, y_temp = generate_openwebtext_task_unified(
+                            num_samples=args.batch_size,
+                            ds=ds,
+                            tokenizer=hf_tokenizer if args.tokenizer == "hf" else None,
+                            min_tokens=args.min_seq_len,
+                            max_tokens=sampled_seq_len,
+                            char_tokenizer=(args.tokenizer != "hf"),
+                            char_to_id=char_to_id,
+                            str_to_tensor=str_to_tensor,
+                            return_strings=False,
+                            train=True,
+                            device=device
+                        )
+        
                     x_ids.append(x_ids_temp.clone())
                     y.append(y_temp.clone())
-    
+                        
                     if verbose:
                         print(f" x_ids {x_ids_temp.shape} y {y_temp.shape} x_ids dtype {x_ids_temp.dtype} y dtype {y_temp.dtype}" )
+
+                    
             
                     
             dist.barrier()
@@ -1897,8 +2147,10 @@ def main():
             # TRAIN THE MODEL
             #####################################################################################
             # if distributed_adaptive.adam:
+            
             train_loss = distributed_adaptive.distributed_step_adaptive(x_ids, y, criterion, iteration=i)
-            # else:
+            
+            # else: # todo, need to implement this to be more efficient with GPUs
             #     train_loss = distributed_adaptive.distributed_step_SPSA(x_ids, y, criterion, iteration=i)
 
             
@@ -1916,10 +2168,11 @@ def main():
             
                 
             
-            #####################################################################################
-            # UPDATE THE LEARNING RATE WITH OUR FAST/SLOW EMA COSINE LR SCHEDULE
-            #####################################################################################
             if rank == distributed_adaptive.clean_rank:
+                #####################################################################################
+                # UPDATE THE LEARNING RATE WITH OUR FAST/SLOW EMA COSINE LR SCHEDULE
+                #####################################################################################
+            
                 if loss_ema_fast is None:
                     # Initialize both EMAs with the current loss value
                     loss_ema_fast = train_loss
@@ -1955,8 +2208,26 @@ def main():
                     progress = i / cosine_wavelength
                     cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
                     distributed_adaptive.learning_rate = min_lr + (base_lr - min_lr) * cosine_factor
-                
-                            
+
+
+                #####################################################################################
+                # UPDATE THE LEARNING RATE WITH OUR FAST/SLOW EMA COSINE LR SCHEDULE
+                #####################################################################################
+                if loss_ema_fast < args.step_seq_len_loss_thresh:
+                    steps_below_thresh += 1
+                else:
+                    steps_below_thresh = 0
+            
+                if steps_below_thresh >= args.patience_seq_len:
+                    if current_max_seq_len + args.step_seq_len <= args.max_seq_len:
+                        current_max_seq_len += args.step_seq_len
+                        print("="*50)
+                        print(f"[INFO] Increased current_max_seq_len from {current_max_seq_len-args.step_seq_len} to {current_max_seq_len} at iter {i} (loss_ema_fast={loss_ema_fast:.4f})")
+                        print("="*50)
+                    else:
+                        current_max_seq_len = args.max_seq_len
+                    steps_below_thresh = 0
+                    
                 
 
                 #####################################################################################
@@ -1966,22 +2237,56 @@ def main():
 
                     if args.mode == "train":
         
-                        # GENERATE VAL BATCH and run
-                        x_strs, y_strs = generate_openwebtext_task_str(
-                                                    args.batch_size,
-                                                    1,
-                                                    ds,
-                                                    train = False,
-                                                    min_total_seq_len=args.seq_len,
-                                                    verbose = False
-                                                )  
+                        # # GENERATE VAL BATCH and run
+                        # x_strs, y_strs = generate_openwebtext_task_str(
+                        #                             args.batch_size,
+                        #                             1,
+                        #                             ds,
+                        #                             train = False,
+                        #                             total_seq_len=args.seq_len,
+                        #                             verbose = False
+                        #                         )  
+                        # if args.tokenizer == "hf":
+                        #     x_ids = hf_tokenizer(x_strs, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
+                        #     y = hf_tokenizer(y_strs, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
+                        # else:
+                        #     x_ids = str_to_tensor(x_strs, char_to_id).to(device)
+                        #     y = str_to_tensor(y_strs, char_to_id).to(device)
+
+                        val_x_ids, val_y = generate_openwebtext_task_unified(
+                            num_samples=args.batch_size,
+                            ds=ds,
+                            tokenizer=hf_tokenizer if args.tokenizer == "hf" else None,
+                            min_tokens=args.min_seq_len,
+                            max_tokens=sampled_seq_len,
+                            char_tokenizer=(args.tokenizer != "hf"),
+                            char_to_id=char_to_id,
+                            str_to_tensor=str_to_tensor,
+                            return_strings=False,
+                            train=True,
+                            device=device
+                        )
+
+                        
+                        val_loss, val_preds = teacher_forcing_loss_emb_parallel(model, val_x_ids, val_y, criterion, return_predictions=True)
+
                         if args.tokenizer == "hf":
-                            x_ids = hf_tokenizer(x_strs, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
-                            y = hf_tokenizer(y_strs, return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
+                            decode_fn = lambda ids: hf_tokenizer.batch_decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+
                         else:
-                            x_ids = str_to_tensor(x_strs, char_to_id).to(device)
-                            y = str_to_tensor(y_strs, char_to_id).to(device)
-                        val_loss = teacher_forcing_loss_emb_parallel(model, x_ids, y, criterion)
+                            decode_fn = lambda ids: ["".join([id_to_char[i.item()] for i in seq if i.item() in id_to_char]) for seq in ids]
+                        
+                        decoded_preds = decode_fn(val_preds)
+                        decoded_targets = decode_fn(val_y)
+                        decoded_inputs = decode_fn(val_x_ids)
+                        
+                        print("="*30)
+                        print("Validation predictions:")
+                        for jjj in range(min(len(decoded_preds), 5)):  # show up to 5 samples
+                            print(f"[Sample {jjj}] Input:    '{decoded_inputs[jjj]}'")
+                            print(f"[Sample {jjj}] Target:   '{decoded_targets[jjj]}'")
+                            print(f"[Sample {jjj}] Predicted:'{decoded_preds[jjj]}'")
+                        print("="*30)
                     
                     #####################################################################################
                     # log to wandb every val_iters iterations.
@@ -2000,6 +2305,7 @@ def main():
                             "val_loss": val_loss, 
                             "loss_ema_fast":loss_ema_fast,
                             "loss_ema_slow":loss_ema_slow,
+                            "current_max_seq_len":current_max_seq_len,
                             "lr": distributed_adaptive.learning_rate,
                             "weight_decay_loss": weight_decay_loss.item(),
                         }
@@ -2014,7 +2320,7 @@ def main():
                 # Log to stdout
                 #####################################################################################
                 print("="*50)
-                print(f"[Train] Iteration {i}, train_loss = {train_loss}, loss_ema_fast = {loss_ema_fast}, loss_ema_slow = {loss_ema_slow}, lr = {distributed_adaptive.learning_rate}, val_loss = {val_loss}")
+                print(f"[Train] Iteration {i}, train_loss = {train_loss}, loss_ema_fast = {loss_ema_fast}, loss_ema_slow = {loss_ema_slow}, lr = {distributed_adaptive.learning_rate}, val_loss = {val_loss}, current_max_seq_len = {current_max_seq_len}")
                 
                
 
