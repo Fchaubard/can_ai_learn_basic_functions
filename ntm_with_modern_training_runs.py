@@ -3533,6 +3533,7 @@ class MezoAdaptiveSamplingParallel:
         eps_schedule_multiplier=1,
         probe_dropout_rate=0.,
         first_warmup_perturbations=-1,
+        distribution = "normal",
         verbose=True
     ):
         self.model_main = model
@@ -3545,6 +3546,7 @@ class MezoAdaptiveSamplingParallel:
         self.probe_dropout_rate = probe_dropout_rate
         self.first_warmup_perturbations = first_warmup_perturbations
 
+        self.distribution = distribution
         _, meta = flatten_params(model)
         self.meta = meta
 
@@ -3624,7 +3626,12 @@ class MezoAdaptiveSamplingParallel:
                     perturbations = []
                     for p in params:
                         if p.requires_grad:
-                            d = torch.randn_like(p)
+                            if self.distribution =="normal":
+                                d = torch.randn_like(p)
+                            elif self.distribution == "rad":
+                                d = torch.zeros_like(p).bernoulli_().mul_(2).sub_(1)  # samples from {-1, 1}
+                            elif self.distribution == "uniform":
+                                d = torch.zeros_like(p).uniform_(-1, 1)
                             
                             if fixed_size_perturbation:
                                 d = d / (torch.norm(d) + 1e-8)
@@ -5944,6 +5951,7 @@ def main():
     parser.add_argument("--first_warmup_perturbations", type=int, default=-1)
     parser.add_argument("--overfit_to_one_batch_flag", action="store_true",
                         help="This will overfit to just one batch in train (not val) and is just to sanity check and ensure no bug, ensure train_loss hits 0 otherwise something is wrong.")
+    parser.add_argument("--distribution", type=str, default="normal", choices=["normal", "rad", "uniform"])
 
     parser.add_argument("--override_with_interaction_file", action="store_true", help="If true, then we will update the values from the interaction file, if not, we wont.")
 
@@ -6130,13 +6138,13 @@ def main():
         
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
-            threshold=0.001,
+            threshold=0.005,
             threshold_mode='abs', 
             mode='min',  # Minimize the validation loss
-            factor=0.5,  # Reduce the LR by a factor of 0.5
-            patience=500,  # Number of validation epochs with no improvement
+            factor=0.99,  # Reduce the LR by a factor of 0.5
+            patience=100,  # Number of validation epochs with no improvement
             verbose=True,  # Log the change in LR
-            min_lr=1e-9   # Minimum learning rate
+            min_lr=1e-7   # Minimum learning rate
         )
     
     criterion= nn.CrossEntropyLoss(ignore_index=0)
@@ -6184,7 +6192,8 @@ def main():
             eps_schedule_multiplier=args.eps_schedule_multiplier,
             variance_reduction = args.variance_reduction,
             probe_dropout_rate = args.probe_dropout_rate,
-            first_warmup_perturbations = args.first_warmup_perturbations
+            first_warmup_perturbations = args.first_warmup_perturbations,
+            distribution = args.distribution 
     )
         
     # Warmup scheduler
