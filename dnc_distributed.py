@@ -1,5 +1,5 @@
 #!/usr/bin/env python3: 
-# python -m torch.distributed.launch --nproc_per_node=10 dnc_distributed.py 
+# python -m torch.distributed.launch --nproc_per_node=9 dnc_distributed.py 
 # python -m torch.distributed.launch --nproc_per_node=10 --master_port=29501 dnc_distributed.py  
 
 import os, argparse, time
@@ -13,6 +13,7 @@ import math
 from datasets import load_dataset
 import random
 import numpy as np
+
 
 CHUNK_SIZE = 1048576 
 
@@ -68,6 +69,8 @@ def teacher_forcing_loss_emb_parallel(model, x_ids, y_ids_unpadded, criterion, c
             targets = y_ids_unpadded[:, pos+1:chunk_end+1].reshape(-1)  # shift by 1 for next-token prediction
             
             if targets.size(0) > 0:  # ensure we have targets
+                chunk_loss = criterion(out_chunk.to(torch.float64), targets)
+                out_chunk = out_chunk.to(torch.float32)  # Optional: demote if reused below
                 chunk_loss = criterion(out_chunk, targets)
                 total_loss += chunk_loss * targets.size(0)
                 total_predicted_tokens += targets.size(0)
@@ -85,6 +88,8 @@ def teacher_forcing_loss_emb_parallel(model, x_ids, y_ids_unpadded, criterion, c
             return 0.0 if not return_predictions else (0.0, None)
         
         avg_loss = total_loss / total_predicted_tokens
+        avg_loss = avg_loss.to(torch.float32)  # demote back
+
         if return_predictions:
             preds = torch.cat(all_preds, dim=-1).reshape(y_ids_unpadded.size(0), -1)
             return avg_loss, preds
@@ -113,7 +118,6 @@ def generate_openwebtext_task_unified(
     char_to_id=None,
     str_to_tensor=None,
     return_strings: bool = False,
-    train: bool = True,
     device="cuda",
     verbose: bool = False,
 ):
@@ -121,8 +125,8 @@ def generate_openwebtext_task_unified(
     target_token_list = []
     input_str_list = []
     target_str_list = []
-
-    size_of_ds = len(ds)
+ 
+    size_of_ds = 300 #len(ds) # REMOVE AFTER TESTING FINISHED! WANT TO TEST IF WE CAN OVERFIT
 
     while len(input_token_list) < num_samples:
         doc_idx = random.randint(0, size_of_ds - 1)
@@ -180,9 +184,9 @@ def generate_openwebtext_task_unified(
                 input_str_list.append(tokenizer.decode(input_tokens, skip_special_tokens=False))
                 target_str_list.append(tokenizer.decode(target_tokens, skip_special_tokens=False))
 
-    # Pad and stack
-    x_ids = torch.nn.utils.rnn.pad_sequence(input_token_list, batch_first=True, padding_value=tokenizer.pad_token_id)
-    y = torch.nn.utils.rnn.pad_sequence(target_token_list, batch_first=True, padding_value=tokenizer.pad_token_id)
+            # Pad and stack
+            x_ids = torch.nn.utils.rnn.pad_sequence(input_token_list, batch_first=True, padding_value=tokenizer.pad_token_id)
+            y = torch.nn.utils.rnn.pad_sequence(target_token_list, batch_first=True, padding_value=tokenizer.pad_token_id)
 
     # print("="*50)
     # print(f" x_ids: {x_ids}")
@@ -458,10 +462,14 @@ class MezoAdaptiveSamplingParallel:
                  meta_perturbations=1,
                  weight_decay=0.0,
                  scatter_batch=False,
+                 normal_distribution =True,
+                 l1_norm = False,
                  verbose=True):
+        self.normal_distribution = normal_distribution
+        self.l1_norm = l1norm
         self.learning_rate = learning_rate
         self.probe_dropout_rate = probe_dropout_rate
-        self.epsilon_tying_ratio = epsilon_tying_ratio  # initial; later tied 1:1 with lr
+        self.epsilon_tying_ratio = epsilon_tying_ratio 
         self.beta1 = beta1
         self.beta2 = beta2
         self.adam = adam
@@ -676,8 +684,11 @@ class MezoAdaptiveSamplingParallel:
                 self.probe_list = []
                 
                 for p in self.param_list:
-                    probe = torch.zeros_like(p)
-                    probe.normal_(mean=0, std=1)
+                    if self.normal_distribution:
+                        probe = torch.zeros_like(p)
+                        probe.normal_(mean=0, std=1)
+                    else:
+                        probe = torch.randint_like(p, low=0, high=2).float().mul_(2).sub_(1) #rademacher
                     # probe.mul_(self.epsilon)
                     self.probe_list.append(probe)
 
@@ -811,8 +822,12 @@ class MezoAdaptiveSamplingParallel:
                 log_start("Stage 3d", rank)
             if rank >= 2:
                 if self.probe_normalization:
-                    norm_val = torch.sqrt(sum(torch.sum(p*p) for p in self.probe_list))
-                    
+                    if self.l1_norm:
+                        norm_val = sum(torch.sum(p.abs()) for p in self.probe_list)  #l1 norm
+                    else:
+                        norm_val = torch.sqrt(sum(torch.sum(p*p) for p in self.probe_list)) #l2 norm
+                        
+                    #                     
                     # if self.verbose:
                     log_msg("Stage 3d", rank, f"probe norm = {norm_val}")
                     
@@ -1035,7 +1050,10 @@ class MezoAdaptiveSamplingParallel:
             log_msg("Stage 10a", rank, f"sum squares of avg_probe_list {(sum(torch.sum(p*p) for p in self.avg_probe_list) )}")
             # normalize the gradients if gradient_normalization
             if self.gradient_normalization:
-                normed_val = torch.sqrt(sum(torch.sum(p*p) for p in self.avg_probe_list) ) 
+                if self.l1_norm:
+                    normed_val = sum(torch.sum(p.abs()) for p in self.avg_probe_list)
+                else:
+                    normed_val = torch.sqrt(sum(torch.sum(p*p) for p in self.avg_probe_list) ) 
                 log_msg("Stage 10a", rank, f"normed_val {normed_val}")
                 if normed_val != 0:  # Avoid division by zero
                     for p in self.avg_probe_list:
@@ -1169,7 +1187,9 @@ class MezoAdaptiveSamplingParallel:
             # list_inplace_sub(self.param_list, self.adam_ratio_list, alpha=current_lr)
             if self.verbose:
                 log_msg("Stage 11", rank, f"Updated theta_t with learning rate {current_lr:.6f} in place.")
-            log_msg(" ", rank, f"gathered_losses {gathered_losses}.")
+            formatted = {k: f"{v.item():.6f}" for k, v in gathered_losses.items()}
+
+            log_msg(" ", rank, f"gathered_losses {formatted}.")
             log_msg(" ", rank, f"grad_est_dict {grad_est_dict}.")
             
             # After Stage 11 param update on Rank 1, apply weight decay
@@ -1576,83 +1596,83 @@ def get_char_vocab():
     return vocab_list, char_to_id, id_to_char
 
 
-def generate_openwebtext_task_str(
-    num_samples: int,
-    context_length: int,
-    ds,
-    max_n=None,   # unused in OWT, but we keep the signature to match the others
-    train: bool = True,
-    total_seq_len=100,
-    verbose=False
-):
-    split_name = "train" if train else "validation"
+# def generate_openwebtext_task_str(
+#     num_samples: int,
+#     context_length: int,
+#     ds,
+#     max_n=None,   # unused in OWT, but we keep the signature to match the others
+#     train: bool = True,
+#     total_seq_len=100,
+#     verbose=False
+# ):
+#     split_name = "train" if train else "validation"
 
-    size_of_ds = len(ds)
-    in_list = []
-    out_list = []
+#     size_of_ds = len(ds)
+#     in_list = []
+#     out_list = []
     
-    while len(in_list) < num_samples:
-        # Keep trying docs until we find one that meets our length requirement
-        max_tries = 100  # Avoid infinite loop
-        tries = 0
-        valid_doc = False
+#     while len(in_list) < num_samples:
+#         # Keep trying docs until we find one that meets our length requirement
+#         max_tries = 100  # Avoid infinite loop
+#         tries = 0
+#         valid_doc = False
         
-        while not valid_doc and tries < max_tries:
-            doc_idx = random.randint(0, size_of_ds - 1)
-            doc = ds[doc_idx]
-            text = doc["text"] if doc["text"] else ""
+#         while not valid_doc and tries < max_tries:
+#             doc_idx = random.randint(0, size_of_ds - 1)
+#             doc = ds[doc_idx]
+#             text = doc["text"] if doc["text"] else ""
             
-            # Calculate total sequence length including special tokens
-            # Length will be: len(<bos> + prefix) + len(remainder + <eos>)
-            # = 5 + len(text) [5 comes from <bos> and <eos>]
-            this_total_seq_len = len(text) + 5  # +5 for <bos> and <eos>
+#             # Calculate total sequence length including special tokens
+#             # Length will be: len(<bos> + prefix) + len(remainder + <eos>)
+#             # = 5 + len(text) [5 comes from <bos> and <eos>]
+#             this_total_seq_len = len(text) + 5  # +5 for <bos> and <eos>
             
-            if this_total_seq_len >= total_seq_len and this_total_seq_len<20000: # crazy large number
-                valid_doc = True
-            else:
-                tries += 1
+#             if this_total_seq_len >= total_seq_len and this_total_seq_len<20000: # crazy large number
+#                 valid_doc = True
+#             else:
+#                 tries += 1
         
-        # If we couldn't find a long enough doc after max_tries,
-        # pad the last one we found
-        if not valid_doc:
-            needed = total_seq_len - this_total_seq_len
-            text = text + (" " * needed)
+#         # If we couldn't find a long enough doc after max_tries,
+#         # pad the last one we found
+#         if not valid_doc:
+#             needed = total_seq_len - this_total_seq_len
+#             text = text + (" " * needed)
             
-        # Now ensure text is at least context_length
-        if len(text) < context_length:
-            needed = context_length - len(text)
-            text = text + (" " * needed)
+#         # Now ensure text is at least context_length
+#         if len(text) < context_length:
+#             needed = context_length - len(text)
+#             text = text + (" " * needed)
             
-        # Split into prefix and remainder
-        prefix = text[:context_length]
-        remainder = text[context_length:total_seq_len] # HACKY! TODO TO CLEAN UP BUT ONLY THING I CAN DO TO MAKE NTM AND DNC FASTER
+#         # Split into prefix and remainder
+#         prefix = text[:context_length]
+#         remainder = text[context_length:total_seq_len] # HACKY! TODO TO CLEAN UP BUT ONLY THING I CAN DO TO MAKE NTM AND DNC FASTER
         
-        # Create input and target strings
-        input_str = f"<bos>{prefix}"
-        target_str = f"{remainder}<eos>"
+#         # Create input and target strings
+#         input_str = f"<bos>{prefix}"
+#         target_str = f"{remainder}<eos>"
         
-        in_list.append(input_str)
-        out_list.append(target_str)
+#         in_list.append(input_str)
+#         out_list.append(target_str)
         
-    # Debug prints
-    max_out_len = max(len(i) for i in out_list)
+#     # Debug prints
+#     max_out_len = max(len(i) for i in out_list)
     
 
-    if verbose:
-        print(f"   Max lengths: max={max_out_len}")
+#     if verbose:
+#         print(f"   Max lengths: max={max_out_len}")
         
-        min_in_len = min(len(i) for i in in_list)
-        min_out_len = min(len(i) for i in out_list)
-        max_in_len = max(len(i) for i in in_list)
-        max_out_len = max(len(i) for i in out_list)
+#         min_in_len = min(len(i) for i in in_list)
+#         min_out_len = min(len(i) for i in out_list)
+#         max_in_len = max(len(i) for i in in_list)
+#         max_out_len = max(len(i) for i in out_list)
         
-        print(f"Sequence length stats:")
-        print(f"Input lengths: min={min_in_len}, max={max_in_len}")
-        print(f"Output lengths: min={min_out_len}, max={max_out_len}")
-        print(f"Min total lengths: {[len(i) + len(j) for i,j in zip(in_list, out_list)]}")
+#         print(f"Sequence length stats:")
+#         print(f"Input lengths: min={min_in_len}, max={max_in_len}")
+#         print(f"Output lengths: min={min_out_len}, max={max_out_len}")
+#         print(f"Min total lengths: {[len(i) + len(j) for i,j in zip(in_list, out_list)]}")
 
    
-    return in_list, out_list
+#     return in_list, out_list
 
 
 
@@ -1783,88 +1803,92 @@ def main():
     import os
     os.environ["WANDB_API_KEY"] = ""
 
-    # train on real data 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
-    parser.add_argument("--mode", type=str, choices=["test", "train"], default="train", help="Run mode: test or train.")
-    parser.add_argument("--max_iters", type=int, default=1e10, help="Maximum iterations for training.")
-    parser.add_argument("--learning_rate", type=float, default=0.001, help="Base learning rate (and eps, tied 1:1).")
-    parser.add_argument("--weight_decay", type=float, default=0.001, help="Standard weight decay.")
-    parser.add_argument("--beta1", type=float, default=0.99, help="Base learning rate (and eps, tied 1:1).")
-    parser.add_argument("--beta2", type=float, default=0.999, help="Base learning rate (and eps, tied 1:1).")
-    parser.add_argument("--epsilon_tying_ratio", type=float, default=1.0, help="Perturbation scale epsilon (tied to learning rate).")
-    parser.add_argument("--probe_dropout_rate", type=float, default=0.0, help="Dropout rate for probe vector.")
-    parser.add_argument("--wandb_proj", type=str, default="ZeroProp_Final_Runs_REALDATA", help="WandB project name (optional)")
-    parser.add_argument("--wandb_run", type=str, default="", help="WandB run name (optional)")
-    parser.add_argument("--warmup_iters", type=int, default=100, help="Warmup iterations.")
-    parser.add_argument("--cosine_wavelength", type=int, default=100000, help="Cosine LR wavelength, init to very high.")
-    parser.add_argument("--val_iters", type=int, default=10, help="Val iters, when we run val and log to wandb, and potentially checkpoint.")
-    parser.add_argument("--meta_perturbations", type=int, default=1, help="Number of Perturbations for all ranks per step.")
-    parser.add_argument("--scatter_batch", type=str, choices=["true", "false"], default="false", help="whether each perturbation should be on a different batch, if true, we sample (world_size-2)*batch_size x_ids and y per iter and scatter it to the appropriate ranks.")
-    
-    # New CLI arguments for model configuration
-    parser.add_argument("--model_scale", type=int, default=1, help="Scaling factor for model dimensions.")
-    parser.add_argument("--num_heads", type=int, default=1, help="# dnc heads.")
-    parser.add_argument("--memory_size", type=int, default=1024, help="memory_size.")
-    parser.add_argument("--hidden_size", type=int, default=1024, help="hidden_size.")
-    parser.add_argument("--input_size", type=int, default=1024, help="Input size.")
-    parser.add_argument("--head_size", type=int, default=1024, help="head_size .")
-    
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size. BE SURE TO REDUCE LR AS YOU INCREASE BATCH SIZE BY SQRT(BATCHSIZE) as stability increases the exp delta loss decreases. So needs lower LR.")
-    parser.add_argument("--min_seq_len", type=int, default=10, help="Min sequence length.")
-    parser.add_argument("--max_seq_len", type=int, default=100000, help="Max sequence length.")
-    parser.add_argument("--step_seq_len", type=int, default=10, help="How much to step the sequence length.")
-    parser.add_argument("--step_seq_len_loss_thresh", type=float, default=3.0, help="At what threshold to check the loss to step sequence length.")
-    parser.add_argument("--patience_seq_len", type=int, default=100, help="How patient to be before stepping sequence length.")
-    parser.add_argument("--tokenizer", type=str, default="hf", choices=["hf", None], 
-                    help="Tokenizer to use. If 'hf', will use HuggingFace tokenizer. If None, will use character tokenizer.")
-    parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
-    parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the final gradient before updating the model weights.")
-    parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="true", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
-    parser.add_argument("--adam", type=str, choices=["true", "false"], default="true", help="if true use adam, else use vanilla sgd.")
-    args = parser.parse_args()
-    
-
-    # # TEST OVERFIT FAST DEMO! 
+    # # train on real data 
     # parser = argparse.ArgumentParser()
     # parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
-    # parser.add_argument("--mode", type=str, choices=["test", "train"], default="test", help="Run mode: test or train.")
+    # parser.add_argument("--mode", type=str, choices=["test", "train"], default="train", help="Run mode: test or train.")
     # parser.add_argument("--max_iters", type=int, default=1e10, help="Maximum iterations for training.")
-    # parser.add_argument("--learning_rate", type=float, default=0.001, help="Base learning rate (and eps, tied 1:1).")
-    # parser.add_argument("--beta1", type=float, default=0.9, help="Base learning rate (and eps, tied 1:1).")
-    # parser.add_argument("--beta2", type=float, default=0.9, help="Base learning rate (and eps, tied 1:1).")
+    # parser.add_argument("--learning_rate", type=float, default=0.00001, help="Base learning rate (and eps, tied 1:1).")
+    # parser.add_argument("--weight_decay", type=float, default=0.001, help="Standard weight decay.")
+    # parser.add_argument("--beta1", type=float, default=0.0, help="Base learning rate (and eps, tied 1:1).")
+    # parser.add_argument("--beta2", type=float, default=0.0, help="Base learning rate (and eps, tied 1:1).")
     # parser.add_argument("--epsilon_tying_ratio", type=float, default=1.0, help="Perturbation scale epsilon (tied to learning rate).")
-    # parser.add_argument("--weight_decay", type=float, default=0.01, help="Standard weight decay.")
-    # parser.add_argument("--probe_dropout_rate", type=float, default=0., help="Dropout rate for probe vector.")
-    # parser.add_argument("--wandb_proj", type=str, default="ZeroProp_Final_Runs2", help="WandB project name (optional)")
+    # parser.add_argument("--probe_dropout_rate", type=float, default=0.999, help="Dropout rate for probe vector.")
+    # parser.add_argument("--wandb_proj", type=str, default="ZeroProp_Final_Runs_REALDATA", help="WandB project name (optional)")
     # parser.add_argument("--wandb_run", type=str, default="", help="WandB run name (optional)")
     # parser.add_argument("--warmup_iters", type=int, default=0, help="Warmup iterations.")
-    # parser.add_argument("--cosine_wavelength", type=int, default=100000000, help="Cosine LR wavelength, init to very high.")
+    # parser.add_argument("--cosine_wavelength", type=int, default=100000, help="Cosine LR wavelength, init to very high.")
     # parser.add_argument("--val_iters", type=int, default=10, help="Val iters, when we run val and log to wandb, and potentially checkpoint.")
     # parser.add_argument("--meta_perturbations", type=int, default=1, help="Number of Perturbations for all ranks per step.")
     # parser.add_argument("--scatter_batch", type=str, choices=["true", "false"], default="false", help="whether each perturbation should be on a different batch, if true, we sample (world_size-2)*batch_size x_ids and y per iter and scatter it to the appropriate ranks.")
-
+    
+    # # New CLI arguments for model configuration
     # parser.add_argument("--model_scale", type=int, default=1, help="Scaling factor for model dimensions.")
     # parser.add_argument("--num_heads", type=int, default=16, help="# dnc heads.")
     # parser.add_argument("--memory_size", type=int, default=1024, help="memory_size.")
     # parser.add_argument("--hidden_size", type=int, default=1024, help="hidden_size.")
     # parser.add_argument("--input_size", type=int, default=1024, help="Input size.")
     # parser.add_argument("--head_size", type=int, default=1024, help="head_size .")
-    # parser.add_argument("--batch_size", type=int, default=1, help="Batch size. BE SURE TO REDUCE LR AS YOU INCREASE BATCH SIZE BY SQRT(BATCHSIZE) as stability increases the exp delta loss decreases. So needs lower LR.")
-    # parser.add_argument("--min_seq_len", type=int, default=10, help="Min sequence length.")
-    # parser.add_argument("--max_seq_len", type=int, default=10, help="Max sequence length.")
+    
+    # parser.add_argument("--batch_size", type=int, default=128, help="Batch size. BE SURE TO REDUCE LR AS YOU INCREASE BATCH SIZE BY SQRT(BATCHSIZE) as stability increases the exp delta loss decreases. So needs lower LR.")
+    # parser.add_argument("--min_seq_len", type=int, default=4, help="Min sequence length.")
+    # parser.add_argument("--max_seq_len", type=int, default=100000, help="Max sequence length.")
     # parser.add_argument("--step_seq_len", type=int, default=10, help="How much to step the sequence length.")
     # parser.add_argument("--step_seq_len_loss_thresh", type=float, default=3.0, help="At what threshold to check the loss to step sequence length.")
-    # parser.add_argument("--patience_seq_len", type=int, default=100, help="How patient to be before stepping sequence length.")    
+    # parser.add_argument("--patience_seq_len", type=int, default=100, help="How patient to be before stepping sequence length.")
     # parser.add_argument("--tokenizer", type=str, default="hf", choices=["hf", None], 
     #                 help="Tokenizer to use. If 'hf', will use HuggingFace tokenizer. If None, will use character tokenizer.")
-    # parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
-    # parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the final gradient before updating the model weights.")
-    # parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="true", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
-    # parser.add_argument("--adam", type=str, choices=["true", "false"], default="true", help="if true use adam, else use vanilla sgd.")
+    # parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="false", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
+    # parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="false", help="normalizes the final gradient before updating the model weights.")
+    # parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="false", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
+    # parser.add_argument("--adam", type=str, choices=["true", "false"], default="false", help="if true use adam, else use vanilla sgd.")
     # args = parser.parse_args()
+    
 
-    # torch.backends.cudnn.enabled = False
+    # # TEST OVERFIT FAST DEMO! 
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
+    parser.add_argument("--mode", type=str, choices=["test", "train"], default="test", help="Run mode: test or train.")
+    parser.add_argument("--max_iters", type=int, default=1e10, help="Maximum iterations for training.")
+    parser.add_argument("--learning_rate", type=float, default=0.001, help="Base learning rate (and eps, tied 1:1).")
+    parser.add_argument("--beta1", type=float, default=0.0, help="Base learning rate (and eps, tied 1:1).")
+    parser.add_argument("--beta2", type=float, default=0.0, help="Base learning rate (and eps, tied 1:1).")
+    parser.add_argument("--epsilon_tying_ratio", type=float, default=1.0, help="Perturbation scale epsilon (tied to learning rate).")
+    parser.add_argument("--weight_decay", type=float, default=0.0, help="Standard weight decay.")
+    parser.add_argument("--probe_dropout_rate", type=float, default=0., help="Dropout rate for probe vector.")
+    parser.add_argument("--wandb_proj", type=str, default="ZeroProp_Final_Runs2", help="WandB project name (optional)")
+    parser.add_argument("--wandb_run", type=str, default="", help="WandB run name (optional)")
+    parser.add_argument("--warmup_iters", type=int, default=0, help="Warmup iterations.")
+    parser.add_argument("--cosine_wavelength", type=int, default=100000000, help="Cosine LR wavelength, init to very high.")
+    parser.add_argument("--val_iters", type=int, default=10, help="Val iters, when we run val and log to wandb, and potentially checkpoint.")
+    parser.add_argument("--meta_perturbations", type=int, default=10, help="Number of Perturbations for all ranks per step.")
+    parser.add_argument("--scatter_batch", type=str, choices=["true", "false"], default="false", help="whether each perturbation should be on a different batch, if true, we sample (world_size-2)*batch_size x_ids and y per iter and scatter it to the appropriate ranks.")
+
+    parser.add_argument("--model_scale", type=int, default=64, help="Scaling factor for model dimensions.")
+    parser.add_argument("--num_heads", type=int, default=7, help="# dnc heads.")
+    parser.add_argument("--memory_size", type=int, default=128, help="memory_size.")
+    parser.add_argument("--hidden_size", type=int, default=128, help="hidden_size.")
+    parser.add_argument("--input_size", type=int, default=128, help="Input size.")
+    parser.add_argument("--head_size", type=int, default=128, help="head_size .")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size. BE SURE TO REDUCE LR AS YOU INCREASE BATCH SIZE BY SQRT(BATCHSIZE) as stability increases the exp delta loss decreases. So needs lower LR.")
+    parser.add_argument("--min_seq_len", type=int, default=100, help="Min sequence length.")
+    parser.add_argument("--max_seq_len", type=int, default=100, help="Max sequence length.")
+    parser.add_argument("--step_seq_len", type=int, default=10, help="How much to step the sequence length.")
+    parser.add_argument("--step_seq_len_loss_thresh", type=float, default=0.0, help="At what threshold to check the loss to step sequence length.")
+    parser.add_argument("--patience_seq_len", type=int, default=100, help="How patient to be before stepping sequence length.")    
+    parser.add_argument("--tokenizer", type=str, default=None, choices=["hf", None], 
+                    help="Tokenizer to use. If 'hf', will use HuggingFace tokenizer. If None, will use character tokenizer.")
+    parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="false", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
+    parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the final gradient before updating the model weights.")
+    parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="false", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
+    parser.add_argument("--adam", type=str, choices=["true", "false"], default="true", help="if true use adam, else use vanilla sgd.")
+    parser.add_argument("--use_different_batch_per_meta_perturbation", type=str, choices=["true", "false"], default="true", help="if true use a different minibatch per meta_perturbation, else use all the same.")
+    parser.add_argument("--normal_distribution", type=str, choices=["true", "false"], default="true", help="if true use normal distribution, otherwise use rademacher +/- 1.")
+    parser.add_argument("--l1_norm", type=str, choices=["true", "false"], default="true", help="if true use L1 norm, else use L2 norm for grad normalization and for probe normalization (may help stablize for very large models).")
+    
+    args = parser.parse_args()
+
+    torch.backends.cudnn.enabled = False
 
     #####################################################################################
     # SETUP TRAINING
@@ -1917,7 +1941,7 @@ def main():
     args.memory_size = args.memory_size * args.model_scale
     args.head_size = args.head_size * args.model_scale
     args.input_size = args.input_size * args.model_scale
-    args.num_heads = args.num_heads * args.model_scale # added recently
+    # args.num_heads = args.num_heads * args.model_scale
 
 
     run_name = f"{args.mode}_lr{args.learning_rate}_scale{args.model_scale}_pdrop{args.probe_dropout_rate}"
@@ -1956,6 +1980,7 @@ def main():
     
     
     args.scatter_batch = True if args.scatter_batch == "true" else False 
+    args.use_different_batch_per_meta_perturbation = True if args.use_different_batch_per_meta_perturbation == "true" else False 
 
     distributed_adaptive = MezoAdaptiveSamplingParallel(
         model=model,
@@ -1971,6 +1996,8 @@ def main():
         gradient_normalization=args.gradient_normalization=="true",
         meta_perturbations=args.meta_perturbations,
         scatter_batch = args.scatter_batch,
+        normal_distribution =args.normal_distribution=="true",
+        l1_norm = args.l1_norm=="true",
         verbose=verbose
     )
     dist.barrier()
@@ -2051,11 +2078,15 @@ def main():
         try:
             ds = load_dataset(
                 "haritzpuerto/the_pile_00_OpenWebText2",
-                split="train",
+                # split="train",
                 # cache_dir="/hf_cache/",
                 # use_auth_token=False,  # Disable authentication to avoid API calls
                 download_mode="reuse_dataset_if_exists"  # Reuse the cached dataset
             )
+            # now we can use:
+            # ds['train']
+            # ds['validation']
+            # ds['test']
             break
         except Exception as e:
             print("Hugging face issue...")
@@ -2089,7 +2120,7 @@ def main():
 
                 for j in range(args.meta_perturbations):
 
-                    if args.mode == "train" or (args.mode == "test" and j==0):
+                    if (args.mode == "train" and args.use_different_batch_per_meta_perturbation) or (args.mode == "test" and j==0) or (args.mode == "train" and j==0 and not args.use_different_batch_per_meta_perturbation):
                         # Incorporate these here now:
                         # parser.add_argument("--min_seq_len", type=int, default=10, help="Min sequence length.")
                         # parser.add_argument("--max_seq_len", type=int, default=100000, help="Max sequence length.")
@@ -2120,7 +2151,7 @@ def main():
                         
                         x_ids_temp, y_temp = generate_openwebtext_task_unified(
                             num_samples=args.batch_size,
-                            ds=ds,
+                            ds=ds["train"],
                             tokenizer=hf_tokenizer if args.tokenizer == "hf" else None,
                             min_tokens=args.min_seq_len,
                             max_tokens=sampled_seq_len,
@@ -2128,12 +2159,11 @@ def main():
                             char_to_id=char_to_id,
                             str_to_tensor=str_to_tensor,
                             return_strings=False,
-                            train=True,
                             device=device
                         )
         
-                    x_ids.append(x_ids_temp.clone())
-                    y.append(y_temp.clone())
+                    x_ids.append(x_ids_temp)
+                    y.append(y_temp)
                         
                     if verbose:
                         print(f" x_ids {x_ids_temp.shape} y {y_temp.shape} x_ids dtype {x_ids_temp.dtype} y dtype {y_temp.dtype}" )
@@ -2255,7 +2285,7 @@ def main():
 
                         val_x_ids, val_y = generate_openwebtext_task_unified(
                             num_samples=args.batch_size,
-                            ds=ds,
+                            ds=ds["validation"],
                             tokenizer=hf_tokenizer if args.tokenizer == "hf" else None,
                             min_tokens=args.min_seq_len,
                             max_tokens=sampled_seq_len,
@@ -2263,7 +2293,6 @@ def main():
                             char_to_id=char_to_id,
                             str_to_tensor=str_to_tensor,
                             return_strings=False,
-                            train=True,
                             device=device
                         )
 
