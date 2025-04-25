@@ -1,5 +1,5 @@
 #!/usr/bin/env python3: 
-# python -m torch.distributed.launch --nproc_per_node=9 dnc_distributed.py 
+# python -m torch.distributed.launch --nproc_per_node=10 dnc_distributed.py 
 # python -m torch.distributed.launch --nproc_per_node=10 --master_port=29501 dnc_distributed.py  
 
 import os, argparse, time
@@ -15,7 +15,7 @@ import random
 import numpy as np
 
 
-CHUNK_SIZE = 1048576 
+CHUNK_SIZE = 2**22 
 
 
 def teacher_forcing_loss_emb_parallel(model, x_ids, y_ids_unpadded, criterion, chunk_size=32, x_emb=None, return_predictions=False):
@@ -126,7 +126,7 @@ def generate_openwebtext_task_unified(
     input_str_list = []
     target_str_list = []
  
-    size_of_ds = 300 #len(ds) # REMOVE AFTER TESTING FINISHED! WANT TO TEST IF WE CAN OVERFIT
+    size_of_ds = len(ds) #300 #len(ds) # REMOVE AFTER TESTING FINISHED! WANT TO TEST IF WE CAN OVERFIT
 
     while len(input_token_list) < num_samples:
         doc_idx = random.randint(0, size_of_ds - 1)
@@ -464,15 +464,17 @@ class MezoAdaptiveSamplingParallel:
                  scatter_batch=False,
                  normal_distribution =True,
                  l1_norm = False,
+                 antithetic = True,
                  verbose=True):
         self.normal_distribution = normal_distribution
-        self.l1_norm = l1norm
+        self.l1_norm = l1_norm
         self.learning_rate = learning_rate
         self.probe_dropout_rate = probe_dropout_rate
         self.epsilon_tying_ratio = epsilon_tying_ratio 
         self.beta1 = beta1
         self.beta2 = beta2
         self.adam = adam
+        self.antithetic = antithetic
         self.weight_decay = weight_decay
         if not adam:
             self.beta1 = 0.
@@ -533,7 +535,7 @@ class MezoAdaptiveSamplingParallel:
 
 
 
-    def distributed_step_adaptive(self, x_ids_list, y_list, criterion, iteration):
+    def forward_difference_distributed(self, x_ids_list, y_list, criterion, iteration):
         
         rank = dist.get_rank()
         world_size = dist.get_world_size()
@@ -681,16 +683,23 @@ class MezoAdaptiveSamplingParallel:
             if self.verbose:
                 log_start("Stage 3a", rank)
             if rank >= 2:
-                self.probe_list = []
-                
-                for p in self.param_list:
-                    if self.normal_distribution:
-                        probe = torch.zeros_like(p)
-                        probe.normal_(mean=0, std=1)
-                    else:
-                        probe = torch.randint_like(p, low=0, high=2).float().mul_(2).sub_(1) #rademacher
-                    # probe.mul_(self.epsilon)
-                    self.probe_list.append(probe)
+                if not self.antithetic or (self.antithetic and meta_pert%2==0):
+                    self.probe_list = []
+                    
+                    for p in self.param_list:
+                        if self.normal_distribution:
+                            probe = torch.zeros_like(p)
+                            probe.normal_(mean=0, std=1)
+                        else:
+                            probe = torch.randint_like(p, low=0, high=2).float().mul_(2).sub_(1) #rademacher
+                        # probe.mul_(self.epsilon)
+                        self.probe_list.append(probe)
+                else:
+                    for p in self.probe_list:
+                        p.mul_(-1.)
+                    if self.verbose:
+                        print(f"[Rank {rank} | antithetic sampling")
+                        
 
                 ############
                 # FOR DEBUG (DELETE ME AFTER)
@@ -1025,8 +1034,8 @@ class MezoAdaptiveSamplingParallel:
                 if self.verbose:
                     log_end("Stage 9b", rank)
                 
-                if rank == 1:
-                    log_msg("Stage 9b", rank, f"Finished Meta-Perturbation {meta_pert}.")
+            if rank == 1:
+                log_msg("Stage 9b", rank, f"Finished Meta-Perturbation {meta_pert}.")
 
         dist.barrier()
         # -------------------- Stage 10: Rank 1 Streams Averaged Probe to Rank 0; Rank 0 Updates Adam State --------------------
@@ -1213,6 +1222,447 @@ class MezoAdaptiveSamplingParallel:
             return loss
         else:
             return None
+
+
+    
+    
+    def central_difference_distributed(self, x_ids_list, y_list, criterion, iteration):
+        """
+        Implements central difference gradient estimation in a distributed fashion.
+        Each rank calculates probes on the fly without storing them, to save VRAM.
+        
+        Args:
+            x_ids_list: List of input tensors, one for each meta-perturbation
+            y_list: List of target tensors, one for each meta-perturbation
+            criterion: Loss function
+            iteration: Current training iteration
+            
+        Returns:
+            Loss value on rank 1, None on other ranks
+        """
+        def generate_probe_and_update(param, alpha, seed_val=None):
+            """
+            Helper function to generate a probe on-the-fly and update parameters.
+            
+            Args:
+                param: Parameter tensor to update
+                alpha: Scaling factor for the probe
+                seed_val: Optional seed value for reproducibility
+                
+            Returns:
+                None (updates param in-place)
+            """
+            if seed_val is not None:
+                # Save current states
+                old_rng_state = torch.get_rng_state()
+                old_cuda_rng_state = torch.cuda.get_rng_state()
+                
+                # Set seed for reproducibility
+                torch.manual_seed(seed_val)
+                torch.cuda.manual_seed(seed_val)
+                
+            # Generate perturbation on-the-fly
+            if self.normal_distribution:
+                probe = torch.zeros_like(param)
+                probe.normal_(mean=0, std=1)
+            else:
+                # For Rademacher distribution
+                probe = torch.randint_like(param, low=0, high=2).float().mul_(2).sub_(1)
+            
+            # Apply dropout if specified
+            if self.probe_dropout_rate > 0:
+                mask = (torch.rand_like(probe) > self.probe_dropout_rate).float()
+                probe.mul_(mask)
+                del mask
+            
+            # Apply perturbation directly
+            param.add_(probe, alpha=alpha)
+            
+            # Return probe if needed (when alpha=0)
+            if alpha == 0:
+                result_probe = probe.clone()
+                del probe
+                
+                # Restore RNG state if we changed it
+                if seed_val is not None:
+                    torch.set_rng_state(old_rng_state)
+                    torch.cuda.set_rng_state(old_cuda_rng_state)
+                    
+                return result_probe
+            
+            # Restore RNG state if we changed it
+            if seed_val is not None:
+                torch.set_rng_state(old_rng_state)
+                torch.cuda.set_rng_state(old_cuda_rng_state)
+            
+            # Free memory immediately
+            del probe
+            return None
+        
+        def generate_probe_chunk(chunk_size, seed_val=None):
+            """
+            Generate a probe for a chunk of parameters.
+            
+            Args:
+                chunk_size: Size of the chunk
+                seed_val: Optional seed value for reproducibility
+                
+            Returns:
+                Probe tensor for the chunk
+            """
+            if seed_val is not None:
+                # Save current states
+                old_rng_state = torch.get_rng_state()
+                old_cuda_rng_state = torch.cuda.get_rng_state()
+                
+                # Set seed for reproducibility
+                torch.manual_seed(seed_val)
+                torch.cuda.manual_seed(seed_val)
+            
+            # Generate perturbation for the chunk
+            if self.normal_distribution:
+                chunk_probe = torch.zeros(chunk_size, device=device)
+                chunk_probe.normal_(mean=0, std=1)
+            else:
+                # For Rademacher distribution
+                chunk_probe = torch.randint(0, 2, (chunk_size,), device=device).float().mul_(2).sub_(1)
+            
+            # Apply dropout if needed
+            if self.probe_dropout_rate > 0:
+                chunk_mask = (torch.rand(chunk_size, device=device) > self.probe_dropout_rate).float()
+                chunk_probe.mul_(chunk_mask)
+                del chunk_mask
+            
+            # Restore RNG state if we changed it
+            if seed_val is not None:
+                torch.set_rng_state(old_rng_state)
+                torch.cuda.set_rng_state(old_cuda_rng_state)
+                
+            return chunk_probe
+        
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        device = self.param_list[0].device if self.param_list is not None else torch.device(f"cuda:{rank}")
+        
+        # Calculate total perturbations across all ranks
+        total_perturbations = self.meta_perturbations * (world_size - 1)
+        
+        current_lr = self.learning_rate
+        self.epsilon = self.epsilon_tying_ratio * current_lr
+        
+        dist.barrier()
+        
+        # Stage 0: Generate seeds with global rank offset to ensure uniqueness
+        if rank >= 1:
+            # Generate seeds unique to this rank
+            base_seed = np.random.randint(0, 2**32)
+            rank_seeds = [base_seed + rank * 10000 + i for i in range(self.meta_perturbations)]
+            
+            if self.verbose:
+                print(f"[Rank {rank}] Generated seeds: {rank_seeds}")
+        
+        # -------------------- Stage 0: Broadcast clean model parameters from Rank 1 to other ranks --------------------
+        if self.verbose:
+            log_start("Stage 0", rank)
+        
+        if rank >= 1:
+            for p in self.param_list:
+                broadcast_in_group(p, src_rank=1, group=self.group_except_zero)
+            
+            if self.verbose and self.param_list is not None:
+                norm = sum(torch.norm(p).item() for p in self.param_list)
+                print(f"[Rank {rank}] AFTER STAGE 0 | param_list | L2 norm: {norm:.6f}")
+        
+        dist.barrier()
+        
+        # For each rank, initialize grad_est accumulator
+        if rank >= 1:
+            grad_est_list = []  # Will hold the gradient estimates for each perturbation
+
+        if rank == 1: 
+            accumulated_losses = 0.0 # to keep track of total loss
+            
+        # Process each meta-perturbation, we do 2 fpasses +eps*d and -eps*d
+        for meta_pert in range(self.meta_perturbations):
+
+            # -------------------- Stage 1: Broadcast x_ids and y from Rank 1 to other ranks --------------------
+            if rank >= 1:
+                # Get data for this perturbation
+                x_ids = x_ids_list[meta_pert]
+                y = y_list[meta_pert]
+                if self.verbose:
+                    log_start(f" {meta_pert} / {self.meta_perturbations} Stage 1", rank)
+                    
+                # Broadcast data if not using scattered batches
+                if not self.scatter_batch:
+                    
+                    if rank == 1:
+                        x_shape = torch.tensor([x_ids.size(0), x_ids.size(1)], device=device, dtype=torch.long)
+                        y_shape = torch.tensor([y.size(0), y.size(1)], device=device, dtype=torch.long)
+                        x_ids = x_ids.to(device)
+                        y = y.to(device)
+                    else:
+                        x_shape = torch.zeros(2, device=device, dtype=torch.long)
+                        y_shape = torch.zeros(2, device=device, dtype=torch.long)
+                    
+                    broadcast_in_group(x_shape, src_rank=1, group=self.group_except_zero)
+                    broadcast_in_group(y_shape, src_rank=1, group=self.group_except_zero)
+                    
+                    if rank >= 2:
+                        x_ids = torch.zeros((x_shape[0].item(), x_shape[1].item()), device=device, dtype=torch.long)
+                        y = torch.zeros((y_shape[0].item(), y_shape[1].item()), device=device, dtype=torch.long)
+                    
+                    broadcast_in_group(x_ids, src_rank=1, group=self.group_except_zero)
+                    broadcast_in_group(y, src_rank=1, group=self.group_except_zero)
+                    
+                if self.verbose:
+                    log_end(f" {meta_pert} / {self.meta_perturbations} Stage 1", rank)
+            
+
+
+            dist.barrier()
+            
+            # -------------------- Stage 2: For each rank >= 1, sample probe OTF and perform central difference estimation --------------------
+            if rank >= 1:
+                # Get seed for this perturbation
+                seed = rank_seeds[meta_pert]
+                
+                # Step 1: Apply +epsilon perturbation
+                if self.verbose:
+                    log_msg(f" {meta_pert} / {self.meta_perturbations} Stage 2: CD Step", rank, "Applying +epsilon perturbation")
+                
+                # Apply +epsilon perturbation using helper function
+                for p in self.param_list:
+                    generate_probe_and_update(p, self.epsilon, seed)
+                
+                # Forward pass with +epsilon
+                plus_loss = teacher_forcing_loss_emb_parallel(self.model, x_ids, y, criterion)
+                
+                # Sanitize loss
+                if not torch.isfinite(plus_loss):
+                    if self.verbose:
+                        log_msg(f" {meta_pert} / {self.meta_perturbations} Stage 2: CD Step", rank, f"Plus loss was NaN/Inf: {plus_loss}, replacing with 0.")
+                    plus_loss = torch.tensor(0.0, device=device)
+                
+                # Step 2: Apply -epsilon perturbation (need to go from +epsilon to -epsilon)
+                if self.verbose:
+                    log_msg(f" {meta_pert} / {self.meta_perturbations} Stage 2: CD Step", rank, "Applying -epsilon perturbation")
+                
+                # Apply -2*epsilon to go from +epsilon to -epsilon
+                for p in self.param_list:
+                    generate_probe_and_update(p, -2 * self.epsilon, seed)
+                
+                # Forward pass with -epsilon
+                minus_loss = teacher_forcing_loss_emb_parallel(self.model, x_ids, y, criterion)
+                
+                # Sanitize loss
+                if not torch.isfinite(minus_loss):
+                    if self.verbose:
+                        log_msg(f" {meta_pert} / {self.meta_perturbations} Stage 2: CD Step", rank, f"Minus loss was NaN/Inf: {minus_loss}, replacing with 0.")
+                    minus_loss = torch.tensor(0.0, device=device)
+                
+                # Step 3: Restore the original parameters
+                if self.verbose:
+                    log_msg(f" {meta_pert} / {self.meta_perturbations} Stage 2: CD Step", rank, "Restoring original parameters")
+                
+                # Apply +epsilon again to restore original parameters
+                for p in self.param_list:
+                    generate_probe_and_update(p, self.epsilon, seed)
+                
+                # Calculate gradient estimate for this perturbation using central difference
+                grad_est = (plus_loss - minus_loss) / (2 * self.epsilon)
+                
+                if self.verbose:
+                    log_msg(f" {meta_pert} / {self.meta_perturbations} Stage 2: CD Step", rank, f"plus_loss: {plus_loss}, minus_loss: {minus_loss}, grad_est: {grad_est}")
+                
+                # Store gradient estimate for this perturbation
+                grad_est_list.append(grad_est)
+                if rank == 1:
+                    accumulated_losses += (plus_loss + minus_loss)/2.  # Only add the plus_loss which is the clean loss
+
+            
+            dist.barrier()
+        
+        # -------------------- Stage 3: Done with perturbations, now update adam moments on rank 0 from grad_ests on all other ranks --------------------
+        # After all perturbations, compute and update gradients
+        if rank >= 1:
+            if self.verbose:
+                log_msg("Stage 3: Gradient Computation", rank, "Computing gradients using generators")
+            
+            # Re-initialize generators with the same seeds to reproduce probes exactly
+            generators = [torch.Generator(device=f"cuda:{rank}").manual_seed(seed) for seed in rank_seeds]
+            
+            # For each parameter, process in chunks
+            for param_idx, param in enumerate(self.param_list):
+                param_numel = param.numel()
+                
+                # Process each parameter in chunks
+                for start in range(0, param_numel, CHUNK_SIZE):
+                    end = min(param_numel, start + CHUNK_SIZE)
+                    chunk_size = end - start
+                    
+                    # Accumulator for this chunk's gradient contribution from this rank
+                    chunk_grad = torch.zeros(chunk_size, device=device)
+                    
+                    # For each perturbation on this rank
+                    for pert_idx, generator in enumerate(generators):
+                        if self.verbose:
+                            log_msg(f"Stage 3: Gradient Update param_idx={param_idx}/{len(self.param_list)}  start={start}/{param_numel} pert_idx={pert_idx}/{self.meta_perturbations} ", rank, "Completed gradient computation")
+                        # Generate the probe chunk using the same generator state
+                        if self.normal_distribution:
+                            chunk_probe = torch.zeros(chunk_size, device=device)
+                            chunk_probe.normal_(mean=0, std=1, generator=generator)
+                        else:
+                            # For Rademacher, manually generate with generator
+                            uniform = torch.rand(chunk_size, device=device, generator=generator)
+                            chunk_probe = (uniform > 0.5).float().mul_(2).sub_(1)
+                        
+                        # Apply dropout if specified (with same generator for consistency)
+                        if self.probe_dropout_rate > 0:
+                            drop_mask = torch.rand(chunk_size, device=device, generator=generator)
+                            mask = (drop_mask > self.probe_dropout_rate).float()
+                            chunk_probe.mul_(mask)
+                            del mask
+                        
+                        # Scale by this perturbation's gradient estimate
+                        chunk_probe.mul_(grad_est_list[pert_idx])
+                        
+                        # Add to the accumulator
+                        chunk_grad.add_(chunk_probe)
+                        del chunk_probe
+                    
+                    # Send this chunk's gradient to rank 0
+                    dist.reduce(chunk_grad, dst=0, op=dist.ReduceOp.SUM)
+                    
+                    del chunk_grad
+            
+            if self.verbose:
+                log_msg("Stage 3: Gradient Computation", rank, "Completed gradient computation")
+                
+        # For rank 0 (Adam rank), receive and process accumulated gradients
+        elif rank == 0:
+            if self.verbose:
+                log_msg("Stage 3: Adam Update", rank, "Processing accumulated gradients")
+            
+            # For each parameter, process in chunks
+            for param_idx, (m_param, v_param) in enumerate(zip(self.adam_m, self.adam_v)):
+                param_numel = m_param.numel()
+                m_flat = m_param.view(-1)
+                v_flat = v_param.view(-1)
+                
+                # Process each parameter in chunks
+                for start in range(0, param_numel, CHUNK_SIZE):
+                    end = min(param_numel, start + CHUNK_SIZE)
+                    chunk_size = end - start
+                    
+                    # Receive accumulated gradient for this chunk from rank 1
+                    chunk_grad = torch.zeros(chunk_size, device=device)
+                    dist.reduce(chunk_grad, dst=0, op=dist.ReduceOp.SUM)
+                    
+                    # Update Adam moments
+                    m_flat[start:end].mul_(self.beta1).add_(chunk_grad, alpha=1 - self.beta1)
+                    v_flat[start:end].mul_(self.beta2).addcmul_(chunk_grad, chunk_grad, value=1 - self.beta2)
+                    
+                    del chunk_grad
+            
+            if self.verbose:
+                m_norm = sum(torch.norm(p).item() for p in self.adam_m)
+                v_norm = sum(torch.norm(p).item() for p in self.adam_v)
+                print(f"[Rank {rank}] Stage 3: AFTER ADAM UPDATE | adam_m norm: {m_norm:.6f}, adam_v norm: {v_norm:.6f}")
+
+
+
+
+        # -------------------- Stage 4: After Adam update, broadcast adam_ratio from rank 0 to rank 1 --------------------
+        if self.adam:
+            if self.verbose:
+                log_start("Stage 4", rank)
+            if rank == 0:
+                # Precompute scaling factors 
+                scaling1 = 1.0 / (1 - self.beta1 ** (iteration + 1))
+                scaling2 = 1.0 / (1 - self.beta2 ** (iteration + 1))
+                for idx, p in enumerate(self.adam_m):
+                    # Flatten the parameter tensors for easier chunk processing.
+                    m_flat = p.view(-1)
+                    v_flat = self.adam_v[idx].view(-1)
+                    # Preallocate a buffer for the ratio chunk of size CHUNK_SIZE.
+                    ratio_buf = m_flat.new_empty(CHUNK_SIZE)
+                    # Process tensor in chunks.
+                    for start in range(0, m_flat.numel(), CHUNK_SIZE):
+                        end = min(m_flat.numel(), start + CHUNK_SIZE)
+                        chunk_size = end - start
+                        # Copy the current m chunk into the buffer.
+                        ratio_buf[:chunk_size].copy_(m_flat[start:end])
+                        # In-place scale: m_hat_chunk = m_chunk * scaling1
+                        ratio_buf[:chunk_size].mul_(scaling1)
+                        # Process the corresponding v chunk and compute v_hat_chunk
+                        temp = v_flat[start:end].clone()
+                        temp.mul_(scaling2)
+                        temp.sqrt_()
+                        temp.add_(1e-8)
+                        # In-place compute the ratio for the chunk: ratio = m_hat_chunk / v_hat_chunk
+                        ratio_buf[:chunk_size].div_(temp)
+                        
+                        # Send the computed chunk.
+                        dist.send(ratio_buf[:chunk_size], dst=1)
+                if self.verbose:
+                    log_msg("Stage 4", rank, "Streamed adam_ratio chunks to Rank 1.")
+            elif rank == 1:
+                # Initialize adam_ratio_list if not already done
+                if not hasattr(self, 'adam_ratio_list') or self.adam_ratio_list is None:
+                    self.adam_ratio_list = [torch.zeros_like(p, dtype=p.dtype, device=p.device) for p in self.param_list]
+                    
+                for idx, p in enumerate(self.adam_ratio_list):
+                    p_flat = p.view(-1)
+                    for start in range(0, p_flat.numel(), CHUNK_SIZE):
+                        end = min(p_flat.numel(), start + CHUNK_SIZE)
+                        chunk_size = end - start
+                        # Allocate a small buffer for receiving the chunk.
+                        temp_chunk = p_flat.new_empty(chunk_size)
+                        dist.recv(temp_chunk, src=0)
+                        # In-place copy into the correct segment.
+                        p_flat[start:end].copy_(temp_chunk)
+                        
+                if self.verbose:
+                    log_msg("Stage 4", rank, "Reconstructed adam_ratio from received chunks.")
+            
+            if self.verbose:
+                log_end("Stage 4", rank)
+        
+        
+
+        # -------------------- Stage 5: Update parameters on rank 1 using adam_ratio --------------------
+        if rank == 1:
+            if self.verbose:
+                log_start("Stage 5", rank)
+                
+            for p, a in zip(self.param_list, self.adam_ratio_list):
+                d = p.numel()
+                p_view = p.view(-1)
+                a_view = a.view(-1)
+                for start in range(0, d, CHUNK_SIZE):
+                    end = min(d, start+CHUNK_SIZE)
+                    p_view[start:end].sub_(a_view[start:end], alpha=current_lr)
+                    
+            # Apply weight decay if specified
+            if self.weight_decay > 0.0:
+                for p in self.param_list:
+                    p.mul_(1.0 - current_lr * self.weight_decay)
+            
+            if self.verbose:
+                log_msg("Stage 5", rank, f"Updated theta_t with learning rate {current_lr:.6f} in place.")
+                norm = sum(torch.norm(p).item() for p in self.param_list)
+                print(f"[Rank {rank}] AFTER STAGE 11 | param_list | L2 norm: {norm:.6f}")
+                
+            if self.verbose:
+                log_end("Stage 5", rank)
+            
+            # Calculate averaged loss for reporting
+            return accumulated_losses / self.meta_perturbations
+        
+        
+        return None
+
 
 
     
@@ -1808,41 +2258,47 @@ def main():
     # parser.add_argument("--local-rank", type=int, default=-1, help="Local rank for distributed training.")
     # parser.add_argument("--mode", type=str, choices=["test", "train"], default="train", help="Run mode: test or train.")
     # parser.add_argument("--max_iters", type=int, default=1e10, help="Maximum iterations for training.")
-    # parser.add_argument("--learning_rate", type=float, default=0.00001, help="Base learning rate (and eps, tied 1:1).")
-    # parser.add_argument("--weight_decay", type=float, default=0.001, help="Standard weight decay.")
-    # parser.add_argument("--beta1", type=float, default=0.0, help="Base learning rate (and eps, tied 1:1).")
-    # parser.add_argument("--beta2", type=float, default=0.0, help="Base learning rate (and eps, tied 1:1).")
+    # parser.add_argument("--learning_rate", type=float, default=0.001, help="Base learning rate (and eps, tied 1:1).")
+    # parser.add_argument("--weight_decay", type=float, default=0.00001, help="Standard weight decay.")
+    # parser.add_argument("--beta1", type=float, default=0.99, help="Base learning rate (and eps, tied 1:1).")
+    # parser.add_argument("--beta2", type=float, default=0.999, help="Base learning rate (and eps, tied 1:1).")
     # parser.add_argument("--epsilon_tying_ratio", type=float, default=1.0, help="Perturbation scale epsilon (tied to learning rate).")
-    # parser.add_argument("--probe_dropout_rate", type=float, default=0.999, help="Dropout rate for probe vector.")
+    # parser.add_argument("--probe_dropout_rate", type=float, default=0., help="Dropout rate for probe vector.")
     # parser.add_argument("--wandb_proj", type=str, default="ZeroProp_Final_Runs_REALDATA", help="WandB project name (optional)")
     # parser.add_argument("--wandb_run", type=str, default="", help="WandB run name (optional)")
-    # parser.add_argument("--warmup_iters", type=int, default=0, help="Warmup iterations.")
+    # parser.add_argument("--warmup_iters", type=int, default=100, help="Warmup iterations.")
     # parser.add_argument("--cosine_wavelength", type=int, default=100000, help="Cosine LR wavelength, init to very high.")
     # parser.add_argument("--val_iters", type=int, default=10, help="Val iters, when we run val and log to wandb, and potentially checkpoint.")
-    # parser.add_argument("--meta_perturbations", type=int, default=1, help="Number of Perturbations for all ranks per step.")
+    # parser.add_argument("--meta_perturbations", type=int, default=12, help="Number of Perturbations for all ranks per step.")
     # parser.add_argument("--scatter_batch", type=str, choices=["true", "false"], default="false", help="whether each perturbation should be on a different batch, if true, we sample (world_size-2)*batch_size x_ids and y per iter and scatter it to the appropriate ranks.")
     
     # # New CLI arguments for model configuration
-    # parser.add_argument("--model_scale", type=int, default=1, help="Scaling factor for model dimensions.")
+    # parser.add_argument("--model_scale", type=int, default=8, help="Scaling factor for model dimensions.")
     # parser.add_argument("--num_heads", type=int, default=16, help="# dnc heads.")
-    # parser.add_argument("--memory_size", type=int, default=1024, help="memory_size.")
-    # parser.add_argument("--hidden_size", type=int, default=1024, help="hidden_size.")
-    # parser.add_argument("--input_size", type=int, default=1024, help="Input size.")
-    # parser.add_argument("--head_size", type=int, default=1024, help="head_size .")
+    # parser.add_argument("--memory_size", type=int, default=128, help="memory_size.")
+    # parser.add_argument("--hidden_size", type=int, default=128, help="hidden_size.")
+    # parser.add_argument("--input_size", type=int, default=128, help="Input size.")
+    # parser.add_argument("--head_size", type=int, default=128, help="head_size .")
     
-    # parser.add_argument("--batch_size", type=int, default=128, help="Batch size. BE SURE TO REDUCE LR AS YOU INCREASE BATCH SIZE BY SQRT(BATCHSIZE) as stability increases the exp delta loss decreases. So needs lower LR.")
+    # parser.add_argument("--batch_size", type=int, default=512, help="Batch size. BE SURE TO REDUCE LR AS YOU INCREASE BATCH SIZE BY SQRT(BATCHSIZE) as stability increases the exp delta loss decreases. So needs lower LR.")
     # parser.add_argument("--min_seq_len", type=int, default=4, help="Min sequence length.")
     # parser.add_argument("--max_seq_len", type=int, default=100000, help="Max sequence length.")
-    # parser.add_argument("--step_seq_len", type=int, default=10, help="How much to step the sequence length.")
+    # parser.add_argument("--step_seq_len", type=int, default=2, help="How much to step the sequence length.")
     # parser.add_argument("--step_seq_len_loss_thresh", type=float, default=3.0, help="At what threshold to check the loss to step sequence length.")
-    # parser.add_argument("--patience_seq_len", type=int, default=100, help="How patient to be before stepping sequence length.")
+    # parser.add_argument("--patience_seq_len", type=int, default=50, help="How patient to be before stepping sequence length.")
     # parser.add_argument("--tokenizer", type=str, default="hf", choices=["hf", None], 
     #                 help="Tokenizer to use. If 'hf', will use HuggingFace tokenizer. If None, will use character tokenizer.")
     # parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="false", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
     # parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="false", help="normalizes the final gradient before updating the model weights.")
     # parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="false", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
-    # parser.add_argument("--adam", type=str, choices=["true", "false"], default="false", help="if true use adam, else use vanilla sgd.")
+    # parser.add_argument("--adam", type=str, choices=["true", "false"], default="true", help="if true use adam, else use vanilla sgd.")
+    # parser.add_argument("--use_different_batch_per_meta_perturbation", type=str, choices=["true", "false"], default="false", help="if true use a different minibatch per meta_perturbation, else use all the same.")
+    # parser.add_argument("--normal_distribution", type=str, choices=["true", "false"], default="false", help="if true use normal distribution, otherwise use rademacher +/- 1.")
+    # parser.add_argument("--l1_norm", type=str, choices=["true", "false"], default="false", help="if true use L1 norm, else use L2 norm for grad normalization and for probe normalization (may help stablize for very large models).")
+    # parser.add_argument("--antithetic", type=str, choices=["true", "false"], default="true", help="if true use antithetic sampling for forward diff (not for central as its redundant), else dont.. it will double convergence rate!")
+    # parser.add_argument("--central_difference", type=str, choices=["true", "false"], default="true", help="if true use central difference, else use forward diff.")
     # args = parser.parse_args()
+    
     
 
     # # TEST OVERFIT FAST DEMO! 
@@ -1854,18 +2310,18 @@ def main():
     parser.add_argument("--beta1", type=float, default=0.0, help="Base learning rate (and eps, tied 1:1).")
     parser.add_argument("--beta2", type=float, default=0.0, help="Base learning rate (and eps, tied 1:1).")
     parser.add_argument("--epsilon_tying_ratio", type=float, default=1.0, help="Perturbation scale epsilon (tied to learning rate).")
-    parser.add_argument("--weight_decay", type=float, default=0.0, help="Standard weight decay.")
+    parser.add_argument("--weight_decay", type=float, default=0.0001, help="Standard weight decay.")
     parser.add_argument("--probe_dropout_rate", type=float, default=0., help="Dropout rate for probe vector.")
     parser.add_argument("--wandb_proj", type=str, default="ZeroProp_Final_Runs2", help="WandB project name (optional)")
     parser.add_argument("--wandb_run", type=str, default="", help="WandB run name (optional)")
     parser.add_argument("--warmup_iters", type=int, default=0, help="Warmup iterations.")
     parser.add_argument("--cosine_wavelength", type=int, default=100000000, help="Cosine LR wavelength, init to very high.")
     parser.add_argument("--val_iters", type=int, default=10, help="Val iters, when we run val and log to wandb, and potentially checkpoint.")
-    parser.add_argument("--meta_perturbations", type=int, default=10, help="Number of Perturbations for all ranks per step.")
+    parser.add_argument("--meta_perturbations", type=int, default=12, help="Number of Perturbations for all ranks per step.")
     parser.add_argument("--scatter_batch", type=str, choices=["true", "false"], default="false", help="whether each perturbation should be on a different batch, if true, we sample (world_size-2)*batch_size x_ids and y per iter and scatter it to the appropriate ranks.")
 
-    parser.add_argument("--model_scale", type=int, default=64, help="Scaling factor for model dimensions.")
-    parser.add_argument("--num_heads", type=int, default=7, help="# dnc heads.")
+    parser.add_argument("--model_scale", type=int, default=32, help="Scaling factor for model dimensions.")
+    parser.add_argument("--num_heads", type=int, default=4, help="# dnc heads.")
     parser.add_argument("--memory_size", type=int, default=128, help="memory_size.")
     parser.add_argument("--hidden_size", type=int, default=128, help="hidden_size.")
     parser.add_argument("--input_size", type=int, default=128, help="Input size.")
@@ -1876,19 +2332,32 @@ def main():
     parser.add_argument("--step_seq_len", type=int, default=10, help="How much to step the sequence length.")
     parser.add_argument("--step_seq_len_loss_thresh", type=float, default=0.0, help="At what threshold to check the loss to step sequence length.")
     parser.add_argument("--patience_seq_len", type=int, default=100, help="How patient to be before stepping sequence length.")    
-    parser.add_argument("--tokenizer", type=str, default=None, choices=["hf", None], 
+    parser.add_argument("--tokenizer", type=str, default="hf", choices=["hf", None], 
                     help="Tokenizer to use. If 'hf', will use HuggingFace tokenizer. If None, will use character tokenizer.")
     parser.add_argument("--probe_normalization", type=str, choices=["true", "false"], default="false", help="normalizes the probe before applying to the model before query. helps limit the magnitude of the probe to the epsilon-hypersphere.")
-    parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="true", help="normalizes the final gradient before updating the model weights.")
+    parser.add_argument("--gradient_normalization", type=str, choices=["true", "false"], default="false", help="normalizes the final gradient before updating the model weights.")
     parser.add_argument("--adaptive", type=str, choices=["true", "false"], default="false", help="if true biases the sampling by the adam_ratio, otherwise 0 mean sampling.")
-    parser.add_argument("--adam", type=str, choices=["true", "false"], default="true", help="if true use adam, else use vanilla sgd.")
-    parser.add_argument("--use_different_batch_per_meta_perturbation", type=str, choices=["true", "false"], default="true", help="if true use a different minibatch per meta_perturbation, else use all the same.")
-    parser.add_argument("--normal_distribution", type=str, choices=["true", "false"], default="true", help="if true use normal distribution, otherwise use rademacher +/- 1.")
-    parser.add_argument("--l1_norm", type=str, choices=["true", "false"], default="true", help="if true use L1 norm, else use L2 norm for grad normalization and for probe normalization (may help stablize for very large models).")
-    
+    parser.add_argument("--adam", type=str, choices=["true", "false"], default="false", help="if true use adam, else use vanilla sgd.")
+    parser.add_argument("--use_different_batch_per_meta_perturbation", type=str, choices=["true", "false"], default="false", help="if true use a different minibatch per meta_perturbation, else use all the same.")
+    parser.add_argument("--normal_distribution", type=str, choices=["true", "false"], default="false", help="if true use normal distribution, otherwise use rademacher +/- 1.")
+    parser.add_argument("--l1_norm", type=str, choices=["true", "false"], default="false", help="if true use L1 norm, else use L2 norm for grad normalization and for probe normalization (may help stablize for very large models).")
+    parser.add_argument("--antithetic", type=str, choices=["true", "false"], default="false", help="if true use antithetic sampling, else dont.. it will double convergence rate!")
+    parser.add_argument("--central_difference", type=str, choices=["true", "false"], default="true", help="if true use central difference, else use forward diff.")
+
     args = parser.parse_args()
 
     torch.backends.cudnn.enabled = False
+    # TEMP OVERRIDE FOR NOW SO WE CAN DEBUG
+    # args.wandb_proj = None
+    verbose = False
+    
+    args.scatter_batch = True if args.scatter_batch == "true" else False 
+    args.central_difference = True if args.central_difference == "true" else False 
+    args.use_different_batch_per_meta_perturbation = True if args.use_different_batch_per_meta_perturbation == "true" else False 
+
+
+
+    
 
     #####################################################################################
     # SETUP TRAINING
@@ -1944,7 +2413,11 @@ def main():
     # args.num_heads = args.num_heads * args.model_scale
 
 
-    run_name = f"{args.mode}_lr{args.learning_rate}_scale{args.model_scale}_pdrop{args.probe_dropout_rate}"
+    if args.central_difference:
+        run_name = f"cent_{args.mode}_lr{args.learning_rate}_scale{args.model_scale}_pdrop{args.probe_dropout_rate}"
+    else:
+        run_name = f"fwd_{args.mode}_lr{args.learning_rate}_scale{args.model_scale}_pdrop{args.probe_dropout_rate}"
+
     
     # Add model architecture details
     model_params = f"_h{args.hidden_size}"
@@ -1960,9 +2433,6 @@ def main():
          args.wandb_run = run_name + model_params + train_params + opt_params
     
 
-    # TEMP OVERRIDE FOR NOW SO WE CAN DEBUG
-    # args.wandb_proj = None
-    verbose = False
     
     
     log_msg("Trying first dist.barrier(), if hanging here, no infiniband likely on node, need to turn off p2p",rank,"if so, run export NCCL_P2P_DISABLE=1")
@@ -1979,9 +2449,7 @@ def main():
         model.eval()
     
     
-    args.scatter_batch = True if args.scatter_batch == "true" else False 
-    args.use_different_batch_per_meta_perturbation = True if args.use_different_batch_per_meta_perturbation == "true" else False 
-
+    
     distributed_adaptive = MezoAdaptiveSamplingParallel(
         model=model,
         learning_rate=args.learning_rate,
@@ -1997,6 +2465,7 @@ def main():
         meta_perturbations=args.meta_perturbations,
         scatter_batch = args.scatter_batch,
         normal_distribution =args.normal_distribution=="true",
+        antithetic =args.antithetic=="true",
         l1_norm = args.l1_norm=="true",
         verbose=verbose
     )
@@ -2178,7 +2647,11 @@ def main():
             #####################################################################################
             # if distributed_adaptive.adam:
             
-            train_loss = distributed_adaptive.distributed_step_adaptive(x_ids, y, criterion, iteration=i)
+            if args.central_difference:
+                train_loss = distributed_adaptive.central_difference_distributed(x_ids, y, criterion, iteration=i)
+            else:
+                train_loss = distributed_adaptive.forward_difference_distributed(x_ids, y, criterion, iteration=i)
+
             
             # else: # todo, need to implement this to be more efficient with GPUs
             #     train_loss = distributed_adaptive.distributed_step_SPSA(x_ids, y, criterion, iteration=i)
@@ -2188,7 +2661,7 @@ def main():
             #####################################################################################
             # CHECKPOINT THE MODEL RARELY
             #####################################################################################
-            if args.mode == "train" and (i+1) % (args.val_iters*1000) == 0:
+            if args.mode == "train" and (i+1) % (args.val_iters*100) == 0:
                 
                 save_distributed_checkpoint(distributed_adaptive, 
                                             args.wandb_run, 
